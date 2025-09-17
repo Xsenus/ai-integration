@@ -112,8 +112,8 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
 
 async def push_clients_request(summary: dict, domain: Optional[str] = None) -> bool:
     """
-    Если есть соединение и таблица clients_requests — вставляем строку.
-    Возвращаем True при успешной вставке, иначе False. Ошибки не пробрасываем наверх.
+    Upsert по inn: сначала UPDATE, если затронуто 0 строк — INSERT.
+    Если нет соединения/таблицы — тихо выходим (best-effort).
     """
     available = await clients_requests_exists()
     if not available:
@@ -124,7 +124,23 @@ async def push_clients_request(summary: dict, domain: Optional[str] = None) -> b
         log.info("Не указан ИНН — запись в clients_requests пропущена.")
         return False
 
-    sql = text("""
+    update_sql = text("""
+        UPDATE public.clients_requests
+        SET company_name  = :company_name,
+            domain_1      = COALESCE(:domain_1, domain_1),
+            domain_2      = :domain_2,
+            okved_main    = :okved_main,
+            okved_vtor_1  = :okved_vtor_1,
+            okved_vtor_2  = :okved_vtor_2,
+            okved_vtor_3  = :okved_vtor_3,
+            okved_vtor_4  = :okved_vtor_4,
+            okved_vtor_5  = :okved_vtor_5,
+            okved_vtor_6  = :okved_vtor_6,
+            okved_vtor_7  = :okved_vtor_7
+        WHERE inn = :inn
+    """)
+
+    insert_sql = text("""
         INSERT INTO public.clients_requests
         (company_name, inn, domain_1, domain_2, okved_main,
          okved_vtor_1, okved_vtor_2, okved_vtor_3, okved_vtor_4, okved_vtor_5, okved_vtor_6, okved_vtor_7)
@@ -136,10 +152,11 @@ async def push_clients_request(summary: dict, domain: Optional[str] = None) -> b
     try:
         engine = get_parsing_engine()
         async with engine.begin() as conn:
-            await conn.execute(sql, row)
-        log.info("Добавлена запись в parsing_data.public.clients_requests для ИНН %s (domain_1=%s)",
-                 row["inn"], row["domain_1"])
+            res = await conn.execute(update_sql, row)
+            if getattr(res, "rowcount", 0) == 0:
+                await conn.execute(insert_sql, row)
+        log.info("clients_requests upsert для ИНН %s выполнен (domain_1=%s)", row["inn"], row["domain_1"])
         return True
     except Exception as e:
-        log.warning("Не удалось записать в clients_requests (ИНН %s): %s", row.get("inn"), e)
+        log.warning("clients_requests upsert не удался (ИНН %s): %s", row.get("inn"), e)
         return False
