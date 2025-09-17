@@ -5,12 +5,20 @@ import logging
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db.bitrix import get_bitrix_session
-from app.db.parsing import push_clients_request  # best-effort запись во вторую БД
+from app.db.parsing import (
+    clients_requests_exists,
+    get_clients_request_id,
+    pars_site_exists,
+    push_clients_request,        # best-effort запись во вторую БД
+    create_clients_request,      # явное создание clients_requests + возврат id (с fallback)
+    insert_pars_site_chunks,     # массовая вставка чанков в pars_site
+)
 from app.models.bitrix import DaDataResult
 from app.repo.bitrix_repo import (
     get_last_raw,
@@ -26,6 +34,7 @@ from app.schemas.org import (
 )
 from app.services.dadata_client import find_party_by_inn
 from app.services.mapping import extract_inn, map_summary_from_dadata
+from app.services.scrape import fetch_and_chunk, FetchError  # NEW
 
 log = logging.getLogger("dadata-bitrix")
 router = APIRouter(prefix="/v1")
@@ -505,6 +514,95 @@ async def lookup_card_get(
         card=card,
     )
 
+
+# ==========================================
+#   NEW: Парсинг главной страницы домена → pars_site
+# ==========================================
+
+class ParseSiteRequest(BaseModel):
+    company_name: str = Field(..., description="Название компании для clients_requests.company_name")
+    inn: str = Field(..., min_length=4, max_length=20, description="ИНН для clients_requests.inn")
+    client_domain_1: str = Field(..., description="Домен клиента (как в clients_requests.domain_1), напр. 'www.uniconf.ru'")
+    parse_domain: str = Field(..., description="Домен или URL для запроса, напр. 'uniconf.ru' или 'https://uniconf.ru'")
+    pars_site_domain_1: str | None = Field(None, description="Как писать в pars_site.domain_1; по умолчанию — нормализованный домен")
+    save_client_request: bool = Field(True, description="Создавать запись в clients_requests")
+    url_override: str | None = Field(None, description="Чем заполнить pars_site.url; если пусто — главная страница")
+
+
+class ParseSiteResponse(BaseModel):
+    company_id: int
+    domain_1: str
+    url: str
+    chunks_inserted: int
+
+
+@router.post("/parse-site", response_model=ParseSiteResponse, summary="Парсинг главной страницы домена и сохранение в pars_site")
+async def parse_site(payload: ParseSiteRequest = Body(...)):
+    # 0) Проверка конфигурации
+    if not settings.SCRAPERAPI_KEY:
+        raise HTTPException(status_code=400, detail="SCRAPERAPI_KEY is not configured on server")
+
+    # 0.1) Проверяем наличие таблиц. Если их нет — ничего не пишем.
+    has_clients = await clients_requests_exists()
+    has_pars = await pars_site_exists()
+    if not has_clients or not has_pars:
+        # Мягкий no-op: возвращаем нули, чтобы фронт/оркестратор понимал, что вставок не было
+        return ParseSiteResponse(
+            company_id=0,
+            domain_1=(payload.pars_site_domain_1 or payload.parse_domain),
+            url=(payload.url_override or payload.parse_domain),
+            chunks_inserted=0,
+        )
+
+    # 1) upsert в clients_requests (обновление при наличии записи, вставка при отсутствии)
+    # Составим минимальный summary для push_clients_request
+    minimal_summary = {
+        "short_name": payload.company_name,
+        "inn": payload.inn,
+        # остальные поля опциональны; okved/emails и т.п. оставим None
+    }
+    try:
+        await push_clients_request(minimal_summary, domain=payload.client_domain_1)
+    except Exception as e:
+        # best-effort: если не удалось — считаем, что операцию выполнить нельзя (без company_id нельзя вставлять в pars_site)
+        raise HTTPException(status_code=500, detail=f"Не удалось выполнить upsert в clients_requests: {e}") from e
+
+    # 1.1) Получаем company_id по ИНН (и домену, если указан)
+    company_id = await get_clients_request_id(payload.inn, payload.client_domain_1)
+    if not company_id:
+        raise HTTPException(status_code=500, detail="Не удалось определить company_id после upsert по ИНН")
+
+    # 2) Тянем и режем HTML
+    try:
+        home_url, chunks, normalized_domain = await fetch_and_chunk(payload.parse_domain)
+    except FetchError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    if not chunks:
+        return ParseSiteResponse(
+            company_id=company_id,
+            domain_1=(payload.pars_site_domain_1 or normalized_domain),
+            url=(payload.url_override or home_url),
+            chunks_inserted=0,
+        )
+
+    # 3) Вставляем чанки
+    domain_for_pars = payload.pars_site_domain_1 or normalized_domain
+    url_for_pars = payload.url_override or home_url
+
+    inserted = await insert_pars_site_chunks(
+        company_id=company_id,
+        domain_1=domain_for_pars,
+        url=url_for_pars,
+        chunks=chunks,
+    )
+
+    return ParseSiteResponse(
+        company_id=company_id,
+        domain_1=domain_for_pars,
+        url=url_for_pars,
+        chunks_inserted=inserted,
+    )
 
 # ===============================
 #   Получить сохранённые данные
