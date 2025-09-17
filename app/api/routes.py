@@ -1,30 +1,31 @@
+# app/api/routes.py
 from __future__ import annotations
 
 import logging
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-import httpx
 
 from app.db.bitrix import get_bitrix_session
+from app.db.parsing import push_clients_request  # best-effort запись во вторую БД
 from app.models.bitrix import DaDataResult
-from app.schemas.org import (
-    IngestRequest,
-    OrgResponse,
-    CompanySummaryOut,
-    CompanyCard,
-    OrgExtendedResponse,
-)
-from app.services.mapping import extract_inn, map_summary_from_dadata
-from app.services.dadata_client import find_party_by_inn
 from app.repo.bitrix_repo import (
+    get_last_raw,
     replace_dadata_raw,
     upsert_company_summary,
-    get_last_raw,
 )
-from app.db.parsing import push_clients_request  # запись во вторую БД (мягко)
+from app.schemas.org import (
+    CompanyCard,
+    CompanySummaryOut,
+    IngestRequest,
+    OrgExtendedResponse,
+    OrgResponse,
+)
+from app.services.dadata_client import find_party_by_inn
+from app.services.mapping import extract_inn, map_summary_from_dadata
 
 log = logging.getLogger("dadata-bitrix")
 router = APIRouter(prefix="/v1")
@@ -44,8 +45,9 @@ def _mln_text(revenue: Optional[float]) -> str:
     except Exception:
         return "0 млн"
 
+
 def _build_company_title(short_name_opf: Optional[str], revenue: Optional[float], status: Optional[str]) -> str:
-    """{short_name_opf} | {revenue/1e6} млн | DaData, c префиксом статуса при необходимости."""
+    """{short_name_opf} | {revenue/1e6} млн | DaData, с префиксом статуса при необходимости."""
     base_name = (short_name_opf or "").strip()
     rev_txt = _mln_text(revenue)
     title = f"{base_name} | {rev_txt} | DaData".strip()
@@ -55,6 +57,7 @@ def _build_company_title(short_name_opf: Optional[str], revenue: Optional[float]
         title = f"!!!{st}!!! {title}"
     return title
 
+
 def _build_production_address(address: Optional[str], lat: Optional[float], lon: Optional[float]) -> str:
     """{Address}|{geo_lat};{geo_lon}|21 — пустые части допускаются."""
     addr = (address or "").strip()
@@ -62,41 +65,153 @@ def _build_production_address(address: Optional[str], lat: Optional[float], lon:
     lon_s = "" if lon is None else str(lon)
     return f"{addr}|{lat_s};{lon_s}|21"
 
+
+def _okved_to_text(item: object) -> Optional[str]:
+    """
+    item может быть строкой ('47.11 Розничная торговля ...') или dict{'code','name'}.
+    Возвращает 'code name' или саму строку, если это уже текст.
+    """
+    if item is None:
+        return None
+    if isinstance(item, str):
+        return item.strip() or None
+    if isinstance(item, dict):
+        code = (item.get("code") or "").strip()
+        name = (item.get("name") or "").strip()
+        if code and name:
+            return f"{code} {name}"
+        return code or name or None
+    return None
+
+
+def _extract_main_code(main_okved: Optional[str]) -> Optional[str]:
+    """
+    Пытаемся выделить код из main_okved.
+    Если там только код — возвращаем его.
+    Если там 'код название' — возвращаем первую 'слово-похожую-на-код' часть.
+    """
+    if not main_okved:
+        return None
+    s = str(main_okved).strip()
+    # если строка типа '47.11' — ок
+    if all(ch.isdigit() or ch in {'.'} for ch in s):
+        return s
+    # иначе берём первый токен до пробела/табов/длинных названий
+    return s.split()[0]
+
+
+def _fill_vtors_from_okveds(okveds: object, main_okved: Optional[str]) -> dict:
+    """
+    Собирает okved_vtor_1..7 из списка okveds, исключая главный код (если можем его распознать).
+    okveds может быть: list[str] | list[dict] | None
+    """
+    items: list[str] = []
+    if isinstance(okveds, list):
+        for it in okveds:
+            txt = _okved_to_text(it)
+            if txt:
+                items.append(txt)
+
+    main_code = _extract_main_code(main_okved)
+    if main_code:
+        # фильтруем элементы, начинающиеся с кода (на случай 'код название')
+        items = [x for x in items if not x.startswith(main_code)]
+
+    vtors = {}
+    for i, val in enumerate(items[:7], start=1):
+        vtors[f"okved_vtor_{i}"] = val
+    return vtors
+
+
 def _card_from_summary_dict(d: dict) -> CompanyCard:
     """Собрать CompanyCard из словаря summary (как map_summary_from_dadata)."""
     card = CompanyCard(
+        inn=d.get("inn"),
+        short_name=d.get("short_name"),
+        short_name_opf=d.get("short_name_opf"),
+
+        management_full_name=d.get("management_full_name"),
+        management_surname_n_p=d.get("management_surname_n_p"),
+        management_surname=d.get("management_surname"),
+        management_name=d.get("management_name"),
+        management_patronymic=d.get("management_patronymic"),
+        management_post=d.get("management_post"),
+
+        branch_count=d.get("branch_count"),
+
         address=d.get("address"),
         geo_lat=d.get("geo_lat"),
         geo_lon=d.get("geo_lon"),
         status=d.get("status"),
         employee_count=d.get("employee_count"),
+
         main_okved=d.get("main_okved"),
+        okved_main=d.get("main_okved"),  # алиас
+
+        year=d.get("year"),
         income=d.get("income"),
         revenue=d.get("revenue"),
+        smb_type=d.get("smb_type"),
+        smb_category=d.get("smb_category"),
+        smb_issue_date=d.get("smb_issue_date"),
         phones=(list(d.get("phones") or []) or None),
         emails=(list(d.get("emails") or []) or None),
     )
-    card.company_title = _build_company_title(d.get("short_name_opf"), d.get("revenue"), d.get("status"))
-    card.production_address_2024 = _build_production_address(d.get("address"), d.get("geo_lat"), d.get("geo_lon"))
+    # дополнительные ОКВЭДы из массива okveds
+    vtors = _fill_vtors_from_okveds(d.get("okveds"), d.get("main_okved"))
+    for k, v in vtors.items():
+        setattr(card, k, v)
+
+    # сгенерированные поля
+    card.company_title = _build_company_title(card.short_name_opf, card.revenue, card.status)
+    card.production_address_2024 = _build_production_address(card.address, card.geo_lat, card.geo_lon)
     return card
+
 
 def _card_from_model(m: DaDataResult) -> CompanyCard:
     """Собрать CompanyCard из ORM-модели (когда берём fallback из БД)."""
     card = CompanyCard(
+        inn=m.inn,
+        short_name=m.short_name,
+        short_name_opf=m.short_name_opf,
+
+        management_full_name=m.management_full_name,
+        management_surname_n_p=m.management_surname_n_p,
+        management_surname=m.management_surname,
+        management_name=m.management_name,
+        management_patronymic=m.management_patronymic,
+        management_post=m.management_post,
+
+        branch_count=m.branch_count,
+
         address=m.address,
         geo_lat=m.geo_lat,
         geo_lon=m.geo_lon,
         status=m.status,
         employee_count=m.employee_count,
+
         main_okved=m.main_okved,
+        okved_main=m.main_okved,  # алиас
+
+        year=m.year,
         income=float(m.income) if m.income is not None else None,
         revenue=float(m.revenue) if m.revenue is not None else None,
+        smb_type=m.smb_type,
+        smb_category=m.smb_category,
+        smb_issue_date=m.smb_issue_date,
         phones=list(m.phones) if m.phones else None,
         emails=list(m.emails) if m.emails else None,
     )
-    card.company_title = _build_company_title(m.short_name_opf, card.revenue, card.status)
-    card.production_address_2024 = _build_production_address(m.address, m.geo_lat, m.geo_lon)
+
+    # дополнительные ОКВЭДы из JSONB okveds (list[str|dict] | None)
+    vtors = _fill_vtors_from_okveds(m.okveds, m.main_okved)
+    for k, v in vtors.items():
+        setattr(card, k, v)
+
+    card.company_title = _build_company_title(card.short_name_opf, card.revenue, card.status)
+    card.production_address_2024 = _build_production_address(card.address, card.geo_lat, card.geo_lon)
     return card
+
 
 async def _return_from_db_or_503(inn: str, session: AsyncSession, err_msg: str) -> OrgExtendedResponse:
     """
@@ -119,7 +234,7 @@ async def _return_from_db_or_503(inn: str, session: AsyncSession, err_msg: str) 
 
 
 # ==========================================
-#   Ingest готового payload (как было)
+#   Ingest готового payload (без обращения к DaData)
 # ==========================================
 @router.post("/bitrix/ingest", response_model=OrgResponse)
 async def ingest_dadata(
@@ -127,8 +242,11 @@ async def ingest_dadata(
     session: AsyncSession = Depends(get_bitrix_session),
 ):
     """
-    Принимает JSON с DaData (один объект), сохраняет raw+summary.
-    Параллельно пытается записать короткую строку во вторую БД (best-effort).
+    Принимает JSON с DaData (один объект suggestion/data), сохраняет:
+    - raw в dadata_result_full_json (ровно одна строка на ИНН)
+    - summary в dadata_result (upsert по inn)
+    После успешного сохранения — ПЫТАЕМСЯ записать короткую строку во вторую БД
+      (parsing_data.public.clients_requests). Если второй БД/таблицы нет — просто логируем.
     """
     payload = body.payload
     inn = extract_inn(payload)
@@ -163,11 +281,12 @@ async def ingest_dadata(
 
 
 # ==========================================
-#   Обычный lookup (как было)
+#   Обычный lookup
 # ==========================================
+
 class LookupRequest(BaseModel):
     inn: str
-    domain: Optional[str] = None  # опционально
+    domain: Optional[str] = None  # опционально; будет записан во вторую БД как domain_1
 
 
 @router.post("/lookup", response_model=OrgResponse)
@@ -175,6 +294,11 @@ async def lookup_post(
     dto: LookupRequest,
     session: AsyncSession = Depends(get_bitrix_session),
 ):
+    """
+    Тянем из DaData по ИНН, сохраняем raw+summary, возвращаем сводку и raw.
+    Если DaData недоступна, возвращаем данные из БД (если есть), иначе 503.
+    После успешного сохранения — ПЫТАЕМСЯ записать короткую строку во вторую БД.
+    """
     inn = (dto.inn or "").strip()
     if not inn.isdigit():
         raise HTTPException(status_code=400, detail="ИНН должен содержать только цифры")
@@ -186,6 +310,7 @@ async def lookup_post(
         resp = await _return_from_db_or_503(inn, session, "DaData недоступна")
         return OrgResponse(summary=resp.summary, raw_last=resp.raw_last)
 
+    # DaData ответила, но организация не найдена — это НЕ повод для fallback
     if not suggestion:
         raise HTTPException(status_code=404, detail="Организация не найдена в DaData")
 
@@ -200,6 +325,7 @@ async def lookup_post(
         await session.rollback()
         raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
 
+    # best-effort запись во вторую БД
     try:
         ok = await push_clients_request(summary_dict, domain=dto.domain)
         if ok:
@@ -221,6 +347,11 @@ async def lookup_get(
     domain: Optional[str] = Query(None, description="Адрес сайта (домен), необязательно"),
     session: AsyncSession = Depends(get_bitrix_session),
 ):
+    """
+    Аналог POST /v1/lookup, но ИНН в пути.
+    Fallback: при недоступности DaData отдаём данные из БД (если есть), иначе 503.
+    После успешного сохранения — ПЫТАЕМСЯ записать короткую строку во вторую БД.
+    """
     inn = (inn or "").strip()
     if not inn.isdigit():
         raise HTTPException(status_code=400, detail="ИНН должен содержать только цифры")
@@ -246,6 +377,7 @@ async def lookup_get(
         await session.rollback()
         raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
 
+    # best-effort запись во вторую БД
     try:
         ok = await push_clients_request(summary_dict, domain=domain)
         if ok:
@@ -262,12 +394,12 @@ async def lookup_get(
 
 
 # ==========================================
-#   НОВЫЕ РОУТЫ: lookup + карточка
+#   Расширенный lookup (карточка)
 # ==========================================
 
 class LookupCardRequest(BaseModel):
     inn: str
-    domain: Optional[str] = None  # опционально; пишется во 2ю БД как domain_1
+    domain: Optional[str] = None  # опционально; пишется во 2-ю БД как domain_1
 
 
 @router.post("/lookup/card", response_model=OrgExtendedResponse)

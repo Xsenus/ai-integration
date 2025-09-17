@@ -48,18 +48,46 @@ class OrgResponse(BaseModel):
     raw_last: Optional[dict]
 
 
-# -------- Карточка для расширенного ответа --------
-
+# -------- Расширенная карточка --------
 class CompanyCard(BaseModel):
-    # Поля карточки (по ТЗ)
+    # Поля из твоего полного списка
+    inn: Optional[str] = None
+    short_name: Optional[str] = None
+    short_name_opf: Optional[str] = None
+
+    management_full_name: Optional[str] = None
+    management_surname_n_p: Optional[str] = None
+    management_surname: Optional[str] = None
+    management_name: Optional[str] = None
+    management_patronymic: Optional[str] = None
+    management_post: Optional[str] = None
+
+    branch_count: Optional[int] = None
+
     address: Optional[str] = None
     geo_lat: Optional[float] = None
     geo_lon: Optional[float] = None
     status: Optional[str] = None
     employee_count: Optional[int] = None
+
+    # ОКВЭД
     main_okved: Optional[str] = None
+    okved_main: Optional[str] = None 
+    okved_vtor_1: Optional[str] = None
+    okved_vtor_2: Optional[str] = None
+    okved_vtor_3: Optional[str] = None
+    okved_vtor_4: Optional[str] = None
+    okved_vtor_5: Optional[str] = None
+    okved_vtor_6: Optional[str] = None
+    okved_vtor_7: Optional[str] = None
+
+    # Финансы / МСП / контакты
+    year: Optional[int] = None
     income: Optional[float] = None
     revenue: Optional[float] = None
+    smb_type: Optional[str] = None
+    smb_category: Optional[str] = None
+    smb_issue_date: Optional[str] = None
     phones: Optional[List[str]] = None
     emails: Optional[List[str]] = None
 
