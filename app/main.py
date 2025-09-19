@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.config import settings
 from app.api.routes import router as api_router
 from app.models.bitrix import BaseBitrix
-import app.db.bitrix as db  # важно: импортируем МОДУЛЬ, а не переменную engine_bitrix
+import app.db.bitrix as db 
+from starlette.middleware.cors import CORSMiddleware
 
 # --- Logging ---
 LOG_LEVEL = (settings.LOG_LEVEL or "INFO").upper()
@@ -20,8 +21,21 @@ log = logging.getLogger("dadata-bitrix")
 
 # --- FastAPI app ---
 app = FastAPI(title="DaData Bitrix Service", version="1.3.1")
-app.include_router(api_router)  # подключаем /v1/... маршруты
 
+# CORS
+origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "").split(",") if o.strip()]
+if origins:
+    methods = [m.strip() for m in (settings.CORS_ALLOW_METHODS or "").split(",") if m.strip()]
+    headers = [h.strip() for h in (settings.CORS_ALLOW_HEADERS or "").split(",") if h.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=methods or ["*"],
+        allow_headers=headers or ["*"],
+        allow_credentials=bool(settings.CORS_ALLOW_CREDENTIALS),
+    )
+
+app.include_router(api_router)  # подключаем /v1/... маршруты
 
 @app.on_event("startup")
 async def startup() -> None:

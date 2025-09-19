@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from app.db.pp719 import pp719_has_inn
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from pydantic import BaseModel, Field
@@ -457,6 +458,15 @@ async def lookup_card_post(
     summary = await session.get(DaDataResult, inn)
     raw_payload = await get_last_raw(session, inn)
     card = _card_from_summary_dict(summary_dict)
+    
+    # вставь перед возвратом:
+    try:
+        if card and card.inn and await pp719_has_inn(card.inn):
+            base = card.short_name_opf or card.short_name or ""
+            if card.company_title and base:
+                card.company_title = card.company_title.replace(base, f'{base} (ПП719)', 1)
+    except Exception as e:
+        log.warning("pp719 check failed for %s: %s", inn, e)
 
     return OrgExtendedResponse(
         summary=CompanySummaryOut.model_validate(summary) if summary else None,
@@ -471,11 +481,34 @@ async def lookup_card_get(
     domain: Optional[str] = Query(None, description="Адрес сайта (домен), необязательно"),
     session: AsyncSession = Depends(get_bitrix_session),
 ):
-    """GET-вариант с тем же результатом, что и POST /v1/lookup/card."""
+    """Сначала читаем из своей БД; если нет — идём в DaData, сохраняем и возвращаем."""
     inn = (inn or "").strip()
     if not inn.isdigit():
         raise HTTPException(status_code=400, detail="ИНН должен содержать только цифры")
 
+    # 1) Пытаемся отдать из нашей БД (без обращения к DaData)
+    summary = await session.get(DaDataResult, inn)
+    if summary:
+        raw_payload = await get_last_raw(session, inn)
+        summary_dict = CompanySummaryOut.model_validate(summary).model_dump()
+        card = _card_from_summary_dict(summary_dict)
+
+        # Пометка (ПП719), если ИНН найден в pp719
+        try:
+            if card and card.inn and await pp719_has_inn(card.inn):
+                base = card.short_name_opf or card.short_name or ""
+                if card.company_title and base:
+                    card.company_title = card.company_title.replace(base, f'{base} (ПП719)', 1)
+        except Exception as e:
+            log.warning("pp719 check failed for %s: %s", inn, e)
+
+        return OrgExtendedResponse(
+            summary=CompanySummaryOut.model_validate(summary),
+            raw_last=raw_payload,
+            card=card,
+        )
+
+    # 2) Если в БД нет — fallback на DaData
     try:
         suggestion = await find_party_by_inn(inn)
     except httpx.HTTPError as e:
@@ -496,7 +529,7 @@ async def lookup_card_get(
         await session.rollback()
         raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
 
-    # best-effort запись во вторую БД
+    # best-effort запись во вторую БД (как было)
     try:
         ok = await push_clients_request(summary_dict, domain=domain)
         if ok:
@@ -504,16 +537,25 @@ async def lookup_card_get(
     except Exception as e:
         log.warning("parsing_data.clients_requests: ошибка записи (LOOKUP CARD GET), ИНН %s: %s", inn, e)
 
+    # Итоговый ответ
     summary = await session.get(DaDataResult, inn)
     raw_payload = await get_last_raw(session, inn)
     card = _card_from_summary_dict(summary_dict)
+
+    # Повторяем пометку (ПП719) и для ветки DaData
+    try:
+        if card and card.inn and await pp719_has_inn(card.inn):
+            base = card.short_name_opf or card.short_name or ""
+            if card.company_title and base:
+                card.company_title = card.company_title.replace(base, f'{base} (ПП719)', 1)
+    except Exception as e:
+        log.warning("pp719 check failed for %s: %s", inn, e)
 
     return OrgExtendedResponse(
         summary=CompanySummaryOut.model_validate(summary) if summary else None,
         raw_last=raw_payload,
         card=card,
     )
-
 
 # ==========================================
 #   NEW: Парсинг главной страницы домена → pars_site

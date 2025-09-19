@@ -1,7 +1,8 @@
+# app/db/parsing.py
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from sqlalchemy import text
@@ -15,13 +16,53 @@ log = logging.getLogger("dadata-bitrix")
 engine_parsing: AsyncEngine | None = None
 
 
+# ---------- Engine ----------
+
 def get_parsing_engine() -> AsyncEngine:
-    """Lazy-инициализация engine для parsing_data."""
+    """Lazy-инициализация engine для parsing_data (DSN-only)."""
+    if not settings.parsing_url:
+        raise RuntimeError("PARSING_DATABASE_URL is not set")
     global engine_parsing
     if engine_parsing is None:
-        engine_parsing = create_async_engine(settings.parsing_url, pool_pre_ping=True)
+        engine_parsing = create_async_engine(
+            settings.parsing_url,
+            pool_pre_ping=True,
+            future=True,
+            echo=getattr(settings, "ECHO_SQL", False),
+        )
     return engine_parsing
 
+
+async def wait_for_parsing_db(retries: int = 30, delay: float = 0.5) -> None:
+    """
+    Ждём доступности parsing_data через SQLAlchemy (SELECT 1).
+    Полезно вызывать на старте рядом с проверкой bitrix.
+    """
+    if not settings.parsing_url:
+        log.info("PARSING_DATABASE_URL не задан — пропускаю ожидание parsing_data.")
+        return
+
+    engine = create_async_engine(
+        settings.parsing_url, pool_pre_ping=True, future=True
+    )
+    last_err: BaseException | None = None
+    try:
+        for _ in range(retries):
+            try:
+                async with engine.connect() as conn:
+                    await conn.execute(text("SELECT 1"))
+                return
+            except BaseException as e:
+                last_err = e
+                # локальный sleep, чтобы без лишних зависимостей
+                import asyncio
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"parsing_data is not reachable after {retries} retries") from last_err
+    finally:
+        await engine.dispose()
+
+
+# ---------- Helpers ----------
 
 async def table_exists(table_qualified: str) -> bool:
     """
@@ -37,34 +78,10 @@ async def table_exists(table_qualified: str) -> bool:
         log.info("Нет соединения с parsing_data (%s) — пропускаю операции для %s.", e, table_qualified)
         return False
 
+
 async def pars_site_exists() -> bool:
     return await table_exists("public.pars_site")
 
-async def get_clients_request_id(inn: str, domain_1: Optional[str] = None) -> Optional[int]:
-    """
-    Ищет id в public.clients_requests по ИНН и, опционально, domain_1.
-    Если domain_1 не задан, берём последний по времени id.
-    """
-    engine = get_parsing_engine()
-    if domain_1:
-        sql = text("""
-            SELECT id FROM public.clients_requests
-            WHERE inn = :inn AND domain_1 = :domain_1
-            ORDER BY id DESC LIMIT 1
-        """)
-        params = {"inn": inn, "domain_1": _normalize_domain(domain_1)}
-    else:
-        sql = text("""
-            SELECT id FROM public.clients_requests
-            WHERE inn = :inn
-            ORDER BY id DESC LIMIT 1
-        """)
-        params = {"inn": inn}
-
-    async with engine.begin() as conn:
-        res = await conn.execute(sql, params)
-        row = res.first()
-        return int(row[0]) if row else None
 
 async def clients_requests_exists() -> bool:
     """
@@ -116,7 +133,7 @@ def _normalize_domain(domain: Optional[str]) -> Optional[str]:
 
 
 def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> dict:
-    """Готовим словарь параметров под INSERT в clients_requests."""
+    """Готовим словарь параметров под INSERT/UPDATE в clients_requests."""
     emails = summary.get("emails") or []
     if isinstance(emails, list):
         emails_str = ", ".join(str(e) for e in emails if e)
@@ -126,10 +143,10 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
     main_okved = summary.get("main_okved")
     okveds = summary.get("okveds") or []
 
-    # убрать дубликат главного ОКВЭД из вторичных (если коды совпадают)
     def _get_code(x):
         return x.get("code") or x.get("value") or x.get("okved") if isinstance(x, dict) else str(x)
 
+    # убрать дубликат главного ОКВЭД из вторичных (если коды совпадают)
     secondaries = []
     for it in okveds:
         code = _get_code(it)
@@ -139,10 +156,10 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
     secondaries = [x for x in secondaries if x]          # убрать None/пустые
     secondaries = (secondaries + [None] * 7)[:7]         # до 7 шт
 
-    row = {
+    return {
         "company_name": summary.get("short_name"),
         "inn": summary.get("inn"),
-        "domain_1": _normalize_domain(domain),  # <-- здесь ставим переданный домен (или None)
+        "domain_1": _normalize_domain(domain),  # переданный домен (или None)
         "domain_2": emails_str,                 # emails списком → строка
         "okved_main": main_okved,
         "okved_vtor_1": secondaries[0],
@@ -153,7 +170,35 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
         "okved_vtor_6": secondaries[5],
         "okved_vtor_7": secondaries[6],
     }
-    return row
+
+
+# ---------- CRUD for clients_requests ----------
+
+async def get_clients_request_id(inn: str, domain_1: Optional[str] = None) -> Optional[int]:
+    """
+    Ищет id в public.clients_requests по ИНН и, опционально, domain_1.
+    Если domain_1 не задан, берём последний по времени id.
+    """
+    engine = get_parsing_engine()
+    if domain_1:
+        sql = text("""
+            SELECT id FROM public.clients_requests
+            WHERE inn = :inn AND domain_1 = :domain_1
+            ORDER BY id DESC LIMIT 1
+        """)
+        params = {"inn": inn, "domain_1": _normalize_domain(domain_1)}
+    else:
+        sql = text("""
+            SELECT id FROM public.clients_requests
+            WHERE inn = :inn
+            ORDER BY id DESC LIMIT 1
+        """)
+        params = {"inn": inn}
+
+    async with engine.begin() as conn:
+        res = await conn.execute(sql, params)
+        row = res.first()
+        return int(row[0]) if row else None
 
 
 async def push_clients_request(summary: dict, domain: Optional[str] = None) -> bool:
@@ -208,10 +253,6 @@ async def push_clients_request(summary: dict, domain: Optional[str] = None) -> b
         return False
 
 
-# =========================
-# Новое: явное создание clients_requests с возвратом id (+fallback)
-# =========================
-
 async def create_clients_request(company_name: str, inn: str, domain_1: Optional[str]) -> int:
     """
     Явно создаём запись в clients_requests и возвращаем её id.
@@ -258,9 +299,7 @@ async def create_clients_request(company_name: str, inn: str, domain_1: Optional
         return found_id
 
 
-# =========================
-# Новое: массовая вставка чанков в pars_site
-# =========================
+# ---------- pars_site bulk insert ----------
 
 async def insert_pars_site_chunks(
     company_id: int,
@@ -291,9 +330,8 @@ async def insert_pars_site_chunks(
     url_val = url  # ожидаем полный URL главной страницы
 
     async with engine.begin() as conn:
-        # Вставляем кусками, чтобы не уткнуться в лимиты драйвера
         for i in range(0, len(chunks), batch_size):
-            part = chunks[i : i + batch_size]
+            part = chunks[i: i + batch_size]
             rows = [
                 {
                     "company_id": company_id,
@@ -303,7 +341,6 @@ async def insert_pars_site_chunks(
                 }
                 for ch in part
             ]
-            # В SQLAlchemy 2.0 executemany достигается передачей списка параметров:
             await conn.execute(sql, rows)
             total += len(rows)
 

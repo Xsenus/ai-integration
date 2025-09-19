@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncGenerator, Callable, Awaitable, Any, Optional
+import logging
+from typing import AsyncGenerator, Callable, Awaitable, Any
 
-import asyncpg
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -15,6 +15,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from ..config import settings
+
+log = logging.getLogger(__name__)
 
 engine_bitrix: AsyncEngine | None = None
 SessionBitrix: async_sessionmaker[AsyncSession] | None = None
@@ -30,14 +32,13 @@ async def run_with_retry(
     """
     Запускает корутину с ретраями. Между попытками — линейная задержка.
     """
-    last_exc: Optional[BaseException] = None
+    last_exc: BaseException | None = None
     for i in range(tries):
         try:
             return await coro_factory()
         except BaseException as e:
             last_exc = e
             await asyncio.sleep(delay * (i + 1))
-    # Никогда не поднимаем "None" как исключение
     raise RuntimeError(f"Operation failed after {tries} retries") from last_exc
 
 
@@ -46,98 +47,62 @@ async def ping_engine(engine: AsyncEngine) -> None:
         await conn.execute(text("SELECT 1"))
 
 
-def quote_literal(val: str) -> str:
-    """
-    Экранирует строку как SQL-литерал для Postgres.
-    Превращает одинарные кавычки в двойные: O'Neil -> 'O''Neil'
-    """
-    if not isinstance(val, str):
-        raise TypeError("literal must be str")
-    if "\x00" in val:
-        raise ValueError("NUL byte is not allowed in literals")
-    return "'" + val.replace("'", "''") + "'"
-
-
-def quote_ident(name: str) -> str:
-    """
-    Безопасное квотирование идентификатора Postgres:
-    - экранирует двойные кавычки,
-    - оборачивает в двойные кавычки,
-    - запрещает NUL-байт.
-    """
-    if not isinstance(name, str):
-        raise TypeError("identifier must be str")
-    if "\x00" in name:
-        raise ValueError("NUL byte is not allowed in identifiers")
-    return '"' + name.replace('"', '""') + '"'
-
-
 async def wait_for_postgres(retries: int = 30, delay: float = 0.5) -> None:
-    """Ждём, пока админ-подключение начнёт проходить (устойчиво к старту службы)."""
-    last_err: Optional[BaseException] = None
-    for _ in range(retries):
-        try:
-            conn = await asyncpg.connect(settings.bootstrap_dsn, timeout=3)
-            await conn.close()
-            return
-        except BaseException as e:
-            last_err = e
-            await asyncio.sleep(delay)
-    raise RuntimeError(f"Postgres is not reachable after {retries} retries") from last_err
+    """
+    Ждём доступности БД через SQLAlchemy по settings.bitrix_url.
+    Bootstrap-dsn/asyncpg не используются.
+    """
+    if not settings.bitrix_url:
+        raise RuntimeError("BITRIX_DATABASE_URL is not set")
+
+    engine = create_async_engine(settings.bitrix_url, pool_pre_ping=True, future=True)
+    last_err: BaseException | None = None
+
+    try:
+        for _ in range(retries):
+            try:
+                async with engine.connect() as conn:
+                    await conn.execute(text("SELECT 1"))
+                return
+            except BaseException as e:
+                last_err = e
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"Postgres is not reachable after {retries} retries") from last_err
+    finally:
+        # гарантированно освобождаем ресурсы
+        await engine.dispose()
 
 
-# ---------- Bootstrap (role + database) ----------
+# ---------- Bootstrap (no-op в DSN-режиме) ----------
 
 async def ensure_app_role_exists() -> None:
     """
-    Создаёт/обновляет роль приложения (PG_USER) через bootstrap-подключение.
-    PASSWORD в DDL нельзя параметризовать — подставляем как литерал.
+    NO-OP: в DSN-режиме роли/пользователи создаются вне приложения.
+    Оставлено для обратной совместимости.
     """
-    conn = await asyncpg.connect(settings.bootstrap_dsn)
-    try:
-        role_exists = await conn.fetchval(
-            "SELECT 1 FROM pg_roles WHERE rolname = $1",
-            settings.PG_USER,
-        )
-
-        role_ident = quote_ident(settings.PG_USER)
-        pwd_lit = quote_literal(settings.PG_PASSWORD)
-
-        if not role_exists:
-            await conn.execute(f"CREATE ROLE {role_ident} WITH LOGIN PASSWORD {pwd_lit}")
-        else:
-            await conn.execute(f"ALTER ROLE {role_ident} WITH PASSWORD {pwd_lit}")
-    finally:
-        await conn.close()
+    log.info("ensure_app_role_exists(): skipped (DSN-only mode)")
 
 
 async def ensure_bitrix_database_exists() -> None:
     """
-    Создаёт БД BITRIX_DB_NAME (владелец PG_USER) через bootstrap-подключение.
+    NO-OP: в DSN-режиме БД создаётся вне приложения.
+    Оставлено для обратной совместимости.
     """
-    conn = await asyncpg.connect(settings.bootstrap_dsn)
-    try:
-        exists = await conn.fetchval(
-            "SELECT 1 FROM pg_database WHERE datname = $1",
-            settings.BITRIX_DB_NAME,
-        )
-        if not exists:
-            role_ident = quote_ident(settings.PG_USER)
-            db_ident = quote_ident(settings.BITRIX_DB_NAME)
-            await conn.execute(f"CREATE DATABASE {db_ident} OWNER {role_ident}")
-    finally:
-        await conn.close()
+    log.info("ensure_bitrix_database_exists(): skipped (DSN-only mode)")
 
 
 # ---------- Engine / Session ----------
 
 async def init_bitrix_engine() -> None:
     """Инициализация движка и фабрики сессий для bitrix_data."""
+    if not settings.bitrix_url:
+        raise RuntimeError("BITRIX_DATABASE_URL is not set")
     global engine_bitrix, SessionBitrix
     engine_bitrix = create_async_engine(
         settings.bitrix_url,
-        echo=settings.ECHO_SQL,
+        echo=getattr(settings, "ECHO_SQL", False),
         pool_pre_ping=True,
+        future=True,
     )
     SessionBitrix = async_sessionmaker(engine_bitrix, expire_on_commit=False)
 
