@@ -72,7 +72,12 @@ def _okved_text(item: Any) -> str | None:
 
 
 def _normalize_domain(domain: Optional[str]) -> Optional[str]:
-    """Нормализация домена: вырезаем протокол/путь, host в lower без www."""
+    """
+    Нормализуем домен к виду ДЛЯ pars_site (БЕЗ 'www.'):
+      - обрезаем протокол/путь
+      - host в lower
+      - убираем ведущий 'www.'
+    """
     if not domain:
         return None
     s = domain.strip()
@@ -85,11 +90,22 @@ def _normalize_domain(domain: Optional[str]) -> Optional[str]:
     return host or None
 
 
+def _ensure_www(domain: Optional[str]) -> Optional[str]:
+    """
+    Возвращает домен в формате ДЛЯ clients_requests (С 'www.').
+    Принимает сырой домен/URL, сам нормализует и добавит 'www.' при необходимости.
+    """
+    base = _normalize_domain(domain)  # уже без www
+    if not base:
+        return None
+    return f"www.{base}"
+
+
 def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> dict:
     """
     Готовит поля под INSERT/UPDATE в public.clients_requests:
       - company_name, inn
-      - domain_1 (нормализованный домен), domain_2 (e-mail'ы через запятую)
+      - domain_1 (ВНИМАНИЕ: С 'www.'), domain_2 (e-mail'ы через запятую)
       - okved_main
       - okved_vtor_1..7 (до 7 вторичных ОКВЭД, без дубликата главного)
     """
@@ -125,7 +141,8 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
     return {
         "company_name": summary.get("short_name"),
         "inn": summary.get("inn"),
-        "domain_1": _normalize_domain(domain),
+        # ВАЖНО: для clients_requests.domain_1 храним С 'www.'
+        "domain_1": _ensure_www(domain),
         "domain_2": emails_str,
         "okved_main": main_okved,
         "okved_vtor_1": pick(0),
@@ -141,7 +158,10 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
 # ---------- CRUD for clients_requests ----------
 
 async def get_clients_request_id(inn: str, domain_1: Optional[str] = None) -> Optional[int]:
-    """Возвращает id последней записи по ИНН (+ опц. domain_1) из public.clients_requests."""
+    """
+    Возвращает id последней записи по ИНН (+ опц. domain_1) из public.clients_requests.
+    ВНИМАНИЕ: поиск по domain_1 выполняем в том же формате, как мы храним — С 'www.'.
+    """
     eng = get_parsing_engine()
     if eng is None:
         return None
@@ -151,7 +171,7 @@ async def get_clients_request_id(inn: str, domain_1: Optional[str] = None) -> Op
             "SELECT id FROM public.clients_requests "
             "WHERE inn = :inn AND domain_1 = :d ORDER BY id DESC LIMIT 1"
         )
-        params = {"inn": inn, "d": _normalize_domain(domain_1)}
+        params = {"inn": inn, "d": _ensure_www(domain_1)}
     else:
         sql = text(
             "SELECT id FROM public.clients_requests "
@@ -168,6 +188,9 @@ async def push_clients_request(summary: dict, domain: Optional[str] = None) -> b
     """
     Upsert по inn: UPDATE … WHERE inn; если 0 строк — INSERT.
     Если нет соединения/таблицы — тихо выходим (best-effort).
+
+    Соглашение подтверждено:
+      - clients_requests.domain_1 храним С 'www.'
     """
     if not await clients_requests_exists():
         return False
@@ -240,12 +263,15 @@ async def pars_site_insert_chunks(
     Дубликаты по (company_id, domain_1, url, start, end) не вставляются
     (делаем WHERE NOT EXISTS для совместимости даже без уникального индекса).
     Возвращает количество реально вставленных записей.
+
+    Соглашение подтверждено:
+      - pars_site.domain_1 храним БЕЗ 'www.'
     """
     eng = get_parsing_engine()
     if eng is None:
         return 0
 
-    dom = _normalize_domain(domain_1) or domain_1
+    dom = _normalize_domain(domain_1) or domain_1  # гарантируем хранение без 'www.'
     inserted = 0
 
     def _coerce_chunk(ch: Mapping[str, Any] | tuple[int, int, str]) -> Optional[dict]:
@@ -310,7 +336,6 @@ async def _flush_pars_site_batch(conn, rows: list[dict]) -> int:
     total = 0
     for row in rows:
         res = await conn.execute(sql, row)
-        # rowcount в SA 2.x для INSERT обычно 1 или 0 (если NOT EXISTS сработал)
         try:
             total += int(getattr(res, "rowcount", 0) or 0)
         except Exception:
