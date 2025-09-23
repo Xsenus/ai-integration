@@ -1,5 +1,9 @@
+# app/services/dadata_client.py
 from __future__ import annotations
+
 import re
+from typing import Any
+
 import httpx
 from app.config import settings
 
@@ -15,17 +19,18 @@ def _ascii_only(value: str | None) -> str:
     return re.sub(r"[^\x20-\x7E]", "", str(value))
 
 
-async def find_party_by_inn(inn: str) -> dict | None:
+async def find_party_by_inn(inn: str) -> dict[str, Any] | None:
+    # Если ключи не заданы — бросаем RequestError, чтобы роуты поймали httpx.HTTPError
     if not settings.DADATA_API_KEY or not settings.DADATA_SECRET_KEY:
-        raise RuntimeError("DaData API keys are not configured")
+        req = httpx.Request("POST", DADATA_SUGGEST_URL)
+        raise httpx.RequestError("DaData API keys are not configured", request=req)
 
-    # Сначала формируем, затем прогоняем через ASCII-санитайзер.
+    # Заголовки → ASCII
     raw_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Token {str(settings.DADATA_API_KEY).strip()}",
         "X-Secret": str(settings.DADATA_SECRET_KEY).strip(),
-        # Явно зададим ASCII-only User-Agent:
         "User-Agent": "ai-integration/1.0 (+https://example.com)",
     }
     headers = {k: _ascii_only(v) for k, v in raw_headers.items() if v is not None and _ascii_only(v) != ""}

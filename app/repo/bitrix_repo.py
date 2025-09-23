@@ -1,39 +1,35 @@
+# app/repo/bitrix_repo.py
 from __future__ import annotations
-
-from sqlalchemy import select, delete
+from typing import Any
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.models.bitrix import DaDataResult, DaDataResultFullJSON
 
-
-async def replace_dadata_raw(session: AsyncSession, inn: str, payload: dict) -> None:
+async def replace_dadata_raw(session: AsyncSession, inn: str, payload: dict[str, Any]) -> None:
     """
-    В таблице dadata_result_full_json держим ровно одну строку на ИНН:
-    удаляем все старые строки по inn и вставляем свежую.
+    Держим ровно одну «сырую» запись JSON на ИНН в dadata_result_full_json:
+    удаляем все старые строки по inn и вставляем свежую. Commit — снаружи.
     """
     await session.execute(delete(DaDataResultFullJSON).where(DaDataResultFullJSON.inn == inn))
-    await session.execute(
-        insert(DaDataResultFullJSON).values(inn=inn, payload=payload)
-    )
+    await session.execute(insert(DaDataResultFullJSON).values(inn=inn, payload=payload))
 
 
-async def upsert_company_summary(session: AsyncSession, data: dict) -> None:
+async def upsert_company_summary(session: AsyncSession, data: dict[str, Any]) -> None:
     """
-    Upsert в dadata_result по PK(inn).
+    UPSERT в dadata_result по PK (inn). Commit — снаружи.
     """
     stmt = insert(DaDataResult).values(**data)
     stmt = stmt.on_conflict_do_update(
-        index_elements=[DaDataResult.inn],
+        index_elements=[DaDataResult.inn],  # конфликт по PK
         set_={k: stmt.excluded[k] for k in data.keys() if k != "inn"},
     )
     await session.execute(stmt)
 
 
-async def get_last_raw(session: AsyncSession, inn: str) -> dict | None:
+async def get_last_raw(session: AsyncSession, inn: str) -> dict[str, Any] | None:
     """
-    Возвращает последний сохранённый raw JSON по ИНН.
-    (с учётом replace_* всегда будет одна запись)
+    Возвращает последний сохранённый raw JSON по ИНН (обычно единственный).
     """
     q = (
         select(DaDataResultFullJSON.payload)

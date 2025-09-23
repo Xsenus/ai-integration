@@ -1,17 +1,21 @@
+# app/schemas/org.py
 from __future__ import annotations
 
-from typing import Optional, List
-from pydantic import BaseModel, Field
+from typing import Optional, List, Any
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class IngestRequest(BaseModel):
     """Тело запроса — любой JSON от DaData (один объект suggestion/data)."""
-    payload: dict = Field(..., description="Полный JSON-ответ DaData по компании")
+    payload: dict[str, Any] = Field(..., description="Полный JSON-ответ DaData по компании")
     # НЕОБЯЗАТЕЛЬНО: если знаем домен — можем передать
     domain: Optional[str] = Field(None, description="Адрес сайта (домен) компании")
 
 
 class CompanySummaryOut(BaseModel):
+    # Pydantic v2
+    model_config = ConfigDict(from_attributes=True)
+
     inn: Optional[str]
     short_name: Optional[str]
     short_name_opf: Optional[str]
@@ -28,7 +32,7 @@ class CompanySummaryOut(BaseModel):
     status: Optional[str]
     employee_count: Optional[int]
     main_okved: Optional[str]
-    okveds: Optional[list]
+    okveds: Optional[List[Any]]
     year: Optional[int]
     income: Optional[float]
     revenue: Optional[float]
@@ -38,19 +42,16 @@ class CompanySummaryOut(BaseModel):
     phones: Optional[List[str]]
     emails: Optional[List[str]]
 
-    class Config:
-        from_attributes = True
-
 
 class OrgResponse(BaseModel):
     """Базовый ответ: сводка + последний raw JSON."""
     summary: Optional[CompanySummaryOut]
-    raw_last: Optional[dict]
+    raw_last: Optional[dict[str, Any]]
 
 
 # -------- Расширенная карточка --------
 class CompanyCard(BaseModel):
-    # Поля из твоего полного списка
+    # Поля из полного списка
     inn: Optional[str] = None
     short_name: Optional[str] = None
     short_name_opf: Optional[str] = None
@@ -72,7 +73,7 @@ class CompanyCard(BaseModel):
 
     # ОКВЭД
     main_okved: Optional[str] = None
-    okved_main: Optional[str] = None 
+    okved_main: Optional[str] = None
     okved_vtor_1: Optional[str] = None
     okved_vtor_2: Optional[str] = None
     okved_vtor_3: Optional[str] = None

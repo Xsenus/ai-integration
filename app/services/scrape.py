@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -12,10 +11,12 @@ from bs4 import BeautifulSoup
 
 from app.config import settings
 
-log = logging.getLogger("dadata-bitrix")
+log = logging.getLogger("services.scrape")
+
 
 class FetchError(RuntimeError):
     pass
+
 
 def normalize_whitespace(text: str) -> str:
     text = re.sub(r"\r", "\n", text)
@@ -23,10 +24,13 @@ def normalize_whitespace(text: str) -> str:
     text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
     return text.strip()
 
+
 def hard_split(text: str, chunk_size: int) -> list[str]:
     if not text:
         return []
-    return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    size = int(chunk_size)
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
 
 def to_home_url(domain_or_url: str) -> str:
     # поддержим и "uniconf.ru", и "https://uniconf.ru", и "www.uniconf.ru/"
@@ -38,6 +42,7 @@ def to_home_url(domain_or_url: str) -> str:
     parsed = urlparse(d)
     host = parsed.netloc.replace("www.", "")
     return f"https://{host}/"
+
 
 async def fetch_home_via_scraperapi(domain_or_url: str, *, retries: int = 5) -> str:
     if not settings.SCRAPERAPI_KEY:
@@ -69,12 +74,14 @@ async def fetch_home_via_scraperapi(domain_or_url: str, *, retries: int = 5) -> 
     # не должно сюда дойти
     raise FetchError("Unreachable")
 
+
 def html_to_full_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
         tag.decompose()
     raw_text = soup.get_text(separator="\n")
     return normalize_whitespace(raw_text)
+
 
 async def fetch_and_chunk(domain_or_url: str) -> tuple[str, list[str], str]:
     """

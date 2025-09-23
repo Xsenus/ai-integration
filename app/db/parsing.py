@@ -2,108 +2,61 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, Iterable, Mapping
 from urllib.parse import urlparse
 
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from ..config import settings
+from app.config import settings
 
-log = logging.getLogger("dadata-bitrix")
+log = logging.getLogger("db.parsing")
 
-engine_parsing: AsyncEngine | None = None
+_engine_parsing: Optional[AsyncEngine] = None
 
 
 # ---------- Engine ----------
 
-def get_parsing_engine() -> AsyncEngine:
-    """Lazy-инициализация engine для parsing_data (DSN-only)."""
-    if not settings.parsing_url:
-        raise RuntimeError("PARSING_DATABASE_URL is not set")
-    global engine_parsing
-    if engine_parsing is None:
-        engine_parsing = create_async_engine(
-            settings.parsing_url,
-            pool_pre_ping=True,
-            future=True,
-            echo=getattr(settings, "ECHO_SQL", False),
+def get_parsing_engine() -> Optional[AsyncEngine]:
+    """
+    Ленивая инициализация движка для БД parsing_data.
+    Если DSN не задан — возвращает None (мягкое отключение).
+    """
+    global _engine_parsing
+    url = settings.parsing_url
+    if not url:
+        log.warning("PARSING_DATABASE_URL не задан — соединение с parsing_data отключено")
+        return None
+    if _engine_parsing is None:
+        _engine_parsing = create_async_engine(
+            url, pool_pre_ping=True, future=True, echo=settings.ECHO_SQL
         )
-    return engine_parsing
-
-
-async def wait_for_parsing_db(retries: int = 30, delay: float = 0.5) -> None:
-    """
-    Ждём доступности parsing_data через SQLAlchemy (SELECT 1).
-    Полезно вызывать на старте рядом с проверкой bitrix.
-    """
-    if not settings.parsing_url:
-        log.info("PARSING_DATABASE_URL не задан — пропускаю ожидание parsing_data.")
-        return
-
-    engine = create_async_engine(
-        settings.parsing_url, pool_pre_ping=True, future=True
-    )
-    last_err: BaseException | None = None
-    try:
-        for _ in range(retries):
-            try:
-                async with engine.connect() as conn:
-                    await conn.execute(text("SELECT 1"))
-                return
-            except BaseException as e:
-                last_err = e
-                # локальный sleep, чтобы без лишних зависимостей
-                import asyncio
-                await asyncio.sleep(delay)
-        raise RuntimeError(f"parsing_data is not reachable after {retries} retries") from last_err
-    finally:
-        await engine.dispose()
+    return _engine_parsing
 
 
 # ---------- Helpers ----------
 
 async def table_exists(table_qualified: str) -> bool:
-    """
-    Проверяет наличие таблицы в parsing_data.
-    Принимает 'public.clients_requests' или 'public.pars_site'.
-    """
-    try:
-        engine = get_parsing_engine()
-        async with engine.connect() as conn:
-            res = await conn.execute(text("SELECT to_regclass(:tname)"), {"tname": table_qualified})
-            return res.scalar_one_or_none() is not None
-    except Exception as e:
-        log.info("Нет соединения с parsing_data (%s) — пропускаю операции для %s.", e, table_qualified)
+    """Проверяет наличие таблицы (например, 'public.clients_requests') в parsing_data."""
+    eng = get_parsing_engine()
+    if eng is None:
         return False
-
-
-async def pars_site_exists() -> bool:
-    return await table_exists("public.pars_site")
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(text("SELECT to_regclass(:t)"), {"t": table_qualified})
+            return res.scalar_one_or_none() is not None
+    except Exception as e:  # noqa: BLE001
+        log.info("Ошибка соединения с parsing_data (%s) — пропускаю проверку %s.", e, table_qualified)
+        return False
 
 
 async def clients_requests_exists() -> bool:
-    """
-    Проверяем, что есть соединение и существует таблица public.clients_requests.
-    НИЧЕГО не создаём, только проверяем.
-    """
-    try:
-        engine = get_parsing_engine()
-        async with engine.connect() as conn:
-            res = await conn.execute(text("SELECT to_regclass('public.clients_requests')"))
-            reg = res.scalar_one_or_none()
-            if reg is None:
-                log.info("В parsing_data таблица public.clients_requests не найдена — пропускаю запись.")
-                return False
-            return True
-    except Exception as e:
-        log.info("Нет соединения с parsing_data (%s) — пропускаю запись в clients_requests.", e)
-        return False
+    """Есть ли таблица public.clients_requests в parsing_data."""
+    return await table_exists("public.clients_requests")
 
 
 def _okved_text(item: Any) -> str | None:
-    """Превращаем элемент okved в читаемый текст 'код — наименование'."""
+    """Формат 'код — наименование' из dict/str."""
     if item is None:
         return None
     if isinstance(item, dict):
@@ -119,7 +72,7 @@ def _okved_text(item: Any) -> str | None:
 
 
 def _normalize_domain(domain: Optional[str]) -> Optional[str]:
-    """Нормализуем домен: вырезаем протокол/путь, берём host, в нижний регистр, без www."""
+    """Нормализация домена: вырезаем протокол/путь, host в lower без www."""
     if not domain:
         return None
     s = domain.strip()
@@ -133,7 +86,14 @@ def _normalize_domain(domain: Optional[str]) -> Optional[str]:
 
 
 def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> dict:
-    """Готовим словарь параметров под INSERT/UPDATE в clients_requests."""
+    """
+    Готовит поля под INSERT/UPDATE в public.clients_requests:
+      - company_name, inn
+      - domain_1 (нормализованный домен), domain_2 (e-mail'ы через запятую)
+      - okved_main
+      - okved_vtor_1..7 (до 7 вторичных ОКВЭД, без дубликата главного)
+    """
+    # emails -> строка
     emails = summary.get("emails") or []
     if isinstance(emails, list):
         emails_str = ", ".join(str(e) for e in emails if e)
@@ -144,70 +104,72 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
     okveds = summary.get("okveds") or []
 
     def _get_code(x):
-        return x.get("code") or x.get("value") or x.get("okved") if isinstance(x, dict) else str(x)
+        if isinstance(x, dict):
+            return x.get("code") or x.get("value") or x.get("okved")
+        return str(x) if x is not None else None
 
-    # убрать дубликат главного ОКВЭД из вторичных (если коды совпадают)
-    secondaries = []
+    # Собираем вторичные коды в list[str] без None внутри и без дубликата главного
+    secondaries: list[str] = []
     for it in okveds:
         code = _get_code(it)
         if main_okved and code and str(code) == str(main_okved):
             continue
-        secondaries.append(_okved_text(it))
-    secondaries = [x for x in secondaries if x]          # убрать None/пустые
-    secondaries = (secondaries + [None] * 7)[:7]         # до 7 шт
+        txt = _okved_text(it)  # использует 'код — наименование', если dict
+        if txt:
+            secondaries.append(txt)
+    secondaries = secondaries[:7]  # максимум 7
+
+    def pick(i: int) -> Optional[str]:
+        return secondaries[i] if i < len(secondaries) else None
 
     return {
         "company_name": summary.get("short_name"),
         "inn": summary.get("inn"),
-        "domain_1": _normalize_domain(domain),  # переданный домен (или None)
-        "domain_2": emails_str,                 # emails списком → строка
+        "domain_1": _normalize_domain(domain),
+        "domain_2": emails_str,
         "okved_main": main_okved,
-        "okved_vtor_1": secondaries[0],
-        "okved_vtor_2": secondaries[1],
-        "okved_vtor_3": secondaries[2],
-        "okved_vtor_4": secondaries[3],
-        "okved_vtor_5": secondaries[4],
-        "okved_vtor_6": secondaries[5],
-        "okved_vtor_7": secondaries[6],
+        "okved_vtor_1": pick(0),
+        "okved_vtor_2": pick(1),
+        "okved_vtor_3": pick(2),
+        "okved_vtor_4": pick(3),
+        "okved_vtor_5": pick(4),
+        "okved_vtor_6": pick(5),
+        "okved_vtor_7": pick(6),
     }
 
 
 # ---------- CRUD for clients_requests ----------
 
 async def get_clients_request_id(inn: str, domain_1: Optional[str] = None) -> Optional[int]:
-    """
-    Ищет id в public.clients_requests по ИНН и, опционально, domain_1.
-    Если domain_1 не задан, берём последний по времени id.
-    """
-    engine = get_parsing_engine()
+    """Возвращает id последней записи по ИНН (+ опц. domain_1) из public.clients_requests."""
+    eng = get_parsing_engine()
+    if eng is None:
+        return None
+
     if domain_1:
-        sql = text("""
-            SELECT id FROM public.clients_requests
-            WHERE inn = :inn AND domain_1 = :domain_1
-            ORDER BY id DESC LIMIT 1
-        """)
-        params = {"inn": inn, "domain_1": _normalize_domain(domain_1)}
+        sql = text(
+            "SELECT id FROM public.clients_requests "
+            "WHERE inn = :inn AND domain_1 = :d ORDER BY id DESC LIMIT 1"
+        )
+        params = {"inn": inn, "d": _normalize_domain(domain_1)}
     else:
-        sql = text("""
-            SELECT id FROM public.clients_requests
-            WHERE inn = :inn
-            ORDER BY id DESC LIMIT 1
-        """)
+        sql = text(
+            "SELECT id FROM public.clients_requests "
+            "WHERE inn = :inn ORDER BY id DESC LIMIT 1"
+        )
         params = {"inn": inn}
 
-    async with engine.begin() as conn:
-        res = await conn.execute(sql, params)
-        row = res.first()
+    async with eng.begin() as conn:
+        row = (await conn.execute(sql, params)).first()
         return int(row[0]) if row else None
 
 
 async def push_clients_request(summary: dict, domain: Optional[str] = None) -> bool:
     """
-    Upsert по inn: сначала UPDATE, если затронуто 0 строк — INSERT.
+    Upsert по inn: UPDATE … WHERE inn; если 0 строк — INSERT.
     Если нет соединения/таблицы — тихо выходим (best-effort).
     """
-    available = await clients_requests_exists()
-    if not available:
+    if not await clients_requests_exists():
         return False
 
     row = _prepare_row_from_summary(summary, domain=domain)
@@ -215,23 +177,23 @@ async def push_clients_request(summary: dict, domain: Optional[str] = None) -> b
         log.info("Не указан ИНН — запись в clients_requests пропущена.")
         return False
 
-    update_sql = text("""
+    sql_update = text("""
         UPDATE public.clients_requests
-        SET company_name  = :company_name,
-            domain_1      = COALESCE(:domain_1, domain_1),
-            domain_2      = :domain_2,
-            okved_main    = :okved_main,
-            okved_vtor_1  = :okved_vtor_1,
-            okved_vtor_2  = :okved_vtor_2,
-            okved_vtor_3  = :okved_vtor_3,
-            okved_vtor_4  = :okved_vtor_4,
-            okved_vtor_5  = :okved_vtor_5,
-            okved_vtor_6  = :okved_vtor_6,
-            okved_vtor_7  = :okved_vtor_7
-        WHERE inn = :inn
+        SET company_name=:company_name,
+            domain_1=COALESCE(:domain_1, domain_1),
+            domain_2=:domain_2,
+            okved_main=:okved_main,
+            okved_vtor_1=:okved_vtor_1,
+            okved_vtor_2=:okved_vtor_2,
+            okved_vtor_3=:okved_vtor_3,
+            okved_vtor_4=:okved_vtor_4,
+            okved_vtor_5=:okved_vtor_5,
+            okved_vtor_6=:okved_vtor_6,
+            okved_vtor_7=:okved_vtor_7
+        WHERE inn=:inn
     """)
 
-    insert_sql = text("""
+    sql_insert = text("""
         INSERT INTO public.clients_requests
         (company_name, inn, domain_1, domain_2, okved_main,
          okved_vtor_1, okved_vtor_2, okved_vtor_3, okved_vtor_4, okved_vtor_5, okved_vtor_6, okved_vtor_7)
@@ -240,109 +202,117 @@ async def push_clients_request(summary: dict, domain: Optional[str] = None) -> b
          :okved_vtor_1, :okved_vtor_2, :okved_vtor_3, :okved_vtor_4, :okved_vtor_5, :okved_vtor_6, :okved_vtor_7)
     """)
 
+    eng = get_parsing_engine()
+    if eng is None:
+        return False
+
     try:
-        engine = get_parsing_engine()
-        async with engine.begin() as conn:
-            res = await conn.execute(update_sql, row)
+        async with eng.begin() as conn:
+            res = await conn.execute(sql_update, row)
             if getattr(res, "rowcount", 0) == 0:
-                await conn.execute(insert_sql, row)
-        log.info("clients_requests upsert для ИНН %s выполнен (domain_1=%s)", row["inn"], row["domain_1"])
+                await conn.execute(sql_insert, row)
+        log.info("clients_requests upsert: inn=%s, domain_1=%s", row["inn"], row["domain_1"])
         return True
-    except Exception as e:
-        log.warning("clients_requests upsert не удался (ИНН %s): %s", row.get("inn"), e)
+    except Exception as e:  # noqa: BLE001
+        log.warning("clients_requests upsert не удался (inn=%s): %s", row.get("inn"), e)
         return False
 
 
-async def create_clients_request(company_name: str, inn: str, domain_1: Optional[str]) -> int:
-    """
-    Явно создаём запись в clients_requests и возвращаем её id.
-    Если запись уже существует (конфликт уникальности на твоей стороне),
-    делаем fallback: ищем id по (inn, domain_1).
-    """
-    engine = get_parsing_engine()
-    insert_sql = text("""
-        INSERT INTO public.clients_requests (company_name, inn, domain_1)
-        VALUES (:company_name, :inn, :domain_1)
-        RETURNING id
-    """)
-    select_sql = text("""
-        SELECT id
-        FROM public.clients_requests
-        WHERE inn = :inn
-          AND (:domain_1 IS NULL OR domain_1 = :domain_1)
-        ORDER BY id DESC
-        LIMIT 1
-    """)
+# ---------- INSERT into pars_site ----------
 
-    domain_norm = _normalize_domain(domain_1)
-
-    try:
-        async with engine.begin() as conn:
-            res = await conn.execute(insert_sql, {
-                "company_name": company_name,
-                "inn": inn,
-                "domain_1": domain_norm,
-            })
-            new_id = res.scalar_one()
-            log.info("clients_requests: создан id=%s (inn=%s, domain_1=%s)", new_id, inn, domain_norm)
-            return int(new_id)
-    except SQLAlchemyError as e:
-        log.info("create_clients_request: insert conflict (%s), пробуем SELECT id", e)
-
-    async with engine.begin() as conn:
-        res = await conn.execute(select_sql, {"inn": inn, "domain_1": domain_norm})
-        row = res.first()
-        if not row:
-            raise RuntimeError("Не удалось создать/найти clients_requests.id")
-        found_id = int(row[0])
-        log.info("clients_requests: найден id=%s для (inn=%s, domain_1=%s)", found_id, inn, domain_norm)
-        return found_id
-
-
-# ---------- pars_site bulk insert ----------
-
-async def insert_pars_site_chunks(
+async def pars_site_insert_chunks(
+    *,
     company_id: int,
     domain_1: str,
     url: str,
-    chunks: list[str],
+    chunks: Iterable[Mapping[str, Any] | tuple[int, int, str]],
     batch_size: int = 500,
 ) -> int:
     """
-    Вставляет чанки в pars_site:
-      (company_id, domain_1, text_par, url, created_at DEFAULT now(), text_vector NULL)
-    Возвращает количество вставленных строк.
+    Массовая вставка чанков в public.pars_site.
 
-    Для надёжности делаем вставку батчами (во избежание ограничений executemany).
+    Ожидается, что каждый чанк — либо dict с полями:
+      - start: int
+      - end: int
+      - text: str
+    либо tuple(start, end, text).
+
+    Дубликаты по (company_id, domain_1, url, start, end) не вставляются
+    (делаем WHERE NOT EXISTS для совместимости даже без уникального индекса).
+    Возвращает количество реально вставленных записей.
     """
-    if not chunks:
-        log.info("pars_site: список чанков пуст — вставка пропущена.")
+    eng = get_parsing_engine()
+    if eng is None:
         return 0
 
-    engine = get_parsing_engine()
-    sql = text("""
-        INSERT INTO public.pars_site (company_id, domain_1, text_par, url, created_at, text_vector)
-        VALUES (:company_id, :domain_1, :text_par, :url, NOW(), NULL)
-    """)
+    dom = _normalize_domain(domain_1) or domain_1
+    inserted = 0
+
+    def _coerce_chunk(ch: Mapping[str, Any] | tuple[int, int, str]) -> Optional[dict]:
+        if isinstance(ch, tuple) and len(ch) == 3:
+            start, end, txt = ch
+        elif isinstance(ch, Mapping):
+            start = int(ch.get("start", 0))
+            end = int(ch.get("end", 0))
+            txt = ch.get("text")
+        else:
+            return None
+        if txt is None:
+            return None
+        s = int(start)
+        e = int(end)
+        t = str(txt)
+        if not t:
+            return None
+        return {"company_id": company_id, "domain_1": dom, "url": url, "start": s, "end": e, "text": t}
+
+    # Подготовка батча
+    buf: list[dict] = []
+    async with eng.begin() as conn:
+        for ch in chunks:
+            row = _coerce_chunk(ch)
+            if not row:
+                continue
+            buf.append(row)
+            if len(buf) >= batch_size:
+                inserted += await _flush_pars_site_batch(conn, buf)
+                buf.clear()
+        if buf:
+            inserted += await _flush_pars_site_batch(conn, buf)
+            buf.clear()
+
+    return inserted
+
+
+async def _flush_pars_site_batch(conn, rows: list[dict]) -> int:
+    """
+    Вставка батча через INSERT ... SELECT WHERE NOT EXISTS,
+    чтобы не зависеть от наличия UNIQUE индекса.
+    """
+    if not rows:
+        return 0
+
+    sql = text(
+        """
+        INSERT INTO public.pars_site (company_id, domain_1, url, start, "end", text)
+        SELECT :company_id, :domain_1, :url, :start, :end, :text
+        WHERE NOT EXISTS (
+            SELECT 1 FROM public.pars_site ps
+            WHERE ps.company_id = :company_id
+              AND ps.domain_1 = :domain_1
+              AND ps.url = :url
+              AND ps.start = :start
+              AND ps."end" = :end
+        )
+        """
+    )
 
     total = 0
-    domain_norm = _normalize_domain(domain_1)
-    url_val = url  # ожидаем полный URL главной страницы
-
-    async with engine.begin() as conn:
-        for i in range(0, len(chunks), batch_size):
-            part = chunks[i: i + batch_size]
-            rows = [
-                {
-                    "company_id": company_id,
-                    "domain_1": domain_norm,
-                    "text_par": ch,
-                    "url": url_val,
-                }
-                for ch in part
-            ]
-            await conn.execute(sql, rows)
-            total += len(rows)
-
-    log.info("pars_site: вставлено %s строк (company_id=%s, domain_1=%s, url=%s)", total, company_id, domain_norm, url_val)
+    for row in rows:
+        res = await conn.execute(sql, row)
+        # rowcount в SA 2.x для INSERT обычно 1 или 0 (если NOT EXISTS сработал)
+        try:
+            total += int(getattr(res, "rowcount", 0) or 0)
+        except Exception:
+            pass
     return total

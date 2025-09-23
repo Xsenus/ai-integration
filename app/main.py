@@ -2,82 +2,97 @@
 from __future__ import annotations
 
 import logging
-from typing import cast
-
 from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.api.routes import router as api_router
-from app.models.bitrix import BaseBitrix
-import app.db.bitrix as db 
-from starlette.middleware.cors import CORSMiddleware
+
+# DB helpers
+from app.db.bitrix import get_bitrix_engine, ping_bitrix
+from app.db.parsing import get_parsing_engine
+from app.db.pp719 import get_pp719_engine
+from app.db.postgres import get_postgres_engine, ping_postgres
 
 # --- Logging ---
 LOG_LEVEL = (settings.LOG_LEVEL or "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("dadata-bitrix")
+log = logging.getLogger("ai-integration")
 
 # --- FastAPI app ---
-app = FastAPI(title="DaData Bitrix Service", version="1.3.1")
+app = FastAPI(title="ai-integration API", version="1.0.0")
 
-# CORS
-origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "").split(",") if o.strip()]
+# --- CORS (из .env) ---
+origins = [o.strip() for o in (getattr(settings, "CORS_ALLOW_ORIGINS", "") or "").split(",") if o.strip()]
 if origins:
-    methods = [m.strip() for m in (settings.CORS_ALLOW_METHODS or "").split(",") if m.strip()]
-    headers = [h.strip() for h in (settings.CORS_ALLOW_HEADERS or "").split(",") if h.strip()]
+    methods = [m.strip() for m in (getattr(settings, "CORS_ALLOW_METHODS", "") or "").split(",") if m.strip()]
+    headers = [h.strip() for h in (getattr(settings, "CORS_ALLOW_HEADERS", "") or "").split(",") if h.strip()]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
         allow_methods=methods or ["*"],
         allow_headers=headers or ["*"],
-        allow_credentials=bool(settings.CORS_ALLOW_CREDENTIALS),
+        allow_credentials=bool(getattr(settings, "CORS_ALLOW_CREDENTIALS", False)),
     )
 
-app.include_router(api_router)  # подключаем /v1/... маршруты
+# Подключаем /v1/... маршруты
+app.include_router(api_router)
 
 @app.on_event("startup")
-async def startup() -> None:
-    # 0) ждём доступности Postgres (устойчиво к гонкам Windows/Docker)
-    await db.wait_for_postgres(retries=40, delay=0.5)
-
-    # 1) гарантируем наличие роли приложения
-    await db.run_with_retry(lambda: db.ensure_app_role_exists(), tries=8, delay=0.5)
-
-    # 2) гарантируем наличие БД и владельца
-    await db.run_with_retry(lambda: db.ensure_bitrix_database_exists(), tries=8, delay=0.5)
-
-    # 3) инициализируем engine и проверяем коннект
-    await db.init_bitrix_engine()
-    if db.engine_bitrix is None:
-        raise RuntimeError("Bitrix engine was not initialized")
-
-    eng: AsyncEngine = cast(AsyncEngine, db.engine_bitrix)
-    await db.run_with_retry(lambda: db.ping_engine(eng), tries=8, delay=0.5)
-
-    # 4) создаём таблицы (idempotent)
-    await db.create_bitrix_tables(BaseBitrix)
-    log.info("Инициализация завершена. URL: %s", settings.bitrix_url)
-
+async def on_startup() -> None:
+    get_bitrix_engine()
+    get_parsing_engine()
+    get_pp719_engine()
+    get_postgres_engine()
+    log.info("Startup complete: engines initialized (where DSN provided).")
 
 @app.on_event("shutdown")
-async def shutdown() -> None:
-    if db.engine_bitrix is not None:
-        await db.engine_bitrix.dispose()
-        log.info("Соединение с БД закрыто.")
-
+async def on_shutdown() -> None:
+    engines: list[AsyncEngine | None] = [
+        get_bitrix_engine(),
+        get_parsing_engine(),
+        get_pp719_engine(),
+        get_postgres_engine(),
+    ]
+    for eng in engines:
+        if eng is not None:
+            await eng.dispose()
+    log.info("All database engines disposed.")
 
 @app.get("/health")
 async def health():
-    """Простой healthcheck + быстрый SQL ping."""
+    """
+    Healthcheck пингует все четыре базы.
+    ok=true только если доступны все, для которых заданы DSN.
+    """
+    results = {
+        "bitrix_data": await ping_bitrix(),
+        "parsing_data": False,
+        "pp719": False,
+        "postgres": await ping_postgres(),
+    }
+
+    # parsing_data ping
     try:
-        if db.engine_bitrix is None:
-            return {"ok": False, "error": "engine not initialized"}
-        eng: AsyncEngine = cast(AsyncEngine, db.engine_bitrix)
-        async with eng.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return {"ok": True}
+        eng = get_parsing_engine()
+        if eng is not None:
+            async with eng.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            results["parsing_data"] = True
     except Exception as e:
-        log.exception("health failed: %s", e)
-        return {"ok": False, "error": str(e)}    
+        logging.getLogger("db.parsing").warning("parsing ping failed: %s", e)
+
+    # pp719 ping
+    try:
+        eng = get_pp719_engine()
+        if eng is not None:
+            async with eng.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            results["pp719"] = True
+    except Exception as e:
+        logging.getLogger("db.pp719").warning("pp719 ping failed: %s", e)
+
+    ok = all(results.values()) if results else False
+    return {"ok": ok, "connections": results}

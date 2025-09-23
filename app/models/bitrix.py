@@ -1,6 +1,9 @@
+# app/db/bitrix.py
 from __future__ import annotations
 
-from typing import Optional
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Optional
 
 from sqlalchemy import (
     String,
@@ -26,11 +29,12 @@ class DaDataResult(BaseBitrix):
     __tablename__ = "dadata_result"
 
     inn: Mapped[str] = mapped_column(String(20), primary_key=True, doc="ИНН")
+
     short_name: Mapped[Optional[str]] = mapped_column(String(512))
     short_name_opf: Mapped[Optional[str]] = mapped_column(String(512))
 
     management_full_name: Mapped[Optional[str]] = mapped_column(String(512))
-    management_surname_n_p: Mapped[Optional[str]] = mapped_column(String(256))  # 'Фамилия И.О.'
+    management_surname_n_p: Mapped[Optional[str]] = mapped_column(String(256), doc="Фамилия И.О.")
     management_surname: Mapped[Optional[str]] = mapped_column(String(256))
     management_name: Mapped[Optional[str]] = mapped_column(String(256))
     management_patronymic: Mapped[Optional[str]] = mapped_column(String(256))
@@ -47,11 +51,12 @@ class DaDataResult(BaseBitrix):
     employee_count: Mapped[Optional[int]] = mapped_column(Integer, doc="ССЧ2024")
 
     main_okved: Mapped[Optional[str]] = mapped_column(String(32))
-    okveds: Mapped[Optional[list]] = mapped_column(JSONB, doc="до 7 шт (массив объектов/пар)")
+    # до 7 шт (массив строк или объектов {code,name,...})
+    okveds: Mapped[Optional[list[dict[str, Any] | str]]] = mapped_column(JSONB)
 
     year: Mapped[Optional[int]] = mapped_column(Integer)
-    income: Mapped[Optional[float]] = mapped_column(Numeric(18, 2), doc="доходы по бух. отчетности")
-    revenue: Mapped[Optional[float]] = mapped_column(Numeric(18, 2), doc="выручка по бух. отчетности")
+    income: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2), doc="доходы по бух. отчетности")
+    revenue: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2), doc="выручка по бух. отчетности")
 
     smb_type: Mapped[Optional[str]] = mapped_column(String(64), doc="тип документа")
     smb_category: Mapped[Optional[str]] = mapped_column(String(128), doc="Категория предприятия")
@@ -60,7 +65,7 @@ class DaDataResult(BaseBitrix):
     phones: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
     emails: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
 
-    updated_at: Mapped["DateTime"] = mapped_column(
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
@@ -81,8 +86,8 @@ class DaDataResultFullJSON(BaseBitrix):
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
     inn: Mapped[str] = mapped_column(String(20), index=True, nullable=False)
     source: Mapped[str] = mapped_column(String(32), default="dadata")
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    received_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         Index("ix_dadata_result_full_json_payload_gin", "payload", postgresql_using="gin"),

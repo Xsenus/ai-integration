@@ -76,8 +76,10 @@ def map_summary_from_dadata(payload: dict) -> dict:
     addr = d.get("address") or {}
     ad = (addr or {}).get("data") or {}
 
-    # основной ОКВЭД
-    main_okved = d.get("okved") or (d.get("okveds") or {}).get("main") if isinstance(d.get("okveds"), dict) else d.get("okved")
+    # основной ОКВЭД — читаем явно и прозрачно
+    main_okved = d.get("okved")
+    if main_okved is None and isinstance(d.get("okveds"), dict):
+        main_okved = (d.get("okveds") or {}).get("main")
 
     # до 7 ОКВЭДов (разные форматы)
     okveds = _normalize_okveds(d)

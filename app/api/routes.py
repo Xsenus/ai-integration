@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from app.db.pp719 import pp719_has_inn
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from pydantic import BaseModel, Field
@@ -12,13 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.bitrix import get_bitrix_session
+from app.db.pp719 import pp719_has_inn
 from app.db.parsing import (
     clients_requests_exists,
     get_clients_request_id,
-    pars_site_exists,
-    push_clients_request,        # best-effort запись во вторую БД
-    create_clients_request,      # явное создание clients_requests + возврат id (с fallback)
-    insert_pars_site_chunks,     # массовая вставка чанков в pars_site
+    push_clients_request,
+    table_exists,
+    pars_site_insert_chunks, 
 )
 from app.models.bitrix import DaDataResult
 from app.repo.bitrix_repo import (
@@ -29,21 +28,18 @@ from app.repo.bitrix_repo import (
 from app.schemas.org import (
     CompanyCard,
     CompanySummaryOut,
-    IngestRequest,
     OrgExtendedResponse,
-    OrgResponse,
 )
 from app.services.dadata_client import find_party_by_inn
-from app.services.mapping import extract_inn, map_summary_from_dadata
-from app.services.scrape import fetch_and_chunk, FetchError  # NEW
+from app.services.mapping import map_summary_from_dadata
+from app.services.scrape import fetch_and_chunk, FetchError
 
-log = logging.getLogger("dadata-bitrix")
+log = logging.getLogger("api.routes")
 router = APIRouter(prefix="/v1")
 
-
-# ==============
-#   Helpers
-# ==============
+# =========================
+#        Helpers
+# =========================
 
 def _mln_text(revenue: Optional[float]) -> str:
     """revenue → 'N млн' (целое, округление)."""
@@ -201,7 +197,7 @@ def _card_from_model(m: DaDataResult) -> CompanyCard:
         employee_count=m.employee_count,
 
         main_okved=m.main_okved,
-        okved_main=m.main_okved,  # алиас
+        okved_main=m.main_okved,
 
         year=m.year,
         income=float(m.income) if m.income is not None else None,
@@ -222,190 +218,9 @@ def _card_from_model(m: DaDataResult) -> CompanyCard:
     card.production_address_2024 = _build_production_address(card.address, card.geo_lat, card.geo_lon)
     return card
 
-
-async def _return_from_db_or_503(inn: str, session: AsyncSession, err_msg: str) -> OrgExtendedResponse:
-    """
-    Возвратить данные из БД, если они есть; иначе 503.
-    Используется как fallback, когда DaData не отвечает.
-    """
-    summary = await session.get(DaDataResult, inn)
-    raw_payload = await get_last_raw(session, inn)
-
-    if not summary and not raw_payload:
-        # Нет сети и нет кэша — временная недоступность
-        raise HTTPException(status_code=503, detail=f"{err_msg}; локальных данных по ИНН нет")
-
-    card = _card_from_model(summary) if summary else None
-    return OrgExtendedResponse(
-        summary=CompanySummaryOut.model_validate(summary) if summary else None,
-        raw_last=raw_payload,
-        card=card,
-    )
-
-
-# ==========================================
-#   Ingest готового payload (без обращения к DaData)
-# ==========================================
-@router.post("/bitrix/ingest", response_model=OrgResponse)
-async def ingest_dadata(
-    body: IngestRequest,
-    session: AsyncSession = Depends(get_bitrix_session),
-):
-    """
-    Принимает JSON с DaData (один объект suggestion/data), сохраняет:
-    - raw в dadata_result_full_json (ровно одна строка на ИНН)
-    - summary в dadata_result (upsert по inn)
-    После успешного сохранения — ПЫТАЕМСЯ записать короткую строку во вторую БД
-      (parsing_data.public.clients_requests). Если второй БД/таблицы нет — просто логируем.
-    """
-    payload = body.payload
-    inn = extract_inn(payload)
-    if not inn:
-        raise HTTPException(status_code=400, detail="Не удалось определить ИНН в payload")
-
-    summary_dict = map_summary_from_dadata(payload)
-    summary_dict.setdefault("inn", inn)
-
-    try:
-        await replace_dadata_raw(session, inn=inn, payload=payload)
-        await upsert_company_summary(session, data=summary_dict)
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
-
-    # best-effort запись во вторую БД
-    try:
-        ok = await push_clients_request(summary_dict, domain=getattr(body, "domain", None))
-        if ok:
-            log.info("parsing_data.clients_requests: запись добавлена (INGEST), ИНН %s", inn)
-    except Exception as e:
-        log.warning("parsing_data.clients_requests: ошибка записи (INGEST), ИНН %s: %s", inn, e)
-
-    summary = await session.get(DaDataResult, inn)
-    raw_payload = await get_last_raw(session, inn)
-    return OrgResponse(
-        summary=CompanySummaryOut.model_validate(summary) if summary else None,
-        raw_last=raw_payload,
-    )
-
-
-# ==========================================
-#   Обычный lookup
-# ==========================================
-
-class LookupRequest(BaseModel):
-    inn: str
-    domain: Optional[str] = None  # опционально; будет записан во вторую БД как domain_1
-
-
-@router.post("/lookup", response_model=OrgResponse)
-async def lookup_post(
-    dto: LookupRequest,
-    session: AsyncSession = Depends(get_bitrix_session),
-):
-    """
-    Тянем из DaData по ИНН, сохраняем raw+summary, возвращаем сводку и raw.
-    Если DaData недоступна, возвращаем данные из БД (если есть), иначе 503.
-    После успешного сохранения — ПЫТАЕМСЯ записать короткую строку во вторую БД.
-    """
-    inn = (dto.inn or "").strip()
-    if not inn.isdigit():
-        raise HTTPException(status_code=400, detail="ИНН должен содержать только цифры")
-
-    try:
-        suggestion = await find_party_by_inn(inn)
-    except httpx.HTTPError as e:
-        log.warning("DaData недоступна при lookup (POST) для ИНН %s: %s", inn, e)
-        resp = await _return_from_db_or_503(inn, session, "DaData недоступна")
-        return OrgResponse(summary=resp.summary, raw_last=resp.raw_last)
-
-    # DaData ответила, но организация не найдена — это НЕ повод для fallback
-    if not suggestion:
-        raise HTTPException(status_code=404, detail="Организация не найдена в DaData")
-
-    summary_dict = map_summary_from_dadata(suggestion)
-    summary_dict.setdefault("inn", inn)
-
-    try:
-        await replace_dadata_raw(session, inn=inn, payload=suggestion)
-        await upsert_company_summary(session, data=summary_dict)
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
-
-    # best-effort запись во вторую БД
-    try:
-        ok = await push_clients_request(summary_dict, domain=dto.domain)
-        if ok:
-            log.info("parsing_data.clients_requests: запись добавлена (LOOKUP POST), ИНН %s", inn)
-    except Exception as e:
-        log.warning("parsing_data.clients_requests: ошибка записи (LOOKUP POST), ИНН %s: %s", inn, e)
-
-    summary = await session.get(DaDataResult, inn)
-    raw_payload = await get_last_raw(session, inn)
-    return OrgResponse(
-        summary=CompanySummaryOut.model_validate(summary) if summary else None,
-        raw_last=raw_payload,
-    )
-
-
-@router.get("/lookup/{inn}", response_model=OrgResponse)
-async def lookup_get(
-    inn: str,
-    domain: Optional[str] = Query(None, description="Адрес сайта (домен), необязательно"),
-    session: AsyncSession = Depends(get_bitrix_session),
-):
-    """
-    Аналог POST /v1/lookup, но ИНН в пути.
-    Fallback: при недоступности DaData отдаём данные из БД (если есть), иначе 503.
-    После успешного сохранения — ПЫТАЕМСЯ записать короткую строку во вторую БД.
-    """
-    inn = (inn or "").strip()
-    if not inn.isdigit():
-        raise HTTPException(status_code=400, detail="ИНН должен содержать только цифры")
-
-    try:
-        suggestion = await find_party_by_inn(inn)
-    except httpx.HTTPError as e:
-        log.warning("DaData недоступна при lookup (GET) для ИНН %s: %s", inn, e)
-        resp = await _return_from_db_or_503(inn, session, "DaData недоступна")
-        return OrgResponse(summary=resp.summary, raw_last=resp.raw_last)
-
-    if not suggestion:
-        raise HTTPException(status_code=404, detail="Организация не найдена в DaData")
-
-    summary_dict = map_summary_from_dadata(suggestion)
-    summary_dict.setdefault("inn", inn)
-
-    try:
-        await replace_dadata_raw(session, inn=inn, payload=suggestion)
-        await upsert_company_summary(session, data=summary_dict)
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
-
-    # best-effort запись во вторую БД
-    try:
-        ok = await push_clients_request(summary_dict, domain=domain)
-        if ok:
-            log.info("parsing_data.clients_requests: запись добавлена (LOOKUP GET), ИНН %s", inn)
-    except Exception as e:
-        log.warning("parsing_data.clients_requests: ошибка записи (LOOKUP GET), ИНН %s: %s", inn, e)
-
-    summary = await session.get(DaDataResult, inn)
-    raw_payload = await get_last_raw(session, inn)
-    return OrgResponse(
-        summary=CompanySummaryOut.model_validate(summary) if summary else None,
-        raw_last=raw_payload,
-    )
-
-
-# ==========================================
-#   Расширенный lookup (карточка)
-# ==========================================
+# ==============================
+#     Расширенный LOOKUP
+# ==============================
 
 class LookupCardRequest(BaseModel):
     inn: str
@@ -418,7 +233,7 @@ async def lookup_card_post(
     session: AsyncSession = Depends(get_bitrix_session),
 ):
     """
-    Всё как /v1/lookup, но дополнительно возвращаем 'card':
+    Всё как обычный lookup, но дополнительно возвращаем 'card':
     - company_title: `{short_name_opf} | {revenue/1e6} млн | DaData`, с префиксом !!!STATUS!!!
     - production_address_2024: `{Address}|{geo_lat};{geo_lon}|21`
     а также адрес/координаты/статус/ССЧ/ОКВЭД/финансы/контакты.
@@ -431,7 +246,16 @@ async def lookup_card_post(
         suggestion = await find_party_by_inn(inn)
     except httpx.HTTPError as e:
         log.warning("DaData недоступна при lookup/card (POST) для ИНН %s: %s", inn, e)
-        return await _return_from_db_or_503(inn, session, "DaData недоступна")
+        # fallback из БД, если есть
+        summary = await session.get(DaDataResult, inn)
+        raw_payload = await get_last_raw(session, inn)
+        if not summary and not raw_payload:
+            raise HTTPException(status_code=503, detail="DaData недоступна; локальных данных по ИНН нет")
+        return OrgExtendedResponse(
+            summary=CompanySummaryOut.model_validate(summary) if summary else None,
+            raw_last=raw_payload,
+            card=_card_from_model(summary) if summary else None,
+        )
 
     if not suggestion:
         raise HTTPException(status_code=404, detail="Организация не найдена в DaData")
@@ -458,13 +282,13 @@ async def lookup_card_post(
     summary = await session.get(DaDataResult, inn)
     raw_payload = await get_last_raw(session, inn)
     card = _card_from_summary_dict(summary_dict)
-    
-    # вставь перед возвратом:
+
+    # Пометка (ПП719), если ИНН найден в pp719
     try:
         if card and card.inn and await pp719_has_inn(card.inn):
             base = card.short_name_opf or card.short_name or ""
             if card.company_title and base:
-                card.company_title = card.company_title.replace(base, f'{base} (ПП719)', 1)
+                card.company_title = card.company_title.replace(base, f"{base} (ПП719)", 1)
     except Exception as e:
         log.warning("pp719 check failed for %s: %s", inn, e)
 
@@ -486,19 +310,18 @@ async def lookup_card_get(
     if not inn.isdigit():
         raise HTTPException(status_code=400, detail="ИНН должен содержать только цифры")
 
-    # 1) Пытаемся отдать из нашей БД (без обращения к DaData)
+    # 1) Пытаемся отдать из своей БД (без обращения к DaData)
     summary = await session.get(DaDataResult, inn)
     if summary:
         raw_payload = await get_last_raw(session, inn)
         summary_dict = CompanySummaryOut.model_validate(summary).model_dump()
         card = _card_from_summary_dict(summary_dict)
 
-        # Пометка (ПП719), если ИНН найден в pp719
         try:
             if card and card.inn and await pp719_has_inn(card.inn):
                 base = card.short_name_opf or card.short_name or ""
                 if card.company_title and base:
-                    card.company_title = card.company_title.replace(base, f'{base} (ПП719)', 1)
+                    card.company_title = card.company_title.replace(base, f"{base} (ПП719)", 1)
         except Exception as e:
             log.warning("pp719 check failed for %s: %s", inn, e)
 
@@ -513,7 +336,7 @@ async def lookup_card_get(
         suggestion = await find_party_by_inn(inn)
     except httpx.HTTPError as e:
         log.warning("DaData недоступна при lookup/card (GET) для ИНН %s: %s", inn, e)
-        return await _return_from_db_or_503(inn, session, "DaData недоступна")
+        raise HTTPException(status_code=503, detail="DaData недоступна; локальных данных по ИНН нет")
 
     if not suggestion:
         raise HTTPException(status_code=404, detail="Организация не найдена в DaData")
@@ -529,7 +352,7 @@ async def lookup_card_get(
         await session.rollback()
         raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
 
-    # best-effort запись во вторую БД (как было)
+    # best-effort запись во вторую БД
     try:
         ok = await push_clients_request(summary_dict, domain=domain)
         if ok:
@@ -542,12 +365,11 @@ async def lookup_card_get(
     raw_payload = await get_last_raw(session, inn)
     card = _card_from_summary_dict(summary_dict)
 
-    # Повторяем пометку (ПП719) и для ветки DaData
     try:
         if card and card.inn and await pp719_has_inn(card.inn):
             base = card.short_name_opf or card.short_name or ""
             if card.company_title and base:
-                card.company_title = card.company_title.replace(base, f'{base} (ПП719)', 1)
+                card.company_title = card.company_title.replace(base, f"{base} (ПП719)", 1)
     except Exception as e:
         log.warning("pp719 check failed for %s: %s", inn, e)
 
@@ -558,7 +380,7 @@ async def lookup_card_get(
     )
 
 # ==========================================
-#   NEW: Парсинг главной страницы домена → pars_site
+#   Парсинг главной страницы домена → pars_site
 # ==========================================
 
 class ParseSiteRequest(BaseModel):
@@ -586,7 +408,7 @@ async def parse_site(payload: ParseSiteRequest = Body(...)):
 
     # 0.1) Проверяем наличие таблиц. Если их нет — ничего не пишем.
     has_clients = await clients_requests_exists()
-    has_pars = await pars_site_exists()
+    has_pars = await table_exists("public.pars_site")
     if not has_clients or not has_pars:
         # Мягкий no-op: возвращаем нули, чтобы фронт/оркестратор понимал, что вставок не было
         return ParseSiteResponse(
@@ -597,16 +419,13 @@ async def parse_site(payload: ParseSiteRequest = Body(...)):
         )
 
     # 1) upsert в clients_requests (обновление при наличии записи, вставка при отсутствии)
-    # Составим минимальный summary для push_clients_request
     minimal_summary = {
         "short_name": payload.company_name,
         "inn": payload.inn,
-        # остальные поля опциональны; okved/emails и т.п. оставим None
     }
     try:
         await push_clients_request(minimal_summary, domain=payload.client_domain_1)
     except Exception as e:
-        # best-effort: если не удалось — считаем, что операцию выполнить нельзя (без company_id нельзя вставлять в pars_site)
         raise HTTPException(status_code=500, detail=f"Не удалось выполнить upsert в clients_requests: {e}") from e
 
     # 1.1) Получаем company_id по ИНН (и домену, если указан)
@@ -632,11 +451,13 @@ async def parse_site(payload: ParseSiteRequest = Body(...)):
     domain_for_pars = payload.pars_site_domain_1 or normalized_domain
     url_for_pars = payload.url_override or home_url
 
-    inserted = await insert_pars_site_chunks(
+    chunks_payload = [{"start": i, "end": i, "text": t} for i, t in enumerate(chunks) if t]
+
+    inserted = await pars_site_insert_chunks(
         company_id=company_id,
         domain_1=domain_for_pars,
         url=url_for_pars,
-        chunks=chunks,
+        chunks=chunks_payload
     )
 
     return ParseSiteResponse(
@@ -644,24 +465,4 @@ async def parse_site(payload: ParseSiteRequest = Body(...)):
         domain_1=domain_for_pars,
         url=url_for_pars,
         chunks_inserted=inserted,
-    )
-
-# ===============================
-#   Получить сохранённые данные
-# ===============================
-@router.get("/org/{inn}", response_model=OrgResponse)
-async def get_org(
-    inn: str,
-    session: AsyncSession = Depends(get_bitrix_session),
-):
-    """Быстрый доступ к сохранённым данным: сводка + последний raw по ИНН."""
-    summary = await session.get(DaDataResult, inn)
-    raw_payload = await get_last_raw(session, inn)
-
-    if not summary and not raw_payload:
-        raise HTTPException(status_code=404, detail="Данные по ИНН не найдены")
-
-    return OrgResponse(
-        summary=CompanySummaryOut.model_validate(summary) if summary else None,
-        raw_last=raw_payload,
     )

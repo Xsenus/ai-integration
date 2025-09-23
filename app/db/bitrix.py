@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import AsyncGenerator, Callable, Awaitable, Any
+from typing import Any, AsyncGenerator, Awaitable, Callable, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -14,12 +14,12 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
-from ..config import settings
+from app.config import settings
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("db.bitrix")
 
-engine_bitrix: AsyncEngine | None = None
-SessionBitrix: async_sessionmaker[AsyncSession] | None = None
+_engine_bitrix: Optional[AsyncEngine] = None
+_SessionBitrix: Optional[async_sessionmaker[AsyncSession]] = None
 
 
 # ---------- Utilities ----------
@@ -29,14 +29,12 @@ async def run_with_retry(
     tries: int = 8,
     delay: float = 0.5,
 ) -> Any:
-    """
-    Запускает корутину с ретраями. Между попытками — линейная задержка.
-    """
+    """Запуск корутины с ретраями и линейной паузой."""
     last_exc: BaseException | None = None
     for i in range(tries):
         try:
             return await coro_factory()
-        except BaseException as e:
+        except BaseException as e:  # noqa: BLE001
             last_exc = e
             await asyncio.sleep(delay * (i + 1))
     raise RuntimeError(f"Operation failed after {tries} retries") from last_exc
@@ -47,89 +45,79 @@ async def ping_engine(engine: AsyncEngine) -> None:
         await conn.execute(text("SELECT 1"))
 
 
-async def wait_for_postgres(retries: int = 30, delay: float = 0.5) -> None:
-    """
-    Ждём доступности БД через SQLAlchemy по settings.bitrix_url.
-    Bootstrap-dsn/asyncpg не используются.
-    """
-    if not settings.bitrix_url:
-        raise RuntimeError("BITRIX_DATABASE_URL is not set")
-
-    engine = create_async_engine(settings.bitrix_url, pool_pre_ping=True, future=True)
-    last_err: BaseException | None = None
-
-    try:
-        for _ in range(retries):
-            try:
-                async with engine.connect() as conn:
-                    await conn.execute(text("SELECT 1"))
-                return
-            except BaseException as e:
-                last_err = e
-                await asyncio.sleep(delay)
-        raise RuntimeError(f"Postgres is not reachable after {retries} retries") from last_err
-    finally:
-        # гарантированно освобождаем ресурсы
-        await engine.dispose()
-
-
-# ---------- Bootstrap (no-op в DSN-режиме) ----------
+# ---------- Bootstrap (NO-OP) ----------
 
 async def ensure_app_role_exists() -> None:
-    """
-    NO-OP: в DSN-режиме роли/пользователи создаются вне приложения.
-    Оставлено для обратной совместимости.
-    """
-    log.info("ensure_app_role_exists(): skipped (DSN-only mode)")
+    """NO-OP: роли/БД создаются вне приложения."""
+    log.info("ensure_app_role_exists(): skipped")
 
 
 async def ensure_bitrix_database_exists() -> None:
-    """
-    NO-OP: в DSN-режиме БД создаётся вне приложения.
-    Оставлено для обратной совместимости.
-    """
-    log.info("ensure_bitrix_database_exists(): skipped (DSN-only mode)")
+    """NO-OP: БД создаётся вне приложения."""
+    log.info("ensure_bitrix_database_exists(): skipped")
 
 
 # ---------- Engine / Session ----------
 
+def get_bitrix_engine() -> Optional[AsyncEngine]:
+    """
+    Ленивая инициализация движка для БД bitrix_data.
+    Если DSN не задан — возвращает None (мягкое отключение).
+    """
+    global _engine_bitrix
+    url = settings.bitrix_url
+    if not url:
+        log.warning("BITRIX_DATABASE_URL не задан — соединение с bitrix_data отключено")
+        return None
+    if _engine_bitrix is None:
+        _engine_bitrix = create_async_engine(
+            url, pool_pre_ping=True, future=True, echo=settings.ECHO_SQL
+        )
+    return _engine_bitrix
+
+
+def get_bitrix_sessionmaker() -> Optional[async_sessionmaker[AsyncSession]]:
+    """Фабрика сессий для bitrix_data или None, если DSN отсутствует."""
+    global _SessionBitrix
+    eng = get_bitrix_engine()
+    if eng is None:
+        return None
+    if _SessionBitrix is None:
+        _SessionBitrix = async_sessionmaker(eng, expire_on_commit=False)
+    return _SessionBitrix
+
+
 async def init_bitrix_engine() -> None:
-    """Инициализация движка и фабрики сессий для bitrix_data."""
-    if not settings.bitrix_url:
-        raise RuntimeError("BITRIX_DATABASE_URL is not set")
-    global engine_bitrix, SessionBitrix
-    engine_bitrix = create_async_engine(
-        settings.bitrix_url,
-        echo=getattr(settings, "ECHO_SQL", False),
-        pool_pre_ping=True,
-        future=True,
-    )
-    SessionBitrix = async_sessionmaker(engine_bitrix, expire_on_commit=False)
+    """Back-compat: прогреваем движок и фабрику сессий (не обязательно)."""
+    get_bitrix_sessionmaker()
 
 
 async def create_bitrix_tables(BaseBitrix: type[DeclarativeBase]) -> None:
-    """Создать таблицы, если их нет."""
-    if engine_bitrix is None:
-        raise RuntimeError("Bitrix engine is not initialized")
-    async with engine_bitrix.begin() as conn:
+    """Создать таблицы, если они описаны и движок активен."""
+    eng = get_bitrix_engine()
+    if eng is None:
+        return
+    async with eng.begin() as conn:
         await conn.run_sync(BaseBitrix.metadata.create_all)
 
 
 async def get_bitrix_session() -> AsyncGenerator[AsyncSession, None]:
-    """DI-зависимость для FastAPI."""
-    if SessionBitrix is None:
-        raise RuntimeError("Bitrix session factory is not initialized")
-    async with SessionBitrix() as session:
+    """DI-зависимость для FastAPI — вернёт сессию или бросит, если DSN не задан."""
+    sm = get_bitrix_sessionmaker()
+    if sm is None:
+        raise RuntimeError("bitrix_data недоступна: BITRIX_DATABASE_URL не задан")
+    async with sm() as session:
         yield session
 
 
 async def ping_bitrix() -> bool:
-    """Лёгкая проверка соединения с текущим engine (для /health)."""
-    if engine_bitrix is None:
+    """Пинг соединения с bitrix_data (для /health)."""
+    eng = get_bitrix_engine()
+    if eng is None:
         return False
     try:
-        async with engine_bitrix.connect() as conn:
+        async with eng.connect() as conn:
             await conn.execute(text("SELECT 1"))
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
