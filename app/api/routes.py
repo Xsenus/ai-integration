@@ -12,13 +12,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.bitrix import get_bitrix_session
 from app.db.pp719 import pp719_has_inn
+
+# parsing_data (зеркало)
 from app.db.parsing import (
     clients_requests_exists,
-    get_clients_request_id,
-    push_clients_request,
-    table_exists,
-    pars_site_insert_chunks, 
+    get_clients_request_id as get_clients_request_id_pd,
+    push_clients_request as push_clients_request_pd,
+    table_exists as table_exists_pd,
+    pars_site_insert_chunks as pars_site_insert_chunks_pd,
 )
+
+# POSTGRES (основное хранилище)
+from app.db.parsing_mirror import (
+    push_clients_request_pg,
+    get_clients_request_id_pg,
+    pars_site_insert_chunks_pg,
+)
+
 from app.models.bitrix import DaDataResult
 from app.repo.bitrix_repo import (
     get_last_raw,
@@ -50,7 +60,7 @@ def _mln_text(revenue: Optional[float]) -> str:
         return f"{mln} млн"
     except Exception:
         return "0 млн"
-
+    
 
 def _build_company_title(short_name_opf: Optional[str], revenue: Optional[float], status: Optional[str]) -> str:
     """{short_name_opf} | {revenue/1e6} млн | DaData, с префиксом статуса при необходимости."""
@@ -99,10 +109,8 @@ def _extract_main_code(main_okved: Optional[str]) -> Optional[str]:
     if not main_okved:
         return None
     s = str(main_okved).strip()
-    # если строка типа '47.11' — ок
     if all(ch.isdigit() or ch in {'.'} for ch in s):
         return s
-    # иначе берём первый токен до пробела/табов/длинных названий
     return s.split()[0]
 
 
@@ -120,7 +128,6 @@ def _fill_vtors_from_okveds(okveds: object, main_okved: Optional[str]) -> dict:
 
     main_code = _extract_main_code(main_okved)
     if main_code:
-        # фильтруем элементы, начинающиеся с кода (на случай 'код название')
         items = [x for x in items if not x.startswith(main_code)]
 
     vtors = {}
@@ -152,7 +159,7 @@ def _card_from_summary_dict(d: dict) -> CompanyCard:
         employee_count=d.get("employee_count"),
 
         main_okved=d.get("main_okved"),
-        okved_main=d.get("main_okved"),  # алиас
+        okved_main=d.get("main_okved"),
 
         year=d.get("year"),
         income=d.get("income"),
@@ -163,19 +170,17 @@ def _card_from_summary_dict(d: dict) -> CompanyCard:
         phones=(list(d.get("phones") or []) or None),
         emails=(list(d.get("emails") or []) or None),
     )
-    # дополнительные ОКВЭДы из массива okveds
     vtors = _fill_vtors_from_okveds(d.get("okveds"), d.get("main_okved"))
     for k, v in vtors.items():
         setattr(card, k, v)
 
-    # сгенерированные поля
     card.company_title = _build_company_title(card.short_name_opf, card.revenue, card.status)
     card.production_address_2024 = _build_production_address(card.address, card.geo_lat, card.geo_lon)
     return card
 
 
 def _card_from_model(m: DaDataResult) -> CompanyCard:
-    """Собрать CompanyCard из ORM-модели (когда берём fallback из БД)."""
+    """Собрать CompanyCard из ORM-модели (fallback из своей БД)."""
     card = CompanyCard(
         inn=m.inn,
         short_name=m.short_name,
@@ -209,7 +214,6 @@ def _card_from_model(m: DaDataResult) -> CompanyCard:
         emails=list(m.emails) if m.emails else None,
     )
 
-    # дополнительные ОКВЭДы из JSONB okveds (list[str|dict] | None)
     vtors = _fill_vtors_from_okveds(m.okveds, m.main_okved)
     for k, v in vtors.items():
         setattr(card, k, v)
@@ -218,13 +222,14 @@ def _card_from_model(m: DaDataResult) -> CompanyCard:
     card.production_address_2024 = _build_production_address(card.address, card.geo_lat, card.geo_lon)
     return card
 
+
 # ==============================
 #     Расширенный LOOKUP
 # ==============================
 
 class LookupCardRequest(BaseModel):
     inn: str
-    domain: Optional[str] = None  # опционально; пишется во 2-ю БД как domain_1
+    domain: Optional[str] = None  # опционально; пишется в clients_requests.domain_1 (с www.)
 
 
 @router.post("/lookup/card", response_model=OrgExtendedResponse)
@@ -233,10 +238,8 @@ async def lookup_card_post(
     session: AsyncSession = Depends(get_bitrix_session),
 ):
     """
-    Всё как обычный lookup, но дополнительно возвращаем 'card':
-    - company_title: `{short_name_opf} | {revenue/1e6} млн | DaData`, с префиксом !!!STATUS!!!
-    - production_address_2024: `{Address}|{geo_lat};{geo_lon}|21`
-    а также адрес/координаты/статус/ССЧ/ОКВЭД/финансы/контакты.
+    Как обычный lookup, но дополнительно возвращаем 'card'
+    и пишем clients_requests в обе БД (PG — основная, parsing_data — зеркало).
     """
     inn = (dto.inn or "").strip()
     if not inn.isdigit():
@@ -271,10 +274,18 @@ async def lookup_card_post(
         await session.rollback()
         raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
 
-    # best-effort запись во вторую БД
+    # --- запись в POSTGRES (основная) ---
     try:
-        ok = await push_clients_request(summary_dict, domain=dto.domain)
-        if ok:
+        ok_pg = await push_clients_request_pg(summary_dict, domain=dto.domain)
+        if ok_pg:
+            log.info("PG clients_requests: запись добавлена (LOOKUP CARD POST), ИНН %s", inn)
+    except Exception as e:
+        log.warning("PG clients_requests: ошибка записи (LOOKUP CARD POST), ИНН %s: %s", inn, e)
+
+    # --- зеркало в parsing_data (best-effort) ---
+    try:
+        ok_pd = await push_clients_request_pd(summary_dict, domain=dto.domain)
+        if ok_pd:
             log.info("parsing_data.clients_requests: запись добавлена (LOOKUP CARD POST), ИНН %s", inn)
     except Exception as e:
         log.warning("parsing_data.clients_requests: ошибка записи (LOOKUP CARD POST), ИНН %s: %s", inn, e)
@@ -283,7 +294,6 @@ async def lookup_card_post(
     raw_payload = await get_last_raw(session, inn)
     card = _card_from_summary_dict(summary_dict)
 
-    # Пометка (ПП719), если ИНН найден в pp719
     try:
         if card and card.inn and await pp719_has_inn(card.inn):
             base = card.short_name_opf or card.short_name or ""
@@ -305,7 +315,7 @@ async def lookup_card_get(
     domain: Optional[str] = Query(None, description="Адрес сайта (домен), необязательно"),
     session: AsyncSession = Depends(get_bitrix_session),
 ):
-    """Сначала читаем из своей БД; если нет — идём в DaData, сохраняем и возвращаем."""
+    """Сначала читаем из своей БД; если нет — идём в DaData, сохраняем и возвращаем. Пишем в обе БД."""
     inn = (inn or "").strip()
     if not inn.isdigit():
         raise HTTPException(status_code=400, detail="ИНН должен содержать только цифры")
@@ -352,10 +362,18 @@ async def lookup_card_get(
         await session.rollback()
         raise HTTPException(status_code=500, detail="Ошибка сохранения данных")
 
-    # best-effort запись во вторую БД
+    # --- запись в POSTGRES (основная) ---
     try:
-        ok = await push_clients_request(summary_dict, domain=domain)
-        if ok:
+        ok_pg = await push_clients_request_pg(summary_dict, domain=domain)
+        if ok_pg:
+            log.info("PG clients_requests: запись добавлена (LOOKUP CARD GET), ИНН %s", inn)
+    except Exception as e:
+        log.warning("PG clients_requests: ошибка записи (LOOKUP CARD GET), ИНН %s: %s", inn, e)
+
+    # --- зеркало в parsing_data ---
+    try:
+        ok_pd = await push_clients_request_pd(summary_dict, domain=domain)
+        if ok_pd:
             log.info("parsing_data.clients_requests: запись добавлена (LOOKUP CARD GET), ИНН %s", inn)
     except Exception as e:
         log.warning("parsing_data.clients_requests: ошибка записи (LOOKUP CARD GET), ИНН %s: %s", inn, e)
@@ -378,6 +396,7 @@ async def lookup_card_get(
         raw_last=raw_payload,
         card=card,
     )
+
 
 # ==========================================
 #   Парсинг главной страницы домена → pars_site
@@ -402,36 +421,21 @@ class ParseSiteResponse(BaseModel):
 
 @router.post("/parse-site", response_model=ParseSiteResponse, summary="Парсинг главной страницы домена и сохранение в pars_site")
 async def parse_site(payload: ParseSiteRequest = Body(...)):
-    # 0) Проверка конфигурации
     if not settings.SCRAPERAPI_KEY:
         raise HTTPException(status_code=400, detail="SCRAPERAPI_KEY is not configured on server")
 
-    # 0.1) Проверяем наличие таблиц. Если их нет — ничего не пишем.
-    has_clients = await clients_requests_exists()
-    has_pars = await table_exists("public.pars_site")
-    if not has_clients or not has_pars:
-        # Мягкий no-op: возвращаем нули, чтобы фронт/оркестратор понимал, что вставок не было
-        return ParseSiteResponse(
-            company_id=0,
-            domain_1=(payload.pars_site_domain_1 or payload.parse_domain),
-            url=(payload.url_override or payload.parse_domain),
-            chunks_inserted=0,
-        )
+    # 1) upsert в POSTGRES (основная БД)
+    minimal_summary = {"short_name": payload.company_name, "inn": payload.inn}
+    if payload.save_client_request:
+        try:
+            await push_clients_request_pg(minimal_summary, domain=payload.client_domain_1)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"PG upsert clients_requests failed: {e}") from e
 
-    # 1) upsert в clients_requests (обновление при наличии записи, вставка при отсутствии)
-    minimal_summary = {
-        "short_name": payload.company_name,
-        "inn": payload.inn,
-    }
-    try:
-        await push_clients_request(minimal_summary, domain=payload.client_domain_1)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Не удалось выполнить upsert в clients_requests: {e}") from e
-
-    # 1.1) Получаем company_id по ИНН (и домену, если указан)
-    company_id = await get_clients_request_id(payload.inn, payload.client_domain_1)
-    if not company_id:
-        raise HTTPException(status_code=500, detail="Не удалось определить company_id после upsert по ИНН")
+    # 1.1) Получаем company_id из POSTGRES
+    company_id_pg = await get_clients_request_id_pg(payload.inn, payload.client_domain_1)
+    if not company_id_pg:
+        raise HTTPException(status_code=500, detail="PG: не удалось определить company_id после upsert по ИНН")
 
     # 2) Тянем и режем HTML
     try:
@@ -439,30 +443,42 @@ async def parse_site(payload: ParseSiteRequest = Body(...)):
     except FetchError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
-    if not chunks:
-        return ParseSiteResponse(
-            company_id=company_id,
-            domain_1=(payload.pars_site_domain_1 or normalized_domain),
-            url=(payload.url_override or home_url),
-            chunks_inserted=0,
-        )
-
-    # 3) Вставляем чанки
     domain_for_pars = payload.pars_site_domain_1 or normalized_domain
     url_for_pars = payload.url_override or home_url
+    chunks_payload = [{"start": i, "end": i, "text": t} for i, t in enumerate(chunks or []) if t]
 
-    chunks_payload = [{"start": i, "end": i, "text": t} for i, t in enumerate(chunks) if t]
+    # 3) Вставляем чанки в POSTGRES
+    inserted_pg = 0
+    if chunks_payload:
+        inserted_pg = await pars_site_insert_chunks_pg(
+            company_id=company_id_pg,
+            domain_1=domain_for_pars,
+            url=url_for_pars,
+            chunks=chunks_payload,
+        )
 
-    inserted = await pars_site_insert_chunks(
-        company_id=company_id,
-        domain_1=domain_for_pars,
-        url=url_for_pars,
-        chunks=chunks_payload
-    )
+    # 4) Зеркалим в parsing_data (best-effort; свой company_id)
+    try:
+        if payload.save_client_request:
+            await push_clients_request_pd(minimal_summary, domain=payload.client_domain_1)
+            company_id_pd = await get_clients_request_id_pd(payload.inn, payload.client_domain_1)
+        else:
+            company_id_pd = await get_clients_request_id_pd(payload.inn, payload.client_domain_1)
 
+        if company_id_pd and chunks_payload:
+            await pars_site_insert_chunks_pd(
+                company_id=company_id_pd,
+                domain_1=domain_for_pars,
+                url=url_for_pars,
+                chunks=chunks_payload,
+            )
+    except Exception as e:
+        log.warning("mirror parsing_data failed for INN=%s: %s", payload.inn, e)
+
+    # Возвращаем данные по основному хранилищу (POSTGRES)
     return ParseSiteResponse(
-        company_id=company_id,
+        company_id=company_id_pg,
         domain_1=domain_for_pars,
         url=url_for_pars,
-        chunks_inserted=inserted,
+        chunks_inserted=inserted_pg,
     )
