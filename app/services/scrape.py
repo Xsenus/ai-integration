@@ -86,6 +86,9 @@ def html_to_full_text(html: str) -> str:
 async def fetch_and_chunk(domain_or_url: str) -> tuple[str, list[str], str]:
     """
     Возвращает: (home_url, chunks, normalized_domain)
+
+    home_url — https://host/
+    normalized_domain — host без www
     """
     home_url = to_home_url(domain_or_url)
     normalized_domain = urlparse(home_url).netloc.replace("www.", "")

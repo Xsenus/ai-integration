@@ -17,6 +17,42 @@ def _pg_engine() -> Optional[AsyncEngine]:
     return get_postgres_engine()
 
 
+async def get_last_domain_by_inn_pg(inn: str) -> Optional[str]:
+    """
+    Возвращает последний clients_requests.domain_1 для заданного ИНН из основной БД (POSTGRES).
+    - Пропускаем NULL/пустые домены.
+    - По соглашению на выходе всегда добавляем 'www.' (через _ensure_www).
+    - Используем сортировку по id DESC как наиболее простой и быстрой эвристики "последней" записи.
+    """
+    eng = _pg_engine()
+    if eng is None:
+        return None
+
+    sql = text(
+        """
+        SELECT domain_1
+        FROM public.clients_requests
+        WHERE inn = :inn
+          AND domain_1 IS NOT NULL
+          AND TRIM(domain_1) <> ''
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+    async with eng.begin() as conn:
+        row = (await conn.execute(sql, {"inn": inn})).first()
+        if not row:
+            log.info("PG: last domain not found for inn=%s", inn)
+            return None
+        dom = row[0]
+        try:
+            ensured = _ensure_www(dom)
+            return ensured
+        except Exception:
+            # в крайнем случае вернём то, что есть
+            return str(dom) if dom is not None else None
+
+
 async def get_clients_request_id_pg(inn: str, domain_1: Optional[str] = None) -> Optional[int]:
     """
     Возвращает id последней записи из POSTGRES.public.clients_requests по ИНН (+ опц. domain_1).
@@ -109,12 +145,12 @@ async def push_clients_request_pg(summary: dict, domain: Optional[str] = None) -
             okved_vtor_1=:okved_vtor_1,
             okved_vtor_2=:okved_vtor_2,
             okved_vtor_3=:okved_vtor_3,
-            okved_vtor_4=:окved_vтор_4,
+            okved_vtor_4=:okved_vtor_4,
             okved_vtor_5=:okved_vtor_5,
             okved_vtor_6=:okved_vtor_6,
             okved_vtor_7=:okved_vtor_7
         WHERE inn=:inn
-    """.replace("окved_vтор_4", "okved_vtor_4"))  # защита от раскладки
+    """)
 
     sql_insert = text("""
         INSERT INTO public.clients_requests
