@@ -17,12 +17,15 @@ def _pg_engine() -> Optional[AsyncEngine]:
     return get_postgres_engine()
 
 
+# ---------------------------
+# clients_requests helpers
+# ---------------------------
+
 async def get_last_domain_by_inn_pg(inn: str) -> Optional[str]:
     """
     Возвращает последний clients_requests.domain_1 для заданного ИНН из основной БД (POSTGRES).
     - Пропускаем NULL/пустые домены.
-    - По соглашению на выходе всегда добавляем 'www.' (через _ensure_www).
-    - Используем сортировку по id DESC как наиболее простой и быстрой эвристики "последней" записи.
+    - На выходе гарантируем 'www.' (через _ensure_www).
     """
     eng = _pg_engine()
     if eng is None:
@@ -49,7 +52,6 @@ async def get_last_domain_by_inn_pg(inn: str) -> Optional[str]:
             ensured = _ensure_www(dom)
             return ensured
         except Exception:
-            # в крайнем случае вернём то, что есть
             return str(dom) if dom is not None else None
 
 
@@ -89,7 +91,7 @@ async def push_clients_request_pg(summary: dict, domain: Optional[str] = None) -
     if eng is None:
         return False
 
-    # подготовка ряда — повторяем логику из app.db.parsing
+    # подготовка ряда
     emails = summary.get("emails") or []
     if isinstance(emails, list):
         emails_str = ", ".join(str(e) for e in emails if e)
@@ -173,6 +175,61 @@ async def push_clients_request_pg(summary: dict, domain: Optional[str] = None) -
         return False
 
 
+# ---------------------------
+# pars_site insert (основная БД)
+# ---------------------------
+
+# Кэш колонок pars_site основной БД
+_PARS_SITE_COLUMNS: Optional[set[str]] = None
+
+async def _get_pars_site_columns() -> set[str]:
+    """Читает список колонок public.pars_site (основная БД) и кэширует его."""
+    global _PARS_SITE_COLUMNS
+    if _PARS_SITE_COLUMNS is not None:
+        return _PARS_SITE_COLUMNS
+
+    eng = _pg_engine()
+    cols: set[str] = set()
+    if eng is None:
+        _PARS_SITE_COLUMNS = cols
+        return cols
+
+    sql = text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'pars_site'
+    """)
+    try:
+        async with eng.begin() as conn:
+            rows = await conn.execute(sql)
+            for r in rows:
+                cols.add(str(r[0]))
+    except Exception as e:
+        log.warning("PG: не удалось прочитать колонки pars_site: %s", e)
+
+    _PARS_SITE_COLUMNS = cols
+    log.info("PG pars_site columns detected: %s", sorted(cols))
+    return cols
+
+
+def _coerce_chunk(ch: Mapping[str, Any] | tuple[int, int, str]) -> Optional[str]:
+    """
+    Приводим внешний чанк к строке-тексту для записи в БД.
+    Вход: либо кортеж (start,end,text), либо маппинг {text: "..."}.
+    """
+    if isinstance(ch, tuple) and len(ch) == 3:
+        _s, _e, txt = ch
+    elif isinstance(ch, Mapping):
+        txt = ch.get("text")
+    else:
+        return None
+    if txt is None:
+        return None
+    t = str(txt)
+    return t if t else None
+
+
 async def pars_site_insert_chunks_pg(
     *,
     company_id: int,
@@ -182,62 +239,68 @@ async def pars_site_insert_chunks_pg(
     batch_size: int = 500,
 ) -> int:
     """
-    Массовая вставка чанков в POSTGRES.public.pars_site.
-    По соглашению pars_site.domain_1 — без 'www.'.
+    Массовая вставка чанков в ОСНОВНУЮ БД POSTGRES.public.pars_site.
+
+    Схема основной БД из твоего дампа:
+      id, company_id, domain_1, text_par, url, created_at, text_vector, description
+
+    => Пишем в text_par (если он есть), иначе в description.
+       Колонок start/end/idx нет — дедуп по (company_id, domain_1, url, <text_col>).
+       domain_1 сохраняем БЕЗ 'www.'.
     """
     eng = _pg_engine()
     if eng is None:
         return 0
 
+    cols = await _get_pars_site_columns()
+    # определяем колонку для текста
+    text_col: Optional[str] = None
+    if "text_par" in cols:
+        text_col = "text_par"
+    elif "description" in cols:
+        text_col = "description"
+
+    if not text_col:
+        msg = (
+            "В основной БД public.pars_site нет подходящей текстовой колонки "
+            "(ожидались text_par или description). Обнаружено: "
+            + ", ".join(sorted(cols))
+        )
+        log.error(msg)
+        raise RuntimeError(msg)
+
     dom = _normalize_domain(domain_1) or domain_1
     inserted = 0
 
-    def _coerce(ch: Mapping[str, Any] | tuple[int, int, str]) -> Optional[dict]:
-        if isinstance(ch, tuple) and len(ch) == 3:
-            start, end, txt = ch
-        elif isinstance(ch, Mapping):
-            start = int(ch.get("start", 0))
-            end = int(ch.get("end", 0))
-            txt = ch.get("text")
-        else:
-            return None
-        if txt is None:
-            return None
-        s = int(start)
-        e = int(end)
-        t = str(txt)
-        if not t:
-            return None
-        return {"company_id": company_id, "domain_1": dom, "url": url, "start": s, "end": e, "text": t}
-
-    sql = text("""
-        INSERT INTO public.pars_site (company_id, domain_1, url, start, "end", text)
-        SELECT :company_id, :domain_1, :url, :start, :end, :text
+    # Готовим SQL под выбранный text_col
+    sql = text(f"""
+        INSERT INTO public.pars_site (company_id, domain_1, url, {text_col})
+        SELECT :company_id, :domain_1, :url, :text
         WHERE NOT EXISTS (
             SELECT 1 FROM public.pars_site ps
             WHERE ps.company_id = :company_id
               AND ps.domain_1 = :domain_1
               AND ps.url = :url
-              AND ps.start = :start
-              AND ps."end" = :end
+              AND ps.{text_col} = :text
         )
     """)
 
+    # Батч-вставка
     buf: list[dict] = []
     async with eng.begin() as conn:
         for ch in chunks:
-            row = _coerce(ch)
-            if not row:
+            t = _coerce_chunk(ch)
+            if not t:
                 continue
-            buf.append(row)
+            buf.append({"company_id": company_id, "domain_1": dom, "url": url, "text": t})
             if len(buf) >= batch_size:
-                for r in buf:
-                    res = await conn.execute(sql, r)
+                for row in buf:
+                    res = await conn.execute(sql, row)
                     inserted += int(getattr(res, "rowcount", 0) or 0)
                 buf.clear()
         if buf:
-            for r in buf:
-                res = await conn.execute(sql, r)
+            for row in buf:
+                res = await conn.execute(sql, row)
                 inserted += int(getattr(res, "rowcount", 0) or 0)
             buf.clear()
 
