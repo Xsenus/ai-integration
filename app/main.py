@@ -12,7 +12,7 @@ from app.api.routes import router as api_router
 
 # DB helpers
 from app.db.bitrix import get_bitrix_engine, ping_bitrix
-from app.db.parsing import get_parsing_engine
+from app.db.parsing import get_parsing_engine, ensure_parsing_schema
 from app.db.pp719 import get_pp719_engine
 from app.db.postgres import get_postgres_engine, ping_postgres
 
@@ -42,10 +42,15 @@ app.include_router(api_router)
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    # Инициализируем коннекторы (если DSN заданы)
     get_bitrix_engine()
     get_parsing_engine()
     get_pp719_engine()
     get_postgres_engine()
+
+    # Создаём/проверяем схему parsing_data
+    await ensure_parsing_schema()
+
     log.info("Startup complete: engines initialized (where DSN provided).")
 
 @app.on_event("shutdown")
