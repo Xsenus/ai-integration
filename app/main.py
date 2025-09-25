@@ -1,4 +1,3 @@
-# app/main.py
 from __future__ import annotations
 
 import logging
@@ -9,7 +8,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.api.routes import router as api_router
-from app.api.ai_analyzer import router as ai_analyzer_router  # ← НОВОЕ
+from app.api.ai_analyzer import router as ai_analyzer_router
 
 # DB helpers
 from app.db.bitrix import get_bitrix_engine, ping_bitrix
@@ -39,9 +38,7 @@ if origins:
     )
 
 # --- Routers ---
-# Основные /v1/... (как было)
 app.include_router(api_router)
-# Новый AI-анализатор
 app.include_router(ai_analyzer_router)
 
 @app.on_event("startup")
@@ -55,7 +52,7 @@ async def on_startup() -> None:
     # Создаём/проверяем схему parsing_data
     await ensure_parsing_schema()
 
-    # Прологируем все зарегистрированные маршруты (удобно для самопроверки)
+    # Пролог маршрутов (для быстрой самопроверки)
     try:
         routes_dump = []
         for r in app.router.routes:

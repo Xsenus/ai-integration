@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     DADATA_SECRET_KEY: Optional[str] = None
     SCRAPERAPI_KEY: Optional[str] = None
 
+    # === External analyze service (для POST /v1/lookup/ai-analyzer) ===
+    # Можно указать любой из этих ключей в .env; приоритет у AI_ANALYZE_BASE/AI_ANALYZE_TIMEOUT
+    AI_ANALYZE_BASE: Optional[str] = None     # напр.: http://37.221.125.221:8123
+    ANALYZE_BASE: Optional[str] = None        # альтернативное имя переменной окружения
+    AI_ANALYZE_TIMEOUT: int = 30              # таймаут по умолчанию, сек
+    ANALYZE_TIMEOUT: Optional[int] = None     # альтернативное имя переменной окружения
+
     # === Scrape params (используются в services/scrape.py) ===
     PARSE_MAX_CHUNK_SIZE: int = 100_000
     PARSE_MIN_HTML_LEN: int = 100
@@ -53,6 +60,16 @@ class Settings(BaseSettings):
     @property
     def postgres_url(self) -> Optional[str]:
         return self.POSTGRES_DATABASE_URL
+
+    @property
+    def analyze_base(self) -> Optional[str]:
+        """Базовый URL внешнего сервиса анализа (берёт AI_ANALYZE_BASE или ANALYZE_BASE)."""
+        return self.AI_ANALYZE_BASE or self.ANALYZE_BASE
+
+    @property
+    def analyze_timeout(self) -> int:
+        """Таймаут ожидания ответа внешнего сервиса, сек."""
+        return int(self.AI_ANALYZE_TIMEOUT or self.ANALYZE_TIMEOUT or 30)
 
 
 settings: Final[Settings] = Settings()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated, List, Optional
 from pydantic import BaseModel, Field, StringConstraints, ConfigDict
 
-# Тип для ИНН: 10 или 12 цифр
+# ИНН: 10 или 12 цифр
 InnStr = Annotated[
     str,
     StringConstraints(strip_whitespace=True, pattern=r"^\d{10}(\d{2})?$"),
@@ -31,7 +31,7 @@ class AiEquipment(BaseModel):
 
 class AiBlock(BaseModel):
     industry: Optional[str] = Field(None, description="Отрасль (человекочитаемо)")
-    sites: List[str] = Field(default_factory=list, description="Список сайтов, max 2 в приоритете")
+    sites: List[str] = Field(default_factory=list, description="Список сайтов (до 2 шт.)")
     products: List[AiProduct] = Field(default_factory=list, description="Номенклатура (AI)")
     equipment: List[AiEquipment] = Field(default_factory=list, description="Оборудование (AI)")
     utp: Optional[str] = Field(None, description="УТП (с эмодзи)")
