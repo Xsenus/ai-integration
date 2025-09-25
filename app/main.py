@@ -9,6 +9,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.api.routes import router as api_router
+from app.api.ai_analyzer import router as ai_analyzer_router  # ← НОВОЕ
 
 # DB helpers
 from app.db.bitrix import get_bitrix_engine, ping_bitrix
@@ -37,8 +38,11 @@ if origins:
         allow_credentials=bool(getattr(settings, "CORS_ALLOW_CREDENTIALS", False)),
     )
 
-# Подключаем /v1/... маршруты
+# --- Routers ---
+# Основные /v1/... (как было)
 app.include_router(api_router)
+# Новый AI-анализатор
+app.include_router(ai_analyzer_router)
 
 @app.on_event("startup")
 async def on_startup() -> None:
@@ -50,6 +54,18 @@ async def on_startup() -> None:
 
     # Создаём/проверяем схему parsing_data
     await ensure_parsing_schema()
+
+    # Прологируем все зарегистрированные маршруты (удобно для самопроверки)
+    try:
+        routes_dump = []
+        for r in app.router.routes:
+            path = getattr(r, "path", "")
+            methods = sorted(getattr(r, "methods", []) or [])
+            if path:
+                routes_dump.append(f"{path} [{', '.join(methods)}]")
+        log.info("Registered routes:\n" + "\n".join(routes_dump))
+    except Exception as e:
+        log.debug("Route dump failed: %s", e)
 
     log.info("Startup complete: engines initialized (where DSN provided).")
 
