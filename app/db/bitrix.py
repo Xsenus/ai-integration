@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Awaitable, Callable, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, AsyncIterator, Awaitable, Callable, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -71,7 +72,10 @@ def get_bitrix_engine() -> Optional[AsyncEngine]:
         return None
     if _engine_bitrix is None:
         _engine_bitrix = create_async_engine(
-            url, pool_pre_ping=True, future=True, echo=settings.ECHO_SQL
+            url,
+            pool_pre_ping=True,
+            future=True,
+            echo=settings.ECHO_SQL,
         )
     return _engine_bitrix
 
@@ -101,11 +105,49 @@ async def create_bitrix_tables(BaseBitrix: type[DeclarativeBase]) -> None:
         await conn.run_sync(BaseBitrix.metadata.create_all)
 
 
+# ---------- Session helpers ----------
+
 async def get_bitrix_session() -> AsyncGenerator[AsyncSession, None]:
-    """DI-зависимость для FastAPI — вернёт сессию или бросит, если DSN не задан."""
+    """
+    DI-зависимость для FastAPI — вернёт сессию или бросит, если DSN не задан.
+    Использование:
+        async def handler(session: AsyncSession = Depends(get_bitrix_session)):
+            ...
+    """
     sm = get_bitrix_sessionmaker()
     if sm is None:
         raise RuntimeError("bitrix_data недоступна: BITRIX_DATABASE_URL не задан")
+    async with sm() as session:
+        yield session
+
+
+@asynccontextmanager
+async def bitrix_session() -> AsyncIterator[AsyncSession]:
+    """
+    Удобный контекст-менеджер для ручного использования:
+        async with bitrix_session() as s:
+            await s.execute(...)
+    Бросит исключение, если DSN не задан.
+    """
+    sm = get_bitrix_sessionmaker()
+    if sm is None:
+        raise RuntimeError("bitrix_data недоступна: BITRIX_DATABASE_URL не задан")
+    async with sm() as session:
+        yield session
+
+
+@asynccontextmanager
+async def try_bitrix_session() -> AsyncIterator[Optional[AsyncSession]]:
+    """
+    Мягкий контекст-менеджер: вернёт None, если DSN не задан.
+        async with try_bitrix_session() as s:
+            if s is None: ...
+            else: await s.execute(...)
+    """
+    sm = get_bitrix_sessionmaker()
+    if sm is None:
+        yield None
+        return
     async with sm() as session:
         yield session
 

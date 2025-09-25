@@ -31,11 +31,28 @@ class CompanySummaryOut(BaseModel):
     geo_lon: Optional[float]
     status: Optional[str]
     employee_count: Optional[int]
+
+    # Исторические значения численности
+    employee_count_1: Optional[int] = None
+    employee_count_2: Optional[int] = None
+    employee_count_3: Optional[int] = None
+
     main_okved: Optional[str]
     okveds: Optional[List[Any]]
+
     year: Optional[int]
     income: Optional[float]
     revenue: Optional[float]
+
+    # Исторические фин. показатели
+    revenue_1: Optional[float] = None
+    revenue_2: Optional[float] = None
+    revenue_3: Optional[float] = None
+
+    income_1: Optional[float] = None
+    income_2: Optional[float] = None
+    income_3: Optional[float] = None
+
     smb_type: Optional[str]
     smb_category: Optional[str]
     smb_issue_date: Optional[str]
@@ -71,6 +88,11 @@ class CompanyCard(BaseModel):
     status: Optional[str] = None
     employee_count: Optional[int] = None
 
+    # Исторические значения численности
+    employee_count_1: Optional[int] = None
+    employee_count_2: Optional[int] = None
+    employee_count_3: Optional[int] = None
+
     # ОКВЭД
     main_okved: Optional[str] = None
     okved_main: Optional[str] = None
@@ -86,6 +108,16 @@ class CompanyCard(BaseModel):
     year: Optional[int] = None
     income: Optional[float] = None
     revenue: Optional[float] = None
+
+    # Исторические фин. показатели
+    revenue_1: Optional[float] = None
+    revenue_2: Optional[float] = None
+    revenue_3: Optional[float] = None
+
+    income_1: Optional[float] = None
+    income_2: Optional[float] = None
+    income_3: Optional[float] = None
+
     smb_type: Optional[str] = None
     smb_category: Optional[str] = None
     smb_issue_date: Optional[str] = None

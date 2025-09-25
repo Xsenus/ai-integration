@@ -1,4 +1,4 @@
-# app/db/bitrix.py
+# app/models/bitrix.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -64,6 +64,19 @@ class DaDataResult(BaseBitrix):
 
     phones: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
     emails: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
+
+    # Исторические показатели: маппинг на колонки с дефисами из БД
+    revenue_1: Mapped[Optional[Decimal]] = mapped_column("revenue-1", Numeric(18, 0))
+    revenue_2: Mapped[Optional[Decimal]] = mapped_column("revenue-2", Numeric(18, 0))
+    revenue_3: Mapped[Optional[Decimal]] = mapped_column("revenue-3", Numeric(18, 0))
+
+    income_1: Mapped[Optional[Decimal]] = mapped_column("income-1", Numeric(18, 0))
+    income_2: Mapped[Optional[Decimal]] = mapped_column("income-2", Numeric(18, 0))
+    income_3: Mapped[Optional[Decimal]] = mapped_column("income-3", Numeric(18, 0))
+
+    employee_count_1: Mapped[Optional[int]] = mapped_column("employee_count-1", Integer)
+    employee_count_2: Mapped[Optional[int]] = mapped_column("employee_count-2", Integer)
+    employee_count_3: Mapped[Optional[int]] = mapped_column("employee_count-3", Integer)
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -1,4 +1,3 @@
-# app/api/routes.py
 from __future__ import annotations
 
 import logging
@@ -101,8 +100,8 @@ def _okved_to_text(item: object) -> Optional[str]:
     if isinstance(item, str):
         return item.strip() or None
     if isinstance(item, dict):
-        code = (item.get("code") or "").strip()
-        name = (item.get("name") or "").strip()
+        code = (item.get("code") or "").strip()  # type: ignore[attr-defined]
+        name = (item.get("name") or "").strip()  # type: ignore[attr-defined]
         if code and name:
             return f"{code} {name}"
         return code or name or None
@@ -145,6 +144,21 @@ def _fill_vtors_from_okveds(okveds: object, main_okved: Optional[str]) -> dict:
     return vtors
 
 
+def _pick_hist(d: dict, base: str, idx: int):
+    """
+    Берет значение из словаря d по ключам base_idx или base-idx.
+    Например: base='revenue', idx=1 -> 'revenue_1' или 'revenue-1'
+    """
+    return d.get(f"{base}_{idx}", d.get(f"{base}-{idx}"))
+
+
+def _as_float(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
+
+
 def _card_from_summary_dict(d: dict) -> CompanyCard:
     """Собрать CompanyCard из словаря summary (как map_summary_from_dadata)."""
     card = CompanyCard(
@@ -179,6 +193,23 @@ def _card_from_summary_dict(d: dict) -> CompanyCard:
         phones=(list(d.get("phones") or []) or None),
         emails=(list(d.get("emails") or []) or None),
     )
+
+    # Исторические поля: поддерживаем snake_case и dash-case
+    card.revenue_1 = _as_float(_pick_hist(d, "revenue", 1))
+    card.revenue_2 = _as_float(_pick_hist(d, "revenue", 2))
+    card.revenue_3 = _as_float(_pick_hist(d, "revenue", 3))
+
+    card.income_1 = _as_float(_pick_hist(d, "income", 1))
+    card.income_2 = _as_float(_pick_hist(d, "income", 2))
+    card.income_3 = _as_float(_pick_hist(d, "income", 3))
+
+    ec1 = _pick_hist(d, "employee_count", 1)
+    ec2 = _pick_hist(d, "employee_count", 2)
+    ec3 = _pick_hist(d, "employee_count", 3)
+    card.employee_count_1 = int(ec1) if ec1 is not None else None
+    card.employee_count_2 = int(ec2) if ec2 is not None else None
+    card.employee_count_3 = int(ec3) if ec3 is not None else None
+
     vtors = _fill_vtors_from_okveds(d.get("okveds"), d.get("main_okved"))
     for k, v in vtors.items():
         setattr(card, k, v)
@@ -221,6 +252,19 @@ def _card_from_model(m: DaDataResult) -> CompanyCard:
         smb_issue_date=m.smb_issue_date,
         phones=list(m.phones) if m.phones else None,
         emails=list(m.emails) if m.emails else None,
+
+        # Исторические значения (Decimal → float / int)
+        revenue_1=_as_float(m.revenue_1),
+        revenue_2=_as_float(m.revenue_2),
+        revenue_3=_as_float(m.revenue_3),
+
+        income_1=_as_float(m.income_1),
+        income_2=_as_float(m.income_2),
+        income_3=_as_float(m.income_3),
+
+        employee_count_1=int(m.employee_count_1) if m.employee_count_1 is not None else None,
+        employee_count_2=int(m.employee_count_2) if m.employee_count_2 is not None else None,
+        employee_count_3=int(m.employee_count_3) if m.employee_count_3 is not None else None,
     )
 
     vtors = _fill_vtors_from_okveds(m.okveds, m.main_okved)
