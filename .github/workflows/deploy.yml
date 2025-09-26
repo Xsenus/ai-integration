@@ -2,13 +2,12 @@ name: Deploy to VPS (ai-integration)
 
 on:
     push:
-        branches: ["main"] # деплой при пуше в main
-    workflow_dispatch: # возможность запустить вручную из GitHub UI
+        branches: ["main"]
+    workflow_dispatch:
 
 jobs:
     deploy:
         runs-on: ubuntu-latest
-
         steps:
             - name: Checkout repo
               uses: actions/checkout@v4
@@ -22,46 +21,74 @@ jobs:
                   username: ${{ secrets.VPS_USER }}
                   key: ${{ secrets.VPS_SSH_KEY }}
                   passphrase: ${{ secrets.VPS_SSH_PASSPHRASE }}
+                  port: ${{ secrets.VPS_PORT || 22 }}
                   script_stop: true
                   script: |
-                      set -euo pipefail
+                      set -euxo pipefail
 
                       APP_DIR="${{ secrets.APP_DIR }}"
                       SERVICE="${{ secrets.SERVICE_NAME }}"
+                      REPO_URL="https://github.com/Xsenus/ai-integration.git"
 
-                      echo "[1/6] Перехожу в каталог $APP_DIR"
-                      cd "$APP_DIR"
-
-                      echo "[2/6] Обновляю код из main"
-                      # Если репо уже клонировано – просто обновим. Иначе – клонируем.
-                      if [ -d .git ]; then
-                        git fetch --all --prune
-                        git reset --hard origin/main
-                      else
-                        # если чистая папка — клонируем репо заново (URL вашего репозитория)
-                        git clone --depth=1 https://github.com/Xsenus/ai-integration.git "$APP_DIR"
-                        cd "$APP_DIR"
+                      # 0) Базовые пакеты (на всякий)
+                      if ! command -v git >/dev/null 2>&1; then
+                        apt-get update
+                        apt-get install -y git
+                      fi
+                      if ! command -v python3 >/dev/null 2>&1; then
+                        apt-get update
+                        apt-get install -y python3 python3-venv python3-pip
                       fi
 
-                      echo "[3/6] Создаю venv, если нет"
+                      # 1) Готовим каталог и лок
+                      mkdir -p "$APP_DIR"
+                      cd "$APP_DIR"
+
+                      # Чтобы параллельные раннеры не дрались
+                      exec 9>"/tmp/ai-integration.deploy.lock"
+                      flock -n 9 || { echo "Another deploy is running"; exit 1; }
+
+                      echo "[1/7] Подготовка временной директории"
+                      TMP_DIR="$(mktemp -d)"
+                      git clone --depth=1 "$REPO_URL" "$TMP_DIR"
+                      cd "$TMP_DIR"
+                      # Явно убеждаемся, что это main с сервера
+                      git fetch origin main --depth=1
+                      git checkout -B main origin/main
+
+                      echo "[2/7] Синхронизация кода в $APP_DIR (без .env и .venv)"
+                      # Вернёмся в целевой каталог
+                      rsync -a --delete \
+                        --exclude ".venv/" \
+                        --exclude ".env" \
+                        --exclude ".git/" \
+                        "$TMP_DIR"/ "$APP_DIR"/
+
+                      echo "[3/7] Создаю/обновляю виртуальное окружение"
+                      cd "$APP_DIR"
                       if [ ! -d ".venv" ]; then
                         python3 -m venv .venv
                       fi
-
-                      echo "[4/6] Обновляю зависимости"
                       . .venv/bin/activate
                       python -m pip install -U pip wheel
+
+                      echo "[4/7] Устанавливаю зависимости"
                       if [ -f requirements.txt ]; then
                         pip install -r requirements.txt
                       fi
 
-                      # Если используешь Alembic — применим миграции (без ошибок, если нет alembic.ini)
+                      echo "[5/7] Alembic (если есть)"
                       if [ -f alembic.ini ]; then
-                        echo "[5/6] Alembic migrations"
                         alembic upgrade head || true
                       fi
 
-                      echo "[6/6] Перезапускаю systemd сервис"
+                      echo "[6/7] Перезапуск systemd сервиса"
                       systemctl daemon-reload
-                      systemctl restart "$SERVICE"
-                      systemctl is-active --quiet "$SERVICE" && echo "Service $SERVICE is running."
+                      systemctl restart "$SERVICE" || true
+
+                      echo "[7/7] Статус и последние логи"
+                      systemctl status "$SERVICE" --no-pager || true
+                      journalctl -u "$SERVICE" -n 200 --no-pager || true
+
+                      # Уборка
+                      rm -rf "$TMP_DIR"
