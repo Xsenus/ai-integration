@@ -1,0 +1,68 @@
+name: Deploy to VPS (ai-integration)
+
+on:
+  push:
+    branches: [ "main" ]   # деплой при пуше в main
+  workflow_dispatch:       # возможность запустить вручную из GitHub UI
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SSH to VPS and deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            APP_DIR="${{ secrets.APP_DIR }}"
+            SERVICE="${{ secrets.SERVICE_NAME }}"
+
+            echo "[1/6] Перехожу в каталог $APP_DIR"
+            cd "$APP_DIR"
+
+            echo "[2/6] Обновляю код из main"
+            # Если репо уже клонировано – просто обновим. Иначе – клонируем.
+            if [ -d .git ]; then
+              git fetch --all --prune
+              git reset --hard origin/main
+            else
+              # если чистая папка — клонируем репо заново (URL вашего репозитория)
+              git clone --depth=1 https://github.com/Xsenus/ai-integration.git "$APP_DIR"
+              cd "$APP_DIR"
+            fi
+
+            echo "[3/6] Создаю venv, если нет"
+            if [ ! -d ".venv" ]; then
+              python3 -m venv .venv
+            fi
+
+            echo "[4/6] Обновляю зависимости"
+            . .venv/bin/activate
+            python -m pip install -U pip wheel
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            fi
+
+            # Если используешь Alembic — применим миграции (без ошибок, если нет alembic.ini)
+            if [ -f alembic.ini ]; then
+              echo "[5/6] Alembic migrations"
+              alembic upgrade head || true
+            fi
+
+            echo "[6/6] Перезапускаю systemd сервис"
+            systemctl daemon-reload
+            systemctl restart "$SERVICE"
+            systemctl is-active --quiet "$SERVICE" && echo "Service $SERVICE is running."
+
