@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """Общие настройки приложения и подключений к БД."""
+
     # === DB DSNs (SQLAlchemy async: postgresql+asyncpg://user:pass@host:port/db) ===
     BITRIX_DATABASE_URL: Optional[str] = None
     PARSING_DATABASE_URL: Optional[str] = None
@@ -38,13 +39,25 @@ class Settings(BaseSettings):
     CORS_ALLOW_HEADERS: Optional[str] = None
     CORS_ALLOW_CREDENTIALS: Optional[bool] = None
 
+    # === Bitrix24 / batch / sync ===
     B24_BASE_URL: str | None = None
+    # Реальный лимит элементов на странице у crm.company.list, по умолчанию 50
+    B24_PAGE_LIMIT: int = 50
+    # Совместимость со старым кодом (если где-то используется): не влияет на новую пагинацию
     B24_PAGE_SIZE: int = 200
+
     B24_BATCH_ENABLED: bool = True
-    B24_BATCH_SIZE: int = 25
+    B24_BATCH_SIZE: int = 25  # ≤ 50 по правилам Bitrix
+
     B24_SYNC_ENABLED: bool = True
-    B24_SYNC_INTERVAL: int = 600
-    B24_SYNC_COMMIT_BATCH: int = 200
+    B24_SYNC_INTERVAL: int = 600           # каждые 10 минут
+    B24_SYNC_COMMIT_BATCH: int = 200       # коммит каждые N записей
+    B24_SYNC_MAX_ITEMS: int | None = None  # лимит записей за один прогон (None/0 = без лимита)
+
+    # === Логирование Bitrix24 HTTP и шагов пагинации ===
+    B24_LOG_VERBOSE: bool = False          # подробные шаги: start/next, страницы в батче, причины остановки
+    B24_LOG_BODIES: bool = False           # логировать тела запросов/ответов (ОСТОРОЖНО: могут быть ПДн)
+    B24_LOG_BODY_CHARS: int = 2000         # если включены тела — обрезать до N символов
 
     model_config = SettingsConfigDict(
         env_file=".env",

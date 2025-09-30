@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -9,6 +10,7 @@ import httpx
 from app.config import settings
 
 log = logging.getLogger(__name__)
+http_log = logging.getLogger("bitrix.http")
 
 # Конфиг
 B24_BASE_URL = (settings.B24_BASE_URL or "").rstrip("/") + "/"
@@ -29,13 +31,62 @@ def _timeout() -> httpx.Timeout:
     return httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
 
 
+def _redact_url(u: str) -> str:
+    # маскируем секрет вебхука: оставим первые 4 символа токена
+    try:
+        parts = u.split("/rest/")
+        if len(parts) == 2:
+            left, right = parts
+            segs = right.strip("/").split("/")
+            if len(segs) >= 2:
+                user_id, token = segs[0], segs[1]
+                safe = (token[:4] + "…") if token else ""
+                segs[1] = safe
+                return f"{left}/rest/" + "/".join(segs) + "/"
+    except Exception:
+        pass
+    return u
+
+
 async def _post(method: str, json: Dict[str, Any]) -> Dict[str, Any]:
     _ensure_url()
     url = f"{B24_BASE_URL}{method}"
+    red = _redact_url(url)
+    t0 = time.perf_counter()
     async with httpx.AsyncClient(timeout=_timeout()) as client:
+        if settings.B24_LOG_VERBOSE or settings.B24_LOG_BODIES:
+            body_preview = str(json)
+            if not settings.B24_LOG_BODIES:
+                body_preview = "{...}"  # не пишем тело, если флаг выключен
+            else:
+                body_preview = body_preview[: settings.B24_LOG_BODY_CHARS]
+            http_log.info("POST %s json=%s", red, body_preview)
+
         resp = await client.post(url, json=json)
         resp.raise_for_status()
+
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
         data = resp.json()
+
+        # Короткий сводный лог по ответу
+        if isinstance(data, dict):
+            if method == "batch":
+                r = data.get("result", {}) or {}
+                r_res = r.get("result", {})
+                r_next = r.get("result_next", {})
+                res_len = len(r_res) if isinstance(r_res, dict) else (len(r_res) if isinstance(r_res, list) else 0)
+                next_len = len(r_next) if isinstance(r_next, dict) else 0
+                http_log.info('RESP %s %s in %dms (result=%s keys, result_next=%s keys)',
+                              red, resp.status_code, elapsed_ms, res_len, next_len)
+            else:
+                res = data.get("result")
+                res_len = len(res) if isinstance(res, list) else (1 if res is not None else 0)
+                nxt = data.get("next", None)
+                http_log.info('RESP %s %s in %dms (items=%s, next=%s)',
+                              red, resp.status_code, elapsed_ms, res_len, nxt)
+        else:
+            http_log.info('RESP %s %s in %dms', red, resp.status_code, elapsed_ms)
+
         if isinstance(data, dict) and "error" in data:
             raise RuntimeError(f"Bitrix24 error: {data}")
         return data
@@ -77,7 +128,7 @@ async def _call(method: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
     return await _post(method, params or {})
 
 
-async def iter_companies(all_props: bool = True) -> AsyncIterator[Dict[str, Any]]:
+async def iter_companies(all_props: bool = True, max_items: Optional[int] = None) -> AsyncIterator[Dict[str, Any]]:
     """
     Последовательный перебор crm.company.list без batch.
     """
@@ -85,6 +136,7 @@ async def iter_companies(all_props: bool = True) -> AsyncIterator[Dict[str, Any]
     select = ["*", "UF_*"] if all_props else ["ID", "TITLE", "DATE_MODIFY"]
 
     seen_starts: set[int] = set()
+    yielded = 0
 
     while start is not None:
         # предохранитель от циклов
@@ -106,6 +158,10 @@ async def iter_companies(all_props: bool = True) -> AsyncIterator[Dict[str, Any]
         items: List[Dict[str, Any]] = payload.get("result", []) or []
         for item in items:
             yield item
+            yielded += 1
+            if max_items and yielded >= max_items:
+                log.info("B24(non-batch): reached max_items=%s — stopping.", max_items)
+                return
 
         # стоп: если хвост
         if len(items) < PAGE_LIMIT:
@@ -129,7 +185,7 @@ async def _batch(cmd: Dict[str, str], halt: int = 0) -> Dict[str, Any]:
     return await _post("batch", payload)
 
 
-async def iter_companies_batch(all_props: bool = True) -> AsyncIterator[Dict[str, Any]]:
+async def iter_companies_batch(all_props: bool = True, max_items: Optional[int] = None) -> AsyncIterator[Dict[str, Any]]:
     """
     Надёжный перебор: последовательная цепочка в batch.
     За 1 HTTP-запрос вытягиваем до BATCH_SIZE подряд идущих страниц:
@@ -151,6 +207,7 @@ async def iter_companies_batch(all_props: bool = True) -> AsyncIterator[Dict[str
     })
 
     current_start: int | None = 0
+    yielded = 0
 
     while current_start is not None:
         # Собираем цепочку p0..pN
@@ -184,22 +241,36 @@ async def iter_companies_batch(all_props: bool = True) -> AsyncIterator[Dict[str
 
             for item in page_items:
                 yield item
+                yielded += 1
+                if max_items and yielded >= max_items:
+                    log.info("B24(batch): reached max_items=%s — stopping.", max_items)
+                    return
 
             pages_with_items += 1
             last_page_count = len(page_items)
 
         # стоп №1: хвост
         if pages_with_items == 0 or last_page_count < PAGE_LIMIT:
-            log.info("B24(batch): tail reached (pages_with_items=%d, last_count=%d < PAGE_LIMIT=%d).",
-                     pages_with_items, last_page_count, PAGE_LIMIT)
+            log.info(
+                "B24(batch): tail reached (pages_with_items=%d, last_count=%d < PAGE_LIMIT=%d).",
+                pages_with_items, last_page_count, PAGE_LIMIT
+            )
             break
 
         # вычисляем следующий оффсет монотонно
         next_start = current_start + pages_with_items * PAGE_LIMIT
+        if settings.B24_LOG_VERBOSE:
+            log.info(
+                "B24(batch): current_start=%d, pages_with_items=%d, last_count=%d, next_start=%d",
+                current_start, pages_with_items, last_page_count, next_start
+            )
 
         # стоп №2: защита от зацикливания/регресса
         if next_start <= current_start:
-            log.warning("B24(batch): computed next_start=%d <= current_start=%d — stopping.", next_start, current_start)
+            log.warning(
+                "B24(batch): computed next_start=%d <= current_start=%d — stopping.",
+                next_start, current_start
+            )
             break
 
         current_start = next_start
@@ -212,13 +283,13 @@ async def iter_companies_batch(all_props: bool = True) -> AsyncIterator[Dict[str
 
 # ---------- Унифицированный селектор ----------
 
-async def iter_companies_fast(all_props: bool = True) -> AsyncIterator[Dict[str, Any]]:
+async def iter_companies_fast(all_props: bool = True, max_items: Optional[int] = None) -> AsyncIterator[Dict[str, Any]]:
     """
     Возвращает итератор компаний: batch или обычный — в зависимости от конфигурации.
     """
     if BATCH_ENABLED:
-        async for x in iter_companies_batch(all_props=all_props):
+        async for x in iter_companies_batch(all_props=all_props, max_items=max_items):
             yield x
     else:
-        async for x in iter_companies(all_props=all_props):
+        async for x in iter_companies(all_props=all_props, max_items=max_items):
             yield x
