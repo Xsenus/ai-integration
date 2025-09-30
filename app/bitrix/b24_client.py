@@ -12,9 +12,10 @@ log = logging.getLogger(__name__)
 
 # Конфиг
 B24_BASE_URL = (settings.B24_BASE_URL or "").rstrip("/") + "/"
-PAGE_SIZE = int(getattr(settings, "B24_PAGE_SIZE", 200) or 200)      # размер страницы crm.company.list
-BATCH_SIZE = int(getattr(settings, "B24_BATCH_SIZE", 25) or 25)     # ≤ 50 по правилам Bitrix
-BATCH_ENABLED = bool(getattr(settings, "B24_BATCH_ENABLED", True))  # переключатель режима batch
+# У crm.company.list дефолтный лимит 50; оставим настраиваемым.
+PAGE_LIMIT = int(getattr(settings, "B24_PAGE_LIMIT", 50) or 50)
+BATCH_SIZE = int(getattr(settings, "B24_BATCH_SIZE", 25) or 25)     # ≤ 50
+BATCH_ENABLED = bool(getattr(settings, "B24_BATCH_ENABLED", True))
 
 
 # ---------- Вспомогательные ----------
@@ -83,7 +84,19 @@ async def iter_companies(all_props: bool = True) -> AsyncIterator[Dict[str, Any]
     start: int | str | None = 0
     select = ["*", "UF_*"] if all_props else ["ID", "TITLE", "DATE_MODIFY"]
 
+    seen_starts: set[int] = set()
+
     while start is not None:
+        # предохранитель от циклов
+        try:
+            s_int = int(start)
+            if s_int in seen_starts:
+                log.warning("B24: detected repeated start=%s in non-batch iterator — stopping.", s_int)
+                break
+            seen_starts.add(s_int)
+        except Exception:
+            pass
+
         payload = await _call("crm.company.list", {
             "order": {"ID": "ASC"},
             "filter": {},
@@ -93,6 +106,11 @@ async def iter_companies(all_props: bool = True) -> AsyncIterator[Dict[str, Any]
         items: List[Dict[str, Any]] = payload.get("result", []) or []
         for item in items:
             yield item
+
+        # стоп: если хвост
+        if len(items) < PAGE_LIMIT:
+            log.info("B24(non-batch): tail reached (count=%d < PAGE_LIMIT=%d).", len(items), PAGE_LIMIT)
+            break
 
         start = payload.get("next", None)
         try:
@@ -114,34 +132,31 @@ async def _batch(cmd: Dict[str, str], halt: int = 0) -> Dict[str, Any]:
 async def iter_companies_batch(all_props: bool = True) -> AsyncIterator[Dict[str, Any]]:
     """
     Надёжный перебор: последовательная цепочка в batch.
-    За 1 HTTP-запрос вытягиваем до BATCH_SIZE ПОДРЯД идущих страниц:
+    За 1 HTTP-запрос вытягиваем до BATCH_SIZE подряд идущих страниц:
       p0: start=S
       p1: start=$result[p0][next]
       p2: start=$result[p1][next]
       ...
-    Затем берём next от ПОСЛЕДНЕЙ p{N} как старт следующей пачки.
-    Это гарантирует отсутствие пропусков и дублей.
+    Следующий оффсет вычисляем монотонно: current_start += (число непустых страниц) * PAGE_LIMIT.
+    Это защищает от кейсов, когда Bitrix отдаёт неподвижный или «ломаный» next.
+    Доп. предохранители:
+      - если последняя непустая страница вернула < PAGE_LIMIT — завершаем (хвост);
+      - если вычисленный next_start <= current_start — завершаем (защита от зацикливания).
     """
     select = ["*", "UF_*"] if all_props else ["ID", "TITLE", "DATE_MODIFY"]
-
-    # Базовый qs без start — добавляем start отдельно,
-    # чтобы можно было подставлять плейсхолдеры вида $result[pX][next]
     base_qs = _qs({
         "order": {"ID": "ASC"},
         "filter": {},
         "select": select,
-        # "start" здесь НЕ добавляем
     })
 
     current_start: int | None = 0
 
     while current_start is not None:
-        # Сформировать цепочку p0..pN в одном batch
+        # Собираем цепочку p0..pN
         cmd: Dict[str, str] = {}
         for idx in range(BATCH_SIZE):
             if idx == 0:
-                if current_start is None:
-                    break
                 start_part = f"start={current_start}"
             else:
                 prev = idx - 1
@@ -150,22 +165,17 @@ async def iter_companies_batch(all_props: bool = True) -> AsyncIterator[Dict[str
 
         data = await _batch(cmd, halt=0)
         results: Dict[str, Any] = data.get("result", {}) or {}
-        # По спецификации Bitrix:
-        # - result.result — dict { "p0": [...], "p1": [...], ... } (массивы компаний)
-        # - result.result_next — dict { "p0": <next0>, "p1": <next1>, ... }
         result_map: Dict[str, Any] = results.get("result", {}) or {}
-        result_next: Dict[str, Any] = results.get("result_next", {}) or {}
 
-        last_nonempty_key: str | None = None
+        pages_with_items = 0
+        last_page_count = 0
 
         for idx in range(BATCH_SIZE):
             key = f"p{idx}"
             page_items: List[Dict[str, Any]] = []
-
             if isinstance(result_map, dict):
                 page_items = result_map.get(key, []) or []
             else:
-                # fallback (крайне редкий случай, если SDK вернул массив)
                 if isinstance(result_map, list) and idx < len(result_map):
                     page_items = result_map[idx] or []
 
@@ -175,16 +185,24 @@ async def iter_companies_batch(all_props: bool = True) -> AsyncIterator[Dict[str
             for item in page_items:
                 yield item
 
-            last_nonempty_key = key
+            pages_with_items += 1
+            last_page_count = len(page_items)
 
-        # Готовим старт следующей цепочки: берем next от последней непустой pX
-        if last_nonempty_key and last_nonempty_key in result_next:
-            try:
-                current_start = int(result_next[last_nonempty_key])
-            except Exception:
-                current_start = None
-        else:
-            current_start = None
+        # стоп №1: хвост
+        if pages_with_items == 0 or last_page_count < PAGE_LIMIT:
+            log.info("B24(batch): tail reached (pages_with_items=%d, last_count=%d < PAGE_LIMIT=%d).",
+                     pages_with_items, last_page_count, PAGE_LIMIT)
+            break
+
+        # вычисляем следующий оффсет монотонно
+        next_start = current_start + pages_with_items * PAGE_LIMIT
+
+        # стоп №2: защита от зацикливания/регресса
+        if next_start <= current_start:
+            log.warning("B24(batch): computed next_start=%d <= current_start=%d — stopping.", next_start, current_start)
+            break
+
+        current_start = next_start
 
         try:
             await asyncio.sleep(0.2)
