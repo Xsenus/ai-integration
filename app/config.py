@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     CORS_ALLOW_HEADERS: Optional[str] = None
     CORS_ALLOW_CREDENTIALS: Optional[bool] = None
 
+    B24_BASE_URL: str | None = None
+    B24_PAGE_SIZE: int = 200
+    B24_BATCH_ENABLED: bool = True
+    B24_BATCH_SIZE: int = 25
+    B24_SYNC_ENABLED: bool = True
+    B24_SYNC_INTERVAL: int = 600
+    B24_SYNC_COMMIT_BATCH: int = 200
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

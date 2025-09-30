@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import List
+
 from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -11,10 +14,18 @@ from app.api.routes import router as api_router
 from app.api.ai_analyzer import router as ai_analyzer_router
 
 # DB helpers
-from app.db.bitrix import get_bitrix_engine, ping_bitrix
+from app.db.bitrix import (
+    get_bitrix_engine,
+    ping_bitrix,
+    create_bitrix_tables,
+)
 from app.db.parsing import get_parsing_engine, ensure_parsing_schema
 from app.db.pp719 import get_pp719_engine
 from app.db.postgres import get_postgres_engine, ping_postgres
+
+# Bitrix24 raw companies (модель таблицы) + sync job
+from app.models.bitrix_company import BaseBitrix
+from app.jobs.b24_sync_job import run_b24_sync_loop
 
 # --- Logging ---
 LOG_LEVEL = (settings.LOG_LEVEL or "INFO").upper()
@@ -41,16 +52,44 @@ if origins:
 app.include_router(api_router)
 app.include_router(ai_analyzer_router)
 
+# Хэндлы фоновых задач (для корректной остановки)
+_bg_tasks: List[asyncio.Task] = []
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     # Инициализируем коннекторы (если DSN заданы)
-    get_bitrix_engine()
+    bitrix_eng = get_bitrix_engine()
     get_parsing_engine()
     get_pp719_engine()
     get_postgres_engine()
 
     # Создаём/проверяем схему parsing_data
     await ensure_parsing_schema()
+
+    try:
+        # Создаст таблицу b24_companies_raw, если её раньше не было
+        await create_bitrix_tables(BaseBitrix)
+        log.info("bitrix_data: tables ensured (b24_companies_raw).")
+    except Exception:
+        log.exception("bitrix_data: failed to ensure tables")
+
+    try:
+        bitrix_eng = get_bitrix_engine()
+        if settings.B24_SYNC_ENABLED and bitrix_eng is not None and settings.B24_BASE_URL:
+            interval = int(settings.B24_SYNC_INTERVAL or 600)
+            t = asyncio.create_task(run_b24_sync_loop(interval))
+            _bg_tasks.append(t)
+            log.info("B24 sync loop started (interval=%ss).", interval)
+        else:
+            if not settings.B24_SYNC_ENABLED:
+                log.info("B24 sync loop disabled by settings.")
+            elif not settings.B24_BASE_URL:
+                log.warning("B24 sync loop NOT started: B24_BASE_URL is not configured.")
+            else:
+                log.warning("B24 sync loop NOT started: bitrix_data DSN is empty.")
+    except Exception:
+        log.exception("Failed to start B24 sync loop")
 
     # Пролог маршрутов (для быстрой самопроверки)
     try:
@@ -66,8 +105,24 @@ async def on_startup() -> None:
 
     log.info("Startup complete: engines initialized (where DSN provided).")
 
+
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    # Корректно останавливаем фоновые задачи
+    for t in _bg_tasks:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    # Дадим задачам шанс отмениться
+    if _bg_tasks:
+        try:
+            await asyncio.gather(*_bg_tasks, return_exceptions=True)
+        except Exception:
+            pass
+    _bg_tasks.clear()
+
+    # Закрываем коннекты к БД
     engines: list[AsyncEngine | None] = [
         get_bitrix_engine(),
         get_parsing_engine(),
@@ -78,6 +133,7 @@ async def on_shutdown() -> None:
         if eng is not None:
             await eng.dispose()
     log.info("All database engines disposed.")
+
 
 @app.get("/health")
 async def health():
