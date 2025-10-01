@@ -16,9 +16,12 @@ http_log = logging.getLogger("bitrix.http")
 B24_BASE_URL = (settings.B24_BASE_URL or "").rstrip("/") + "/"
 # У crm.company.list дефолтный лимит 50; оставим настраиваемым.
 PAGE_LIMIT = int(getattr(settings, "B24_PAGE_LIMIT", 50) or 50)
-BATCH_SIZE = int(getattr(settings, "B24_BATCH_SIZE", 25) or 25)     # ≤ 50
-BATCH_ENABLED = bool(getattr(settings, "B24_BATCH_ENABLED", True))
 
+# Batch-параметры
+BATCH_HARD_MAX = 25  # Жёсткий лимит Bitrix: не более 25 команд в одном batch-запросе
+BATCH_SIZE = min(int(getattr(settings, "B24_BATCH_SIZE", 25) or 25), BATCH_HARD_MAX)
+BATCH_ENABLED = bool(getattr(settings, "B24_BATCH_ENABLED", True))
+BATCH_PAUSE_MS = int(getattr(settings, "B24_BATCH_PAUSE_MS", 500) or 500)  # пауза между batch-запросами
 
 # ---------- Вспомогательные ----------
 
@@ -74,18 +77,32 @@ async def _post(method: str, json: Dict[str, Any]) -> Dict[str, Any]:
                 r = data.get("result", {}) or {}
                 r_res = r.get("result", {})
                 r_next = r.get("result_next", {})
-                res_len = len(r_res) if isinstance(r_res, dict) else (len(r_res) if isinstance(r_res, list) else 0)
+                res_len = len(r_res) if isinstance(r_res, dict) else (
+                    len(r_res) if isinstance(r_res, list) else 0
+                )
                 next_len = len(r_next) if isinstance(r_next, dict) else 0
-                http_log.info('RESP %s %s in %dms (result=%s keys, result_next=%s keys)',
-                              red, resp.status_code, elapsed_ms, res_len, next_len)
+                http_log.info(
+                    "RESP %s %s in %dms (result=%s keys, result_next=%s keys)",
+                    red,
+                    resp.status_code,
+                    elapsed_ms,
+                    res_len,
+                    next_len,
+                )
             else:
                 res = data.get("result")
                 res_len = len(res) if isinstance(res, list) else (1 if res is not None else 0)
                 nxt = data.get("next", None)
-                http_log.info('RESP %s %s in %dms (items=%s, next=%s)',
-                              red, resp.status_code, elapsed_ms, res_len, nxt)
+                http_log.info(
+                    "RESP %s %s in %dms (items=%s, next=%s)",
+                    red,
+                    resp.status_code,
+                    elapsed_ms,
+                    res_len,
+                    nxt,
+                )
         else:
-            http_log.info('RESP %s %s in %dms', red, resp.status_code, elapsed_ms)
+            http_log.info("RESP %s %s in %dms", red, resp.status_code, elapsed_ms)
 
         if isinstance(data, dict) and "error" in data:
             raise RuntimeError(f"Bitrix24 error: {data}")
@@ -149,12 +166,15 @@ async def iter_companies(all_props: bool = True, max_items: Optional[int] = None
         except Exception:
             pass
 
-        payload = await _call("crm.company.list", {
-            "order": {"ID": "ASC"},
-            "filter": {},
-            "select": select,
-            "start": start,
-        })
+        payload = await _call(
+            "crm.company.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": {},
+                "select": select,
+                "start": start,
+            },
+        )
         items: List[Dict[str, Any]] = payload.get("result", []) or []
         for item in items:
             yield item
@@ -200,11 +220,13 @@ async def iter_companies_batch(all_props: bool = True, max_items: Optional[int] 
       - если вычисленный next_start <= current_start — завершаем (защита от зацикливания).
     """
     select = ["*", "UF_*"] if all_props else ["ID", "TITLE", "DATE_MODIFY"]
-    base_qs = _qs({
-        "order": {"ID": "ASC"},
-        "filter": {},
-        "select": select,
-    })
+    base_qs = _qs(
+        {
+            "order": {"ID": "ASC"},
+            "filter": {},
+            "select": select,
+        }
+    )
 
     current_start: int | None = 0
     yielded = 0
@@ -253,7 +275,9 @@ async def iter_companies_batch(all_props: bool = True, max_items: Optional[int] 
         if pages_with_items == 0 or last_page_count < PAGE_LIMIT:
             log.info(
                 "B24(batch): tail reached (pages_with_items=%d, last_count=%d < PAGE_LIMIT=%d).",
-                pages_with_items, last_page_count, PAGE_LIMIT
+                pages_with_items,
+                last_page_count,
+                PAGE_LIMIT,
             )
             break
 
@@ -262,23 +286,29 @@ async def iter_companies_batch(all_props: bool = True, max_items: Optional[int] 
         if settings.B24_LOG_VERBOSE:
             log.info(
                 "B24(batch): current_start=%d, pages_with_items=%d, last_count=%d, next_start=%d",
-                current_start, pages_with_items, last_page_count, next_start
+                current_start,
+                pages_with_items,
+                last_page_count,
+                next_start,
             )
 
         # стоп №2: защита от зацикливания/регресса
         if next_start <= current_start:
             log.warning(
                 "B24(batch): computed next_start=%d <= current_start=%d — stopping.",
-                next_start, current_start
+                next_start,
+                current_start,
             )
             break
 
         current_start = next_start
 
-        try:
-            await asyncio.sleep(0.2)
-        except Exception:
-            pass
+        # Пауза между batch-запросами (настраиваемая)
+        if BATCH_PAUSE_MS > 0:
+            try:
+                await asyncio.sleep(BATCH_PAUSE_MS / 1000.0)
+            except Exception:
+                pass
 
 
 # ---------- Унифицированный селектор ----------

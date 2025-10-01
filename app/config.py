@@ -47,12 +47,14 @@ class Settings(BaseSettings):
     B24_PAGE_SIZE: int = 200
 
     B24_BATCH_ENABLED: bool = True
-    B24_BATCH_SIZE: int = 25  # ≤ 50 по правилам Bitrix
+    B24_BATCH_SIZE: int = 25               # будет принудительно ограничен 25 в коде клиента
+    B24_BATCH_PAUSE_MS: int = 500          # пауза между batch-запросами (мс)
 
-    B24_SYNC_ENABLED: bool = True
+    B24_SYNC_ENABLED: bool = False
     B24_SYNC_INTERVAL: int = 600           # каждые 10 минут
     B24_SYNC_COMMIT_BATCH: int = 200       # коммит каждые N записей
     B24_SYNC_MAX_ITEMS: int | None = None  # лимит записей за один прогон (None/0 = без лимита)
+    B24_SYNC_COMMIT_PAUSE_MS: int = 0      # пауза между commit-батчами (мс)
 
     # === Логирование Bitrix24 HTTP и шагов пагинации ===
     B24_LOG_VERBOSE: bool = False          # подробные шаги: start/next, страницы в батче, причины остановки

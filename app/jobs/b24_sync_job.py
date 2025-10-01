@@ -20,6 +20,7 @@ async def sync_all_companies_once() -> dict:
     """
     counters = {"updated": 0, "skipped": 0, "errors": 0, "read": 0}
     batch_size = int(getattr(settings, "B24_SYNC_COMMIT_BATCH", 200) or 200)
+    commit_pause_ms = int(getattr(settings, "B24_SYNC_COMMIT_PAUSE_MS", 0) or 0)
     max_items = getattr(settings, "B24_SYNC_MAX_ITEMS", None)
     stopped_by_limit = False
     i = 0
@@ -41,6 +42,12 @@ async def sync_all_companies_once() -> dict:
                     "B24 sync: progress %s (batch committed) [updated=%s skipped=%s errors=%s read=%s]",
                     i, counters["updated"], counters["skipped"], counters["errors"], counters["read"]
                 )
+                # Небольшая пауза между коммит-батчами (если задана)
+                if commit_pause_ms > 0:
+                    try:
+                        await asyncio.sleep(commit_pause_ms / 1000.0)
+                    except Exception:
+                        pass
 
         await session.commit()
 
@@ -53,7 +60,10 @@ async def sync_all_companies_once() -> dict:
 async def run_b24_sync_loop(interval_seconds: int = 600) -> None:
     while True:
         try:
-            if not settings.B24_BASE_URL:
+            # Возможность отключить задачу
+            if not getattr(settings, "B24_SYNC_ENABLED", True):
+                log.info("B24 sync skipped: disabled by B24_SYNC_ENABLED.")
+            elif not settings.B24_BASE_URL:
                 log.warning("B24 sync skipped: B24_BASE_URL is not configured.")
             else:
                 await sync_all_companies_once()
