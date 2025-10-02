@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Literal
+
 from pydantic import BaseModel, Field, StringConstraints, ConfigDict
 
 # ИНН: 10 или 12 цифр
@@ -57,3 +58,11 @@ class AiAnalyzerResponse(BaseModel):
         )
     )
     note: Optional[str] = Field(None, description="Опциональная разработческая пометка")
+
+
+class BulkAiAnalyzeLaunchResponse(BaseModel):
+    """Результат запуска пакетного анализа компаний."""
+
+    status: Literal["started", "already_running", "empty", "disabled"]
+    queued: Optional[int] = Field(None, description="Сколько организаций поставлено в очередь")
+    detail: Optional[str] = Field(None, description="Дополнительная информация о запуске")
