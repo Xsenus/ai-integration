@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, Path
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import urlparse as _urlparse
@@ -17,6 +17,7 @@ from app.db.pp719 import pp719_has_inn
 from app.db.parsing import (
     clients_requests_exists,
     get_clients_request_id as get_clients_request_id_pd,
+    get_last_domain_by_inn as get_last_domain_by_inn_pd,
     push_clients_request as push_clients_request_pd,
     table_exists as table_exists_pd,
     pars_site_insert_chunks as pars_site_insert_chunks_pd,
@@ -455,6 +456,37 @@ async def lookup_card_get(
 #   Парсинг главной страницы домена → pars_site
 # ==========================================
 
+async def _autodetect_domain_by_inn(inn: str) -> Optional[str]:
+    """Ищем домен компании по ИНН в доступных витринах."""
+
+    if get_last_domain_by_inn_pg:
+        try:
+            domain_pg = await get_last_domain_by_inn_pg(inn)
+            if domain_pg:
+                log.info(
+                    "parse-site: domain подтянут из POSTGRES по ИНН %s → %s",
+                    inn,
+                    domain_pg,
+                )
+                return domain_pg
+        except Exception as e:  # noqa: BLE001
+            log.warning("parse-site: не удалось подтянуть домен из POSTGRES по ИНН %s: %s", inn, e)
+
+    try:
+        domain_pd = await get_last_domain_by_inn_pd(inn)
+        if domain_pd:
+            log.info(
+                "parse-site: domain подтянут из parsing_data по ИНН %s → %s",
+                inn,
+                domain_pd,
+            )
+            return domain_pd
+    except Exception as e:  # noqa: BLE001
+        log.warning("parse-site: не удалось подтянуть домен из parsing_data по ИНН %s: %s", inn, e)
+
+    return None
+
+
 class ParseSiteRequest(BaseModel):
     # Теперь parse_domain можно не передавать: попытаемся определить по ИНН
     inn: str = Field(..., min_length=4, max_length=20, description="ИНН для clients_requests.inn")
@@ -479,20 +511,7 @@ class ParseSiteResponse(BaseModel):
     chunks_inserted: int
 
 
-def _normalize_and_split_domain(domain_or_url: str) -> tuple[str, str]:
-    """
-    Возвращает (home_url, normalized_domain без www).
-    """
-    home_url = to_home_url(domain_or_url)
-    normalized_domain = _urlparse(home_url).netloc.replace("www.", "")
-    return home_url, normalized_domain
-
-
-@router.post("/parse-site", response_model=ParseSiteResponse, summary="Парсинг главной страницы домена и сохранение в pars_site")
-async def parse_site(
-    payload: ParseSiteRequest = Body(...),
-    session: AsyncSession = Depends(get_bitrix_session),
-):
+async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> ParseSiteResponse:
     if not settings.SCRAPERAPI_KEY:
         raise HTTPException(status_code=400, detail="SCRAPERAPI_KEY is not configured on server")
 
@@ -500,31 +519,22 @@ async def parse_site(
     if not inn.isdigit():
         raise HTTPException(status_code=400, detail="ИНН должен содержать только цифры")
 
-    # 0) Определяем parse_domain:
     parse_domain = (payload.parse_domain or "").strip()
-    if not parse_domain and get_last_domain_by_inn_pg:
-        try:
-            last_domain_1 = await get_last_domain_by_inn_pg(inn)  # ожидаем значение вида 'www.example.ru'
-            if last_domain_1:
-                # из domain_1 (www.example.ru) делаем нормализованный домен без www
-                parse_domain = last_domain_1
-                log.info("parse-site: domain подтянут по ИНН %s → %s", inn, parse_domain)
-        except Exception as e:  # noqa: BLE001
-            log.warning("parse-site: не удалось подтянуть домен по ИНН %s: %s", inn, e)
-
     if not parse_domain:
-        raise HTTPException(
-            status_code=400,
-            detail="Не удалось определить домен: передайте 'parse_domain' или добавьте в БД запись clients_requests для этого ИНН",
-        )
+        autodetected = await _autodetect_domain_by_inn(inn)
+        if autodetected:
+            parse_domain = autodetected
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Не удалось определить домен: передайте 'parse_domain' или добавьте в БД запись clients_requests для этого ИНН",
+            )
 
-    # 0.1) Нормализуем домены/URL заранее
     try:
         home_url, normalized_domain = _normalize_and_split_domain(parse_domain)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Некорректный parse_domain: {e}") from e
 
-    # 1) company_name: если не задано — попробуем подтянуть из своей БД (DaDataResult)
     company_name = (payload.company_name or "").strip()
     if not company_name:
         persisted = await session.get(DaDataResult, inn)
@@ -533,14 +543,10 @@ async def parse_site(
                 (persisted.short_name_opf or persisted.short_name or "").strip()
             ) or None
 
-    # 2) client_domain_1: если не задано — используем www.{normalized_domain}
     client_domain_1 = (payload.client_domain_1 or "").strip() or f"www.{normalized_domain}"
-
-    # 3) pars_site.domain_1 и url
     domain_for_pars = (payload.pars_site_domain_1 or "").strip() or normalized_domain
     url_for_pars = (payload.url_override or "").strip() or home_url
 
-    # 4) upsert в POSTGRES (основная БД)
     minimal_summary = {"short_name": company_name, "inn": inn}
     if payload.save_client_request:
         try:
@@ -548,16 +554,12 @@ async def parse_site(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"PG upsert clients_requests failed: {e}") from e
 
-    # 4.1) Получаем company_id из POSTGRES
     company_id_pg = await get_clients_request_id_pg(inn, client_domain_1)
     if not company_id_pg:
         raise HTTPException(status_code=500, detail="PG: не удалось определить company_id после upsert по ИНН")
 
-    # 5) Тянем и режем HTML
     try:
-        # fetch_and_chunk сам вызывает ScraperAPI и чистку текста
         home_url_checked, chunks, normalized_domain_checked = await fetch_and_chunk(parse_domain)
-        # на случай редиректов/особенностей — доверяем возвращённым значениям
         if not payload.url_override:
             url_for_pars = home_url_checked
         if not payload.pars_site_domain_1:
@@ -565,9 +567,12 @@ async def parse_site(
     except FetchError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
-    chunks_payload = [{"start": i, "end": i, "text": t} for i, t in enumerate(chunks or []) if t]
+    chunks_payload = [
+        {"start": i, "end": i, "text": text}
+        for i, text in enumerate(chunks or [])
+        if text
+    ]
 
-    # 6) Вставляем чанки в POSTGRES
     inserted_pg = 0
     if chunks_payload:
         inserted_pg = await pars_site_insert_chunks_pg(
@@ -577,7 +582,6 @@ async def parse_site(
             chunks=chunks_payload,
         )
 
-    # 7) Зеркалим в parsing_data (best-effort; со своим company_id)
     try:
         if payload.save_client_request:
             await push_clients_request_pd(minimal_summary, domain=client_domain_1)
@@ -592,13 +596,48 @@ async def parse_site(
                 url=url_for_pars,
                 chunks=chunks_payload,
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.warning("mirror parsing_data failed for INN=%s: %s", inn, e)
 
-    # Возвращаем данные по основному хранилищу (POSTGRES)
     return ParseSiteResponse(
         company_id=company_id_pg,
         domain_1=domain_for_pars,
         url=url_for_pars,
         chunks_inserted=inserted_pg,
     )
+
+
+def _normalize_and_split_domain(domain_or_url: str) -> tuple[str, str]:
+    """
+    Возвращает (home_url, normalized_domain без www).
+    """
+    home_url = to_home_url(domain_or_url)
+    normalized_domain = _urlparse(home_url).netloc.replace("www.", "")
+    return home_url, normalized_domain
+
+
+@router.post("/parse-site", response_model=ParseSiteResponse, summary="Парсинг главной страницы домена и сохранение в pars_site")
+async def parse_site(
+    payload: ParseSiteRequest = Body(...),
+    session: AsyncSession = Depends(get_bitrix_session),
+):
+    return await _parse_site_impl(payload, session)
+
+
+@router.get(
+    "/parse-site/{inn}",
+    response_model=ParseSiteResponse,
+    summary="Парсинг главной страницы по ИНН с автоопределением домена",
+)
+async def parse_site_by_inn(
+    inn: str = Path(
+        ...,
+        min_length=4,
+        max_length=20,
+        regex=r"^\d+$",
+        description="ИНН компании, для которой нужно подтянуть домен",
+    ),
+    session: AsyncSession = Depends(get_bitrix_session),
+):
+    payload = ParseSiteRequest(inn=inn)
+    return await _parse_site_impl(payload, session)

@@ -6,7 +6,7 @@ AI Integration Service — асинхронное FastAPI-приложение, 
 
 - **FastAPI** (`app/main.py`) — точка входа, инициализирует подключения к четырём БД (`bitrix_data`, `parsing_data`, `pp719`, основная `postgres`), настраивает CORS и запускает фоновый цикл синхронизации компаний из Bitrix24.
 - **API-модули**
-  - `app/api/routes.py` — расширенные карточки компании `/v1/lookup/card` (POST/GET), запись сведений в PostgreSQL и зеркало `parsing_data`, а также парсинг главной страницы домена `/v1/parse-site` c сохранением текста в `pars_site`.
+  - `app/api/routes.py` — расширенные карточки компании `/v1/lookup/card` (POST/GET), запись сведений в PostgreSQL и зеркало `parsing_data`, а также парсинг главной страницы домена `/v1/parse-site` (POST/GET) c сохранением текста в `pars_site`.
   - `app/api/ai_analyzer.py` — маршрут `/v1/lookup/ai-analyzer`, который дополняет данные из БД запросом к внешнему AI-сервису.
 - **Бэкенд-слой**
   - `app/db/*` — подключение и вспомогательные операции для каждой базы, включая создание таблиц Bitrix и зеркалирование данных в `clients_requests`/`pars_site`.
@@ -62,7 +62,7 @@ uvicorn app.main:app --reload
 - `GET /health` — пинг всех сконфигурированных баз.
 - `POST /v1/lookup/card` и `GET /v1/lookup/{inn}/card` — получение и сохранение расширенных карточек компании по ИНН с записью в обе БД.
 - `POST /v1/lookup/ai-analyzer` — агрегация сохранённых данных с результатами внешнего AI-анализа по домену.
-- `POST /v1/parse-site` — загрузка главной страницы компании через ScraperAPI, нарезка текста на чанки и сохранение в `pars_site`.
+- `POST /v1/parse-site` и `GET /v1/parse-site/{inn}` — загрузка главной страницы компании через ScraperAPI, нарезка текста на чанки и сохранение в `pars_site` (GET автоматически ищет домен по ИНН).
 
 ## Полезные заметки
 
