@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import urlparse as _urlparse
 
 from app.config import settings
-from app.db.bitrix import get_bitrix_session
+from app.db.bitrix import get_bitrix_session, bitrix_session
 from app.db.pp719 import pp719_has_inn
 
 # parsing_data (зеркало)
@@ -356,6 +357,14 @@ async def lookup_card_post(
     except Exception as e:
         log.warning("pp719 check failed for %s: %s", inn, e)
 
+    schedule_parse_site_background(
+        inn=inn,
+        parse_domain=dto.domain,
+        company_name=summary_dict.get("short_name"),
+        save_client_request=False,
+        reason="lookup/card-post",
+    )
+
     return OrgExtendedResponse(
         summary=CompanySummaryOut.model_validate(summary) if summary else None,
         raw_last=raw_payload,
@@ -509,6 +518,84 @@ class ParseSiteResponse(BaseModel):
     domain_1: str
     url: str
     chunks_inserted: int
+
+
+async def _run_parse_site_background(
+    *,
+    inn: str,
+    parse_domain: str | None,
+    company_name: str | None,
+    save_client_request: bool,
+    reason: str,
+) -> None:
+    """Выполнить parse-site в отдельной задаче."""
+
+    payload_data: dict[str, object] = {
+        "inn": inn,
+        "save_client_request": save_client_request,
+    }
+    if parse_domain:
+        payload_data["parse_domain"] = parse_domain
+    if company_name:
+        payload_data["company_name"] = company_name
+
+    try:
+        async with bitrix_session() as session:
+            payload = ParseSiteRequest(**payload_data)
+            await _parse_site_impl(payload, session)
+    except HTTPException as e:
+        log.info(
+            "parse-site background skipped (%s): %s (inn=%s, domain=%s)",
+            reason,
+            e.detail,
+            inn,
+            parse_domain,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "parse-site background failed (%s) for inn=%s, domain=%s",
+            reason,
+            inn,
+            parse_domain,
+        )
+
+
+def schedule_parse_site_background(
+    *,
+    inn: str,
+    parse_domain: str | None,
+    company_name: str | None = None,
+    save_client_request: bool = False,
+    reason: str,
+) -> None:
+    """Запускает parse-site в фоне, не блокируя ответ API."""
+
+    inn_clean = (inn or "").strip()
+    if not inn_clean:
+        log.debug("parse-site background not scheduled: empty inn (%s).", reason)
+        return
+
+    domain_clean = (parse_domain or "").strip() or None
+    name_clean = (company_name or "").strip() or None
+
+    async def runner() -> None:
+        await _run_parse_site_background(
+            inn=inn_clean,
+            parse_domain=domain_clean,
+            company_name=name_clean,
+            save_client_request=save_client_request,
+            reason=reason,
+        )
+
+    try:
+        asyncio.create_task(runner(), name=f"parse-site:{inn_clean}")
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "parse-site background scheduling failed (%s) for inn=%s, domain=%s",
+            reason,
+            inn_clean,
+            domain_clean,
+        )
 
 
 async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> ParseSiteResponse:

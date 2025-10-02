@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.config import settings
+from app.db.bitrix import bitrix_session
 from app.db.postgres import get_postgres_engine
 from app.schemas.ai_analyzer import (
     AiAnalyzerRequest,
@@ -23,6 +24,7 @@ from app.schemas.ai_analyzer import (
     BulkAiAnalyzeLaunchResponse,
 )
 from app.services.ai_analyzer import analyze_company_by_inn
+from app.api.routes import ParseSiteRequest, _parse_site_impl
 
 log = logging.getLogger("api.ai_analyzer")
 router = APIRouter(prefix="/v1/lookup", tags=["ai-analyzer"])
@@ -136,6 +138,7 @@ async def _run_bulk_analyze(companies: list[tuple[str, str]]) -> None:
             inn,
             site,
         )
+        await _ensure_site_parsed_for_bulk(inn, site)
         try:
             ok, message = await _call_external_analyze(site, inn)
         except asyncio.CancelledError:
@@ -169,6 +172,37 @@ async def _run_bulk_analyze(companies: list[tuple[str, str]]) -> None:
             )
 
     log.info("Bulk analyze: completed (total=%s).", total)
+
+
+async def _ensure_site_parsed_for_bulk(inn: str, site: str) -> None:
+    """Готовит pars_site перед запуском внешнего анализа."""
+
+    payload = ParseSiteRequest(
+        inn=inn,
+        parse_domain=site,
+        save_client_request=False,
+    )
+    try:
+        async with bitrix_session() as session:
+            await _parse_site_impl(payload, session)
+        log.info(
+            "Bulk analyze: pars_site refreshed for inn=%s, site=%s.",
+            inn,
+            site,
+        )
+    except HTTPException as e:
+        log.info(
+            "Bulk analyze: parse-site skipped for inn=%s, site=%s (%s).",
+            inn,
+            site,
+            e.detail,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "Bulk analyze: parse-site failed for inn=%s, site=%s.",
+            inn,
+            site,
+        )
 
 
 async def _cancel_bulk_task() -> None:
