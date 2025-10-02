@@ -311,20 +311,37 @@ async def pars_site_insert_chunks(
     def _coerce_chunk(ch: Mapping[str, Any] | tuple[int, int, str]) -> Optional[dict]:
         if isinstance(ch, tuple) and len(ch) == 3:
             start, end, txt = ch
+            txt_par = None
         elif isinstance(ch, Mapping):
             start = int(ch.get("start", 0))
             end = int(ch.get("end", 0))
             txt = ch.get("text")
+            txt_par = ch.get("text_par")
         else:
             return None
-        if txt is None:
+        if txt is None and txt_par is None:
             return None
         s = int(start)
         e = int(end)
-        t = str(txt)
+        base_text = txt if txt is not None else txt_par
+        if base_text is None:
+            return None
+        t = str(base_text)
         if not t:
             return None
-        return {"company_id": company_id, "domain_1": dom, "url": url, "start": s, "end": e, "text": t}
+
+        text_par_value = txt_par if txt_par is not None else base_text
+        text_par_str = str(text_par_value) if text_par_value is not None else t
+
+        return {
+            "company_id": company_id,
+            "domain_1": dom,
+            "url": url,
+            "start": s,
+            "end": e,
+            "text": t,
+            "text_par": text_par_str,
+        }
 
     # Подготовка батча
     buf: list[dict] = []
@@ -354,8 +371,8 @@ async def _flush_pars_site_batch(conn, rows: list[dict]) -> int:
 
     sql = text(
         """
-        INSERT INTO public.pars_site (company_id, domain_1, url, start, "end", text)
-        SELECT :company_id, :domain_1, :url, :start, :end, :text
+        INSERT INTO public.pars_site (company_id, domain_1, url, start, "end", text, text_par)
+        SELECT :company_id, :domain_1, :url, :start, :end, :text, :text_par
         WHERE NOT EXISTS (
             SELECT 1 FROM public.pars_site ps
             WHERE ps.company_id = :company_id
