@@ -6,9 +6,13 @@ from typing import Optional
 from urllib.parse import quote, urlparse
 
 import httpx
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.config import settings
+from app.db.postgres import get_postgres_engine
 from app.schemas.ai_analyzer import (
     AiAnalyzerRequest,
     AiAnalyzerResponse,
@@ -16,6 +20,7 @@ from app.schemas.ai_analyzer import (
     AiBlock,
     AiProduct,
     AiEquipment,
+    BulkAiAnalyzeLaunchResponse,
 )
 from app.services.ai_analyzer import analyze_company_by_inn
 
@@ -39,6 +44,151 @@ _RETRY_BACKOFF_BASE = 0.5  # seconds
 
 _http_client: httpx.AsyncClient | None = None
 _http_client_lock = asyncio.Lock()
+_bulk_analyze_task: asyncio.Task[None] | None = None
+_bulk_task_lock = asyncio.Lock()
+
+_CLIENTS_FOR_ANALYZE_SQL = text(
+    """
+    SELECT DISTINCT ON (inn)
+        inn,
+        domain_1,
+        domain_2
+    FROM public.clients_requests
+    WHERE NULLIF(TRIM(inn), '') IS NOT NULL
+      AND (
+            NULLIF(TRIM(domain_1), '') IS NOT NULL
+         OR NULLIF(TRIM(domain_2), '') IS NOT NULL
+      )
+    ORDER BY inn, COALESCE(ended_at, created_at) DESC NULLS LAST, id DESC
+    """
+)
+
+
+def _on_bulk_task_done(task: asyncio.Task[None]) -> None:
+    """Callback для завершившейся фоновой задачи массового анализа."""
+
+    global _bulk_analyze_task
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        log.info("Bulk analyze task cancelled.")
+    except Exception:  # noqa: BLE001
+        log.exception("Bulk analyze task failed.")
+    finally:
+        if _bulk_analyze_task is task:
+            _bulk_analyze_task = None
+
+
+async def _collect_companies_for_bulk(
+    limit: int | None = None,
+    *,
+    engine: AsyncEngine | None = None,
+) -> list[tuple[str, str]]:
+    """Возвращает список (ИНН, домен) для пакетного анализа."""
+
+    eng = engine or get_postgres_engine()
+    if eng is None:
+        log.warning("Bulk analyze: postgres engine is not configured.")
+        return []
+
+    async with eng.connect() as conn:
+        res = await conn.execute(_CLIENTS_FOR_ANALYZE_SQL)
+        rows = res.mappings().all()
+
+    companies: list[tuple[str, str]] = []
+    for row in rows:
+        inn = (row.get("inn") or "").strip()
+        if not inn:
+            continue
+        domains = [
+            (row.get("domain_1") or "").strip(),
+            (row.get("domain_2") or "").strip(),
+        ]
+        site = next((d for d in domains if d), None)
+        if site:
+            companies.append((inn, site))
+
+    if limit is not None and limit > 0:
+        companies = companies[:limit]
+
+    log.info(
+        "Bulk analyze: collected %s companies for processing (limit=%s).",
+        len(companies),
+        limit,
+    )
+    return companies
+
+
+async def _run_bulk_analyze(companies: list[tuple[str, str]]) -> None:
+    """Последовательно вызывает внешний сервис анализа для списка компаний."""
+
+    total = len(companies)
+    if total == 0:
+        log.info("Bulk analyze: nothing to process.")
+        return
+
+    log.info("Bulk analyze: started (total=%s).", total)
+    for idx, (inn, site) in enumerate(companies, start=1):
+        log.info(
+            "Bulk analyze: sending %s/%s -> inn=%s, site=%s.",
+            idx,
+            total,
+            inn,
+            site,
+        )
+        try:
+            ok, message = await _call_external_analyze(site, inn)
+        except asyncio.CancelledError:
+            log.info(
+                "Bulk analyze task cancelled while processing inn=%s (site=%s).",
+                inn,
+                site,
+            )
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "Bulk analyze: unexpected error for inn=%s, site=%s.", inn, site
+            )
+            continue
+
+        if ok:
+            log.info(
+                "Bulk analyze: success %s/%s for inn=%s (%s).",
+                idx,
+                total,
+                inn,
+                message,
+            )
+        else:
+            log.warning(
+                "Bulk analyze: failure %s/%s for inn=%s (%s).",
+                idx,
+                total,
+                inn,
+                message,
+            )
+
+    log.info("Bulk analyze: completed (total=%s).", total)
+
+
+async def _cancel_bulk_task() -> None:
+    """Отменяет текущую фоновую задачу (если она активна)."""
+
+    global _bulk_analyze_task
+    task = _bulk_analyze_task
+    if task is None:
+        return
+
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            log.info("Bulk analyze: task cancellation acknowledged.")
+        except Exception:  # noqa: BLE001
+            log.exception("Bulk analyze: task raised during cancellation.")
+
+    _bulk_analyze_task = None
 
 
 def _canonical_response(
@@ -161,6 +311,7 @@ async def _get_http_client() -> httpx.AsyncClient:
 async def close_ai_analyzer_http_client() -> None:
     """Закрывает переиспользуемый httpx.AsyncClient (на shutdown приложения)."""
 
+    await _cancel_bulk_task()
     global _http_client
     client: httpx.AsyncClient | None
     async with _http_client_lock:
@@ -265,6 +416,66 @@ async def _call_external_analyze(site: str, inn: str) -> tuple[bool, str]:
         last_err = f"{resp.status_code}: {text}" if text else f"{resp.status_code}"
 
     return False, f"external analyze failed ({last_err})"
+
+@router.post(
+    "/ai-analyzer/bulk",
+    response_model=BulkAiAnalyzeLaunchResponse,
+    summary="Запуск пакетного AI-анализа (POST)",
+)
+async def launch_bulk_ai_analyzer(
+    limit: int | None = Query(
+        None,
+        ge=1,
+        le=10000,
+        description="Максимум компаний в запуске (по умолчанию — все)",
+    ),
+    force: bool = Query(
+        False,
+        description="Прервать текущий запуск, если он выполняется, и начать заново",
+    ),
+) -> BulkAiAnalyzeLaunchResponse:
+    """Запускает последовательный анализ всех компаний с доменом и ИНН."""
+
+    eng = get_postgres_engine()
+    if eng is None:
+        detail = "POSTGRES_DATABASE_URL не задан — пакетный анализ отключён"
+        log.warning("Bulk analyze: %s", detail)
+        return BulkAiAnalyzeLaunchResponse(status="disabled", detail=detail)
+
+    async with _bulk_task_lock:
+        global _bulk_analyze_task
+        task = _bulk_analyze_task
+        if task is not None and not task.done():
+            if not force:
+                log.info("Bulk analyze: already running, skip new launch (limit=%s).", limit)
+                return BulkAiAnalyzeLaunchResponse(
+                    status="already_running",
+                    detail="Пакетный анализ уже выполняется",
+                )
+            log.info("Bulk analyze: force restart requested (limit=%s).", limit)
+            await _cancel_bulk_task()
+
+        companies = await _collect_companies_for_bulk(limit=limit, engine=eng)
+        if not companies:
+            detail = "Не найдено компаний с заполненными ИНН и доменом"
+            log.info("Bulk analyze: %s (limit=%s).", detail, limit)
+            return BulkAiAnalyzeLaunchResponse(status="empty", detail=detail)
+
+        task = asyncio.create_task(
+            _run_bulk_analyze(companies),
+            name="bulk-ai-analyze",
+        )
+        task.add_done_callback(_on_bulk_task_done)
+        _bulk_analyze_task = task
+
+    log.info(
+        "Bulk analyze: scheduled task for %s companies (limit=%s, force=%s).",
+        len(companies),
+        limit,
+        force,
+    )
+    return BulkAiAnalyzeLaunchResponse(status="started", queued=len(companies))
+
 
 @router.post(
     "/ai-analyzer",
