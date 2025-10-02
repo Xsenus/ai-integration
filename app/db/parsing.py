@@ -185,6 +185,39 @@ async def get_clients_request_id(inn: str, domain_1: Optional[str] = None) -> Op
         return int(row[0]) if row else None
 
 
+async def get_last_domain_by_inn(inn: str) -> Optional[str]:
+    """Возвращает последний domain_1 для ИНН из parsing_data.clients_requests."""
+
+    eng = get_parsing_engine()
+    if eng is None:
+        return None
+
+    sql = text(
+        """
+        SELECT domain_1
+        FROM public.clients_requests
+        WHERE inn = :inn
+          AND domain_1 IS NOT NULL
+          AND TRIM(domain_1) <> ''
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+
+    async with eng.begin() as conn:
+        row = (await conn.execute(sql, {"inn": inn})).first()
+        if not row:
+            log.info("parsing_data: domain не найден для inn=%s", inn)
+            return None
+
+        dom = row[0]
+        try:
+            ensured = _ensure_www(dom)
+            return ensured
+        except Exception:
+            return str(dom) if dom is not None else None
+
+
 async def push_clients_request(summary: dict, domain: Optional[str] = None) -> bool:
     """
     Upsert по inn: UPDATE … WHERE inn; если 0 строк — INSERT.
