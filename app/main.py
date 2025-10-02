@@ -11,7 +11,10 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.api.routes import router as api_router
-from app.api.ai_analyzer import router as ai_analyzer_router
+from app.api.ai_analyzer import (
+    router as ai_analyzer_router,
+    close_ai_analyzer_http_client,
+)
 
 # DB helpers
 from app.db.bitrix import (
@@ -121,6 +124,12 @@ async def on_shutdown() -> None:
         except Exception:
             pass
     _bg_tasks.clear()
+
+    # Закрываем HTTP-клиенты внешних сервисов
+    try:
+        await close_ai_analyzer_http_client()
+    except Exception:
+        log.exception("Failed to close ai-analyzer HTTP client")
 
     # Закрываем коннекты к БД
     engines: list[AsyncEngine | None] = [

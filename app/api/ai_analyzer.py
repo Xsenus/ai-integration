@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 from urllib.parse import quote, urlparse
@@ -20,6 +21,24 @@ from app.services.ai_analyzer import analyze_company_by_inn
 
 log = logging.getLogger("api.ai_analyzer")
 router = APIRouter(prefix="/v1/lookup", tags=["ai-analyzer"])
+
+_RETRYABLE_STATUS_CODES = {
+    408,
+    409,
+    425,
+    429,
+    500,
+    502,
+    503,
+    504,
+    522,
+    524,
+}
+_MAX_ANALYZE_ATTEMPTS = 3
+_RETRY_BACKOFF_BASE = 0.5  # seconds
+
+_http_client: httpx.AsyncClient | None = None
+_http_client_lock = asyncio.Lock()
 
 
 def _canonical_response(
@@ -82,9 +101,6 @@ def _build_site_path_param(site: str) -> str:
     return quote(s, safe="")
 
 
-from urllib.parse import quote, urlparse
-import httpx
-
 def _extract_host(site: str) -> str:
     """Берём чистый host/netloc из URL/домена и обрезаем путь/слеши."""
     s = (site or "").strip()
@@ -109,12 +125,105 @@ def _build_variants_for_site(site: str) -> list[str]:
     Оба варианта percent-encode.
     """
     host = _extract_host(site)
-    variants = []
+    variants: list[str] = []
     if host:
         variants.append(quote(host, safe=""))
         if not host.lower().startswith("www."):
             variants.append(quote(f"www.{host}", safe=""))
-    return variants
+    # гарантируем сохранение порядка и убираем дубликаты, если host уже начинался с www.
+    return list(dict.fromkeys(variants))
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Ленивая инициализация общего httpx.AsyncClient с коннект-пулом."""
+
+    global _http_client
+    if _http_client is None:
+        async with _http_client_lock:
+            if _http_client is None:
+                client = httpx.AsyncClient(
+                    follow_redirects=True,
+                    http2=False,
+                    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+                )
+                client.headers.update(
+                    {
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "User-Agent": "ai-integration/ai-analyzer",
+                    }
+                )
+                _http_client = client
+    assert _http_client is not None
+    return _http_client
+
+
+async def close_ai_analyzer_http_client() -> None:
+    """Закрывает переиспользуемый httpx.AsyncClient (на shutdown приложения)."""
+
+    global _http_client
+    client: httpx.AsyncClient | None
+    async with _http_client_lock:
+        client = _http_client
+        _http_client = None
+    if client is not None:
+        await client.aclose()
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    timeout: httpx.Timeout,
+    inn: str,
+) -> tuple[httpx.Response | None, str | None]:
+    """POST-запрос с ограниченным числом повторов при транзиентных сбоях."""
+
+    last_error: str | None = None
+    for attempt in range(1, _MAX_ANALYZE_ATTEMPTS + 1):
+        try:
+            resp = await client.post(url, json={}, timeout=timeout)
+        except httpx.TimeoutException as exc:
+            last_error = f"timeout: {exc}" if str(exc) else "timeout"
+            log.warning(
+                "Analyze timeout (attempt %s/%s): %s [inn=%s]",
+                attempt,
+                _MAX_ANALYZE_ATTEMPTS,
+                url,
+                inn,
+            )
+        except httpx.RequestError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "Analyze request failed (attempt %s/%s): %s [%s] %s [inn=%s]",
+                attempt,
+                _MAX_ANALYZE_ATTEMPTS,
+                url,
+                type(exc).__name__,
+                exc,
+                inn,
+            )
+        else:
+            if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_ANALYZE_ATTEMPTS:
+                text = (resp.text or "")[:120]
+                last_error = f"{resp.status_code}"
+                log.warning(
+                    "Analyze retryable status %s (attempt %s/%s): %s %s [inn=%s]",
+                    resp.status_code,
+                    attempt,
+                    _MAX_ANALYZE_ATTEMPTS,
+                    url,
+                    text,
+                    inn,
+                )
+            else:
+                return resp, None
+
+        if attempt < _MAX_ANALYZE_ATTEMPTS:
+            backoff = min(_RETRY_BACKOFF_BASE * (2 ** (attempt - 1)), 2.0)
+            await asyncio.sleep(backoff)
+
+    return None, last_error
 
 async def _call_external_analyze(site: str, inn: str) -> tuple[bool, str]:
     """
@@ -127,35 +236,33 @@ async def _call_external_analyze(site: str, inn: str) -> tuple[bool, str]:
         or "http://37.221.125.221:8123"
     ).rstrip("/")
 
-    timeout_s = int(getattr(settings, "AI_ANALYZE_TIMEOUT", 60))
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    timeout_s = max(1, int(getattr(settings, "AI_ANALYZE_TIMEOUT", 60)))
+    timeout = httpx.Timeout(
+        timeout_s,
+        connect=min(float(timeout_s), 10.0),
+        read=float(timeout_s),
+        write=min(float(timeout_s), 10.0),
+    )
 
     variants = _build_variants_for_site(site)
     if not variants:
         return False, "external analyze: empty site"
 
-    async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True, http2=False) as client:
-        last_err = None
-        for v in variants:
-            url = f"{base}/v1/analyze/by-site/{v}"
-            try:
-                # ⬇️ тело запроса ровно '{}'
-                resp = await client.post(url, json={}, headers=headers)
-                if 200 <= resp.status_code < 300:
-                    log.info("Analyze OK: %s (%s)", url, resp.status_code)
-                    return True, f"external analyze ok @ {url}"
-                text = (resp.text or "")[:300]
-                log.warning("Analyze non-2xx: %s %s %s", url, resp.status_code, text)
-                # если не 2xx — попробуем следующий вариант (если он есть)
-                last_err = f"{resp.status_code}"
-            except Exception as e:
-                # покажем тип исключения для ясности
-                etype = type(e).__name__
-                log.warning("Analyze request failed: %s [%s] %s", url, etype, e)
-                last_err = f"{etype}: {e}"
+    client = await _get_http_client()
+
+    last_err: str | None = None
+    for v in variants:
+        url = f"{base}/v1/analyze/by-site/{v}"
+        resp, err = await _post_with_retry(client, url, timeout=timeout, inn=inn)
+        if resp is None:
+            last_err = err or "no response"
+            continue
+        if 200 <= resp.status_code < 300:
+            log.info("Analyze OK: %s (%s) [inn=%s]", url, resp.status_code, inn)
+            return True, f"external analyze ok @ {url}"
+        text = (resp.text or "")[:300]
+        log.warning("Analyze non-2xx: %s %s %s [inn=%s]", url, resp.status_code, text, inn)
+        last_err = f"{resp.status_code}: {text}" if text else f"{resp.status_code}"
 
     return False, f"external analyze failed ({last_err})"
 
