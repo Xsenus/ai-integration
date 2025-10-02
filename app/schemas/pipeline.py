@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 
 class PipelineRequest(BaseModel):
     """Входные параметры для полного пайплайна."""
+
+    _has_identifiers: bool = PrivateAttr(default=False)
 
     inn: str | None = Field(
         None,
@@ -43,12 +45,18 @@ class PipelineRequest(BaseModel):
     @model_validator(mode="after")
     def _ensure_identifier_present(self) -> "PipelineRequest":  # noqa: D401
         """Проверяет, что указан хотя бы один идентификатор."""
-
-        if not any([self.inn, self.site, self.pars_id, self.client_id]):
-            raise ValueError(
-                "Необходимо указать хотя бы один идентификатор: inn, site, pars_id или client_id."
-            )
+        has_any = any([self.inn, self.site, self.pars_id, self.client_id])
+        object.__setattr__(self, "_has_identifiers", has_any)
+        if not has_any and not self.run_analyze:
+            # При пакетном запуске анализ должен выполняться автоматически
+            self.run_analyze = True
         return self
+
+    @property
+    def has_identifiers(self) -> bool:
+        """Признак, что во входном запросе были указаны идентификаторы."""
+
+        return self._has_identifiers
 
 
 class ResolvedIdentifiers(BaseModel):
@@ -99,4 +107,19 @@ class PipelineResponse(BaseModel):
     analyze: Optional[dict[str, Any]] = None
     ib_match: Optional[dict[str, Any]] = None
     equipment_selection: Optional[dict[str, Any]] = None
+    duration_ms: int
+
+
+class PipelineBatchItem(PipelineResponse):
+    """Результат пайплайна для одной организации при пакетном запуске."""
+
+    parse_run: Optional[dict[str, Any]] = None
+
+
+class PipelineBatchResponse(BaseModel):
+    """Ответ пакетного запуска пайплайна без входных идентификаторов."""
+
+    mode: Literal["batch"] = "batch"
+    total: int
+    items: list[PipelineBatchItem]
     duration_ms: int

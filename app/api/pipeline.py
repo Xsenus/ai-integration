@@ -8,10 +8,14 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from app.config import settings
+from app.db.parsing_mirror import pars_site_insert_chunks_pg
 from app.db.postgres import get_postgres_engine
 from app.schemas.pipeline import (
+    PipelineBatchItem,
+    PipelineBatchResponse,
     ParseSiteStage,
     PipelineClient,
     PipelineParsSite,
@@ -20,6 +24,7 @@ from app.schemas.pipeline import (
     ResolvedIdentifiers,
 )
 from app.services.ai_analyzer import analyze_company_by_inn
+from app.services.scrape import FetchError, fetch_and_chunk
 
 log = logging.getLogger("api.pipeline")
 
@@ -128,6 +133,23 @@ async def _fetch_pars_for_client(conn: AsyncConnection, client_id: int) -> list[
         """
     )
     res = await conn.execute(q, {"client_id": client_id})
+    return [dict(row) for row in res.mappings().all()]
+
+
+async def _fetch_all_clients(conn: AsyncConnection) -> list[dict[str, Any]]:
+    q = text(
+        """
+        SELECT DISTINCT ON (inn)
+               id, company_name, inn, domain_1, domain_2,
+               started_at, ended_at, created_at
+        FROM public.clients_requests
+        WHERE inn IS NOT NULL AND TRIM(inn) <> ''
+        ORDER BY inn,
+                 COALESCE(ended_at, created_at) DESC NULLS LAST,
+                 id DESC
+        """
+    )
+    res = await conn.execute(q)
     return [dict(row) for row in res.mappings().all()]
 
 
@@ -242,42 +264,177 @@ def _skipped(detail: str) -> dict[str, Any]:
     return {"status": "skipped", "detail": detail}
 
 
-@router.post("/full", response_model=PipelineResponse, summary="Полный пайплайн анализа клиента")
-async def run_full_pipeline(payload: PipelineRequest) -> PipelineResponse:
+def _make_resolved_identifiers(resolution: _ResolutionResult) -> ResolvedIdentifiers:
+    pars_id = resolution.pars.get("id") if resolution.pars else None
+    client_id = resolution.client.get("id")
+    if client_id is None:
+        raise RuntimeError("client_id is required to build pipeline response")
+    return ResolvedIdentifiers(
+        inn=resolution.inn,
+        site=resolution.site,
+        pars_id=pars_id,
+        client_id=client_id,
+    )
+
+
+async def _run_analyze_step(
+    resolution: _ResolutionResult, *, should_run: bool
+) -> dict[str, Any] | None:
+    if not should_run:
+        return None
+
+    if not resolution.inn:
+        return _skipped("Не удалось определить ИНН для шага анализа")
+
+    try:
+        analyze_payload = await analyze_company_by_inn(resolution.inn)
+        return {"status": "ok", "payload": analyze_payload}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Pipeline analyze step failed for inn=%s", resolution.inn)
+        return {"status": "error", "detail": str(exc)}
+
+
+async def _parse_site_for_client(*, client_id: int, domain: str) -> dict[str, Any]:
+    home_url, chunks, normalized_domain = await fetch_and_chunk(domain)
+    chunk_rows = [
+        {"start": idx, "end": idx, "text": chunk}
+        for idx, chunk in enumerate(chunks or [])
+        if chunk
+    ]
+    inserted = 0
+    if chunk_rows:
+        inserted = await pars_site_insert_chunks_pg(
+            company_id=client_id,
+            domain_1=normalized_domain,
+            url=home_url,
+            chunks=chunk_rows,
+        )
+    log.info(
+        "Pipeline parse completed for client_id=%s domain=%s: %s chunks (%s inserted)",
+        client_id,
+        normalized_domain,
+        len(chunk_rows),
+        inserted,
+    )
+    return {
+        "domain": normalized_domain,
+        "url": home_url,
+        "chunks_found": len(chunk_rows),
+        "chunks_inserted": inserted,
+    }
+
+
+async def _run_parse_step(resolution: _ResolutionResult) -> tuple[dict[str, Any], bool]:
+    domain = resolution.site
+    if not domain:
+        return _skipped("Для клиента не определён домен"), False
+
+    client_id = resolution.client.get("id")
+    if client_id is None:
+        return {"status": "error", "detail": "Не удалось определить client_id для парсинга"}, False
+
+    if not settings.SCRAPERAPI_KEY:
+        return _skipped("SCRAPERAPI_KEY не задан — шаг парсинга пропущен"), False
+
+    try:
+        detail = await _parse_site_for_client(client_id=client_id, domain=domain)
+        return {"status": "ok", "detail": detail}, detail.get("chunks_inserted", 0) > 0
+    except FetchError as exc:
+        log.warning(
+            "Pipeline parse step failed for client_id=%s domain=%s: %s",
+            client_id,
+            domain,
+            exc,
+        )
+        return {"status": "error", "detail": str(exc)}, False
+    except Exception as exc:  # noqa: BLE001
+        log.exception(
+            "Pipeline parse step crashed for client_id=%s domain=%s",
+            client_id,
+            domain,
+        )
+        return {"status": "error", "detail": str(exc)}, False
+
+
+async def _run_parse_and_refresh(
+    engine: AsyncEngine, payload: PipelineRequest, resolution: _ResolutionResult
+) -> tuple[dict[str, Any], _ResolutionResult]:
+    parse_result, should_refresh = await _run_parse_step(resolution)
+    if should_refresh:
+        async with engine.connect() as conn:
+            resolution = await _resolve_identifiers(conn, payload)
+    return parse_result, resolution
+
+
+async def _run_batch_pipeline(
+    engine: AsyncEngine, payload: PipelineRequest, started: float
+) -> PipelineBatchResponse:
+    async with engine.connect() as conn:
+        clients = await _fetch_all_clients(conn)
+
+    items: list[PipelineBatchItem] = []
+    for client in clients:
+        item_payload = PipelineRequest(
+            inn=client.get("inn"),
+            client_id=client.get("id"),
+            run_analyze=True,
+            analyze_options=payload.analyze_options,
+            ib_match_options=payload.ib_match_options,
+        )
+        item_started = time.perf_counter()
+
+        async with engine.connect() as conn:
+            resolution = await _resolve_identifiers(conn, item_payload)
+
+        parse_result, resolution = await _run_parse_and_refresh(engine, item_payload, resolution)
+        analyze_result = await _run_analyze_step(resolution, should_run=True)
+
+        duration_ms = int((time.perf_counter() - item_started) * 1000)
+        items.append(
+            PipelineBatchItem(
+                resolved=_make_resolved_identifiers(resolution),
+                parse_site=_build_parse_stage(resolution),
+                analyze=analyze_result,
+                ib_match=_skipped("Шаг IB-match не реализован в этой сборке"),
+                equipment_selection=_skipped("Подбор оборудования не реализован в этой сборке"),
+                duration_ms=duration_ms,
+                parse_run=parse_result,
+            )
+        )
+
+    total_duration = int((time.perf_counter() - started) * 1000)
+    return PipelineBatchResponse(
+        total=len(items),
+        items=items,
+        duration_ms=total_duration,
+    )
+
+
+@router.post(
+    "/full",
+    response_model=PipelineResponse | PipelineBatchResponse,
+    summary="Полный пайплайн анализа клиента",
+)
+async def run_full_pipeline(payload: PipelineRequest) -> PipelineResponse | PipelineBatchResponse:
     started = time.perf_counter()
 
     engine = get_postgres_engine()
     if engine is None:
         raise HTTPException(status_code=503, detail="POSTGRES_DATABASE_URL не задан — пайплайн недоступен")
 
+    if not payload.has_identifiers:
+        return await _run_batch_pipeline(engine, payload, started)
+
     async with engine.connect() as conn:
         resolution = await _resolve_identifiers(conn, payload)
 
-    parse_stage = _build_parse_stage(resolution)
+    analyze_result = await _run_analyze_step(resolution, should_run=payload.run_analyze)
 
-    analyze_result: dict[str, Any] | None = None
-    if payload.run_analyze:
-        if resolution.inn:
-            try:
-                analyze_payload = await analyze_company_by_inn(resolution.inn)
-                analyze_result = {"status": "ok", "payload": analyze_payload}
-            except Exception as exc:  # noqa: BLE001
-                log.exception("Pipeline analyze step failed for inn=%s", resolution.inn)
-                analyze_result = {"status": "error", "detail": str(exc)}
-        else:
-            analyze_result = _skipped("Не удалось определить ИНН для шага анализа")
-
-    response = PipelineResponse(
-        resolved=ResolvedIdentifiers(
-            inn=resolution.inn,
-            site=resolution.site,
-            pars_id=resolution.pars.get("id") if resolution.pars else None,
-            client_id=resolution.client["id"],
-        ),
-        parse_site=parse_stage,
+    return PipelineResponse(
+        resolved=_make_resolved_identifiers(resolution),
+        parse_site=_build_parse_stage(resolution),
         analyze=analyze_result,
         ib_match=_skipped("Шаг IB-match не реализован в этой сборке"),
         equipment_selection=_skipped("Подбор оборудования не реализован в этой сборке"),
         duration_ms=int((time.perf_counter() - started) * 1000),
     )
-    return response
