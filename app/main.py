@@ -15,6 +15,7 @@ from app.api.ai_analyzer import (
     router as ai_analyzer_router,
     close_ai_analyzer_http_client,
 )
+from app.api.pipeline import router as pipeline_router
 
 # DB helpers
 from app.db.bitrix import (
@@ -54,6 +55,7 @@ if origins:
 # --- Routers ---
 app.include_router(api_router)
 app.include_router(ai_analyzer_router)
+app.include_router(pipeline_router)
 
 # Хэндлы фоновых задач (для корректной остановки)
 _bg_tasks: List[asyncio.Task] = []
