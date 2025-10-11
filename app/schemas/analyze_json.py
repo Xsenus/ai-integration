@@ -59,7 +59,9 @@ class AnalyzeFromInnRun(BaseModel):
     prodclass_score: Optional[float] = Field(None, description="Сохранённый скор класса производства")
     external_request: Optional[dict[str, Any]] = Field(
         None,
-        description="Полный запрос во внешний сервис (для отладки)",
+        description=(
+            "Запрос во внешний сервис (каталоги заменены на счётчики для снижения объёма данных)"
+        ),
     )
     external_status: int = Field(..., description="HTTP-статус ответа внешнего сервиса")
     external_response: Optional[dict[str, Any]] = Field(
@@ -100,7 +102,9 @@ class AnalyzeFromInnResponse(BaseModel):
     )
     external_request: Optional[dict[str, Any]] = Field(
         None,
-        description="Полный запрос во внешний сервис по первому домену (для отладки)",
+        description=(
+            "Запрос во внешний сервис по первому домену (каталоги заменены на счётчики для снижения объёма данных)"
+        ),
     )
     external_status: int = Field(
         ..., description="HTTP-статус ответа внешнего сервиса (первый домен)"
