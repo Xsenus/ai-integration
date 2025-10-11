@@ -57,6 +57,10 @@ class AnalyzeFromInnRun(BaseModel):
     saved_equipment: int = Field(..., description="Сколько строк записано в ai_site_equipment")
     prodclass_id: Optional[int] = Field(None, description="ID сохранённого класса производства")
     prodclass_score: Optional[float] = Field(None, description="Сохранённый скор класса производства")
+    external_request: Optional[dict[str, Any]] = Field(
+        None,
+        description="Полный запрос во внешний сервис (для отладки)",
+    )
     external_status: int = Field(..., description="HTTP-статус ответа внешнего сервиса")
     external_response: Optional[dict[str, Any]] = Field(
         None,
@@ -93,6 +97,10 @@ class AnalyzeFromInnResponse(BaseModel):
     )
     prodclass_score: Optional[float] = Field(
         None, description="Сохранённый скор класса производства (первый домен)"
+    )
+    external_request: Optional[dict[str, Any]] = Field(
+        None,
+        description="Полный запрос во внешний сервис по первому домену (для отладки)",
     )
     external_status: int = Field(
         ..., description="HTTP-статус ответа внешнего сервиса (первый домен)"
