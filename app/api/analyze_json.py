@@ -46,8 +46,14 @@ def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 "length": len(value),
                 "preview": value[:_TEXT_PREVIEW_LIMIT],
             }
-        elif key in {"goods_catalog", "equipment_catalog"} and isinstance(value, list):
-            summary[key] = {"items": len(value)}
+        elif key in {"goods_catalog", "equipment_catalog"}:
+            items_source: Any = value
+            if isinstance(value, Mapping):
+                items_source = value.get("items")
+            if isinstance(items_source, (list, tuple)):
+                summary[key] = {"items": len(items_source)}
+            else:
+                summary[key] = value
         else:
             summary[key] = value
     return summary
@@ -175,6 +181,69 @@ def _normalize_catalog_vector(value: Any) -> Any:
         except Exception:  # noqa: BLE001
             return value.hex()
     return value
+
+
+def _format_catalog_vector(value: Any) -> Optional[dict[str, Any]]:
+    """Подготавливает представление вектора каталога для внешнего API."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, (list, tuple)):
+        formatted_values: list[float] = []
+        for part in value:
+            try:
+                formatted_values.append(float(part))
+            except Exception:  # noqa: BLE001
+                continue
+        if not formatted_values:
+            return None
+        literal = _vector_to_literal(formatted_values) or ""
+        payload: dict[str, Any] = {"values": formatted_values}
+        if literal:
+            payload["literal"] = literal
+        return payload
+
+    if isinstance(value, str):
+        literal = value.strip()
+        return {"literal": literal} if literal else None
+
+    try:
+        literal = str(value).strip()
+    except Exception:  # noqa: BLE001
+        return None
+    return {"literal": literal} if literal else None
+
+
+def _prepare_catalog_payload(catalog: Iterable[Mapping[str, Any]]) -> Optional[dict[str, Any]]:
+    """Формирует структуру каталога в формате, ожидаемом внешним API."""
+
+    items: list[dict[str, Any]] = []
+    for item in catalog:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+
+        prepared: dict[str, Any] = {"name": name}
+        item_id = item.get("id")
+        if item_id is not None:
+            try:
+                prepared["id"] = int(item_id)
+            except Exception:  # noqa: BLE001
+                prepared["id"] = item_id
+
+        vec_payload = _format_catalog_vector(item.get("vec"))
+        if vec_payload:
+            prepared["vec"] = vec_payload
+
+        items.append(prepared)
+
+    if not items:
+        return None
+
+    return {"items": items}
 
 
 async def _load_catalog(
@@ -986,11 +1055,11 @@ async def _run_analyze(
         [snap.domain or "(unknown)" for snap in snapshots],
     )
 
-    goods_catalog: list[dict[str, Any]] = []
-    equipment_catalog: list[dict[str, Any]] = []
+    goods_catalog_items: list[dict[str, Any]] = []
+    equipment_catalog_items: list[dict[str, Any]] = []
     if payload.include_catalogs:
         try:
-            goods_catalog = await _load_catalog(
+            goods_catalog_items = await _load_catalog(
                 engine,
                 table=settings.IB_GOODS_TYPES_TABLE,
                 id_col=settings.IB_GOODS_TYPES_ID_COLUMN,
@@ -999,9 +1068,9 @@ async def _run_analyze(
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("analyze-json: failed to load goods catalog: %s", exc)
-            goods_catalog = []
+            goods_catalog_items = []
         try:
-            equipment_catalog = await _load_catalog(
+            equipment_catalog_items = await _load_catalog(
                 engine,
                 table=settings.IB_EQUIPMENT_TABLE,
                 id_col=settings.IB_EQUIPMENT_ID_COLUMN,
@@ -1010,12 +1079,16 @@ async def _run_analyze(
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("analyze-json: failed to load equipment catalog: %s", exc)
-            equipment_catalog = []
+            equipment_catalog_items = []
     else:
         log.info("analyze-json: catalogs loading skipped by request")
 
     base_endpoint = base_url.rstrip("/")
-    log.info("analyze-json: external endpoint resolved → %s", base_endpoint)
+    if base_endpoint.endswith("/v1/analyze/json"):
+        external_url = base_endpoint
+    else:
+        external_url = f"{base_endpoint}/v1/analyze/json"
+    log.info("analyze-json: external endpoint resolved → %s", external_url)
     client = await _get_http_client()
 
     runs: list[AnalyzeFromInnRun] = []
@@ -1023,6 +1096,9 @@ async def _run_analyze(
     total_saved_goods = 0
     total_saved_equipment = 0
     domains_processed: list[str] = []
+
+    goods_catalog_payload = _prepare_catalog_payload(goods_catalog_items)
+    equipment_catalog_payload = _prepare_catalog_payload(equipment_catalog_items)
 
     for idx, snapshot in enumerate(snapshots, start=1):
         domain_label = snapshot.domain or ""
@@ -1068,18 +1144,21 @@ async def _run_analyze(
         if payload.return_answer_raw is not None:
             request_payload["return_answer_raw"] = payload.return_answer_raw
             request_payload_for_response["return_answer_raw"] = payload.return_answer_raw
-        if goods_catalog:
-            request_payload["goods_catalog"] = goods_catalog
-            request_payload_for_response["goods_catalog"] = copy.deepcopy(goods_catalog)
-        if equipment_catalog:
-            request_payload["equipment_catalog"] = equipment_catalog
+        if goods_catalog_payload:
+            request_payload["goods_catalog"] = goods_catalog_payload
+            request_payload_for_response["goods_catalog"] = copy.deepcopy(
+                goods_catalog_payload
+            )
+
+        if equipment_catalog_payload:
+            request_payload["equipment_catalog"] = equipment_catalog_payload
             request_payload_for_response["equipment_catalog"] = copy.deepcopy(
-                equipment_catalog
+                equipment_catalog_payload
             )
 
         payload_summary = _summarize_external_payload(request_payload)
 
-        run_url = f"{base_endpoint}/v1/analyze/{snapshot.pars_id}"
+        run_url = external_url
         log.info(
             "analyze-json: sending request #%s to external service (inn=%s, url=%s, payload=%s)",
             idx,
@@ -1190,8 +1269,8 @@ async def _run_analyze(
             created_at=snapshot.created_at,
             text_length=text_length,
             chunk_count=len(snapshot.chunk_ids),
-            catalog_goods_size=len(goods_catalog),
-            catalog_equipment_size=len(equipment_catalog),
+            catalog_goods_size=len(goods_catalog_items),
+            catalog_equipment_size=len(equipment_catalog_items),
             saved_goods=goods_saved,
             saved_equipment=equipment_saved,
             prodclass_id=prodclass_id,
@@ -1217,8 +1296,8 @@ async def _run_analyze(
         pars_id=first_run.pars_id if first_run else None,
         company_id=first_run.company_id if first_run else None,
         text_length=first_run.text_length if first_run else 0,
-        catalog_goods_size=first_run.catalog_goods_size if first_run else len(goods_catalog),
-        catalog_equipment_size=first_run.catalog_equipment_size if first_run else len(equipment_catalog),
+        catalog_goods_size=first_run.catalog_goods_size if first_run else len(goods_catalog_items),
+        catalog_equipment_size=first_run.catalog_equipment_size if first_run else len(equipment_catalog_items),
         saved_goods=first_run.saved_goods if first_run else 0,
         saved_equipment=first_run.saved_equipment if first_run else 0,
         prodclass_id=first_run.prodclass_id,
