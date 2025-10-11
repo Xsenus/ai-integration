@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import copy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional
@@ -58,6 +57,28 @@ def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         else:
             summary[key] = value
     return summary
+
+
+def _sanitize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Удаляет тяжёлые поля (каталоги) из запроса перед сохранением."""
+
+    sanitized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in {"goods_catalog", "equipment_catalog"}:
+            if isinstance(value, Mapping):
+                items_source = value.get("items")
+                if isinstance(items_source, (list, tuple)):
+                    count = len(items_source)
+                else:
+                    count = value.get("items_count") or 0
+            elif isinstance(value, (list, tuple)):
+                count = len(value)
+            else:
+                count = 0
+            sanitized[key] = {"items": count, "truncated": True}
+            continue
+        sanitized[key] = value
+    return sanitized
 
 
 def _log_and_raise(
@@ -1127,38 +1148,26 @@ async def _run_analyze(
             "company_id": snapshot.company_id,
             "text_par": snapshot.text,
         }
-        request_payload_for_response = copy.deepcopy(request_payload)
         if payload.chat_model:
             request_payload["chat_model"] = payload.chat_model
-            request_payload_for_response["chat_model"] = payload.chat_model
         elif settings.CHAT_MODEL:
             request_payload["chat_model"] = settings.CHAT_MODEL
-            request_payload_for_response["chat_model"] = settings.CHAT_MODEL
         if payload.embed_model:
             request_payload["embed_model"] = payload.embed_model
-            request_payload_for_response["embed_model"] = payload.embed_model
         elif settings.embed_model:
             request_payload["embed_model"] = settings.embed_model
-            request_payload_for_response["embed_model"] = settings.embed_model
         if payload.return_prompt is not None:
             request_payload["return_prompt"] = payload.return_prompt
-            request_payload_for_response["return_prompt"] = payload.return_prompt
         if payload.return_answer_raw is not None:
             request_payload["return_answer_raw"] = payload.return_answer_raw
-            request_payload_for_response["return_answer_raw"] = payload.return_answer_raw
         if goods_catalog_payload:
             request_payload["goods_catalog"] = goods_catalog_payload
-            request_payload_for_response["goods_catalog"] = copy.deepcopy(
-                goods_catalog_payload
-            )
 
         if equipment_catalog_payload:
             request_payload["equipment_catalog"] = equipment_catalog_payload
-            request_payload_for_response["equipment_catalog"] = copy.deepcopy(
-                equipment_catalog_payload
-            )
 
-        payload_summary = _summarize_external_payload(request_payload)
+        sanitized_request_payload = _sanitize_external_payload(request_payload)
+        payload_summary = _summarize_external_payload(sanitized_request_payload)
 
         run_url = external_url
         log.info(
@@ -1277,7 +1286,7 @@ async def _run_analyze(
             saved_equipment=equipment_saved,
             prodclass_id=prodclass_id,
             prodclass_score=prodclass_score,
-            external_request=request_payload_for_response,
+            external_request=sanitized_request_payload,
             external_status=response.status_code,
             external_response=response_json,
         )
