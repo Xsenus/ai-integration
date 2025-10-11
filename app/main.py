@@ -11,6 +11,10 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.api.routes import router as api_router
+from app.api.analyze_json import (
+    router as analyze_json_router,
+    close_analyze_json_http_client,
+)
 from app.api.ai_analyzer import (
     router as ai_analyzer_router,
     close_ai_analyzer_http_client,
@@ -55,6 +59,7 @@ if origins:
 # --- Routers ---
 app.include_router(api_router)
 app.include_router(ai_analyzer_router)
+app.include_router(analyze_json_router)
 app.include_router(pipeline_router)
 
 # Хэндлы фоновых задач (для корректной остановки)
@@ -132,6 +137,10 @@ async def on_shutdown() -> None:
         await close_ai_analyzer_http_client()
     except Exception:
         log.exception("Failed to close ai-analyzer HTTP client")
+    try:
+        await close_analyze_json_http_client()
+    except Exception:
+        log.exception("Failed to close analyze-json HTTP client")
 
     # Закрываем коннекты к БД
     engines: list[AsyncEngine | None] = [
