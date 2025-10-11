@@ -34,6 +34,25 @@ _http_client: httpx.AsyncClient | None = None
 _http_client_lock = asyncio.Lock()
 
 _TEXT_PREVIEW_LIMIT = 400
+_LARGE_VECTOR_KEYS = {
+    "description_vector",
+    "text_vector",
+    "vector",
+    "vectors",
+    "embedding",
+    "embeddings",
+}
+_LARGE_TEXT_KEYS = {
+    "text_par",
+    "prompt",
+    "prompt_raw",
+    "answer_raw",
+    "raw_text",
+    "text_raw",
+    "chunks",
+    "text_chunks",
+    "chunks_raw",
+}
 
 
 def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -76,6 +95,9 @@ def _sanitize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             else:
                 count = 0
             sanitized[key] = {"items": count, "truncated": True}
+            continue
+        if key == "text_par" and isinstance(value, str):
+            sanitized[key] = {"length": len(value)}
             continue
         sanitized[key] = value
     return sanitized
@@ -800,6 +822,144 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _compact_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Удаляет пустые значения из словаря."""
+
+    return {
+        key: value
+        for key, value in payload.items()
+        if value not in (None, "", [], {}, ())
+    }
+
+
+def _sanitize_catalog_items(
+    items: Any,
+    *,
+    name_keys: Iterable[str],
+    id_keys: Iterable[str],
+    score_keys: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Сокращает описание элементов каталога, убирая векторы и служебные поля."""
+
+    if not isinstance(items, Iterable) or isinstance(items, (str, bytes, bytearray, memoryview)):
+        return []
+
+    sanitized_items: list[dict[str, Any]] = []
+    for raw_item in items:
+        if isinstance(raw_item, str):
+            candidate = raw_item.strip()
+            if candidate:
+                sanitized_items.append({"name": candidate})
+            continue
+        if not isinstance(raw_item, Mapping):
+            continue
+        name_value: Optional[str] = None
+        for key in name_keys:
+            candidate = raw_item.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                name_value = candidate.strip()
+                break
+        if not name_value:
+            continue
+
+        item_payload: dict[str, Any] = {"name": name_value}
+
+        for key in id_keys:
+            candidate_id = raw_item.get(key)
+            candidate_id = _safe_int(candidate_id)
+            if candidate_id is not None:
+                item_payload["id"] = candidate_id
+                break
+
+        score_value: Optional[float] = None
+        for key in score_keys:
+            candidate_score = raw_item.get(key)
+            score_value = _normalize_score(candidate_score)
+            if score_value is not None:
+                break
+        if score_value is not None:
+            item_payload["score"] = score_value
+
+        sanitized_items.append(item_payload)
+
+    return sanitized_items
+
+
+def _sanitize_db_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Удаляет тяжёлые поля из db_payload перед возвратом клиенту."""
+
+    sanitized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in _LARGE_VECTOR_KEYS:
+            continue
+        if key in {"goods_catalog", "equipment_catalog"}:
+            continue
+        if key in {"goods_types", "goods"}:
+            sanitized[key] = _sanitize_catalog_items(
+                value,
+                name_keys=("name", "goods_type"),
+                id_keys=("match_id", "id", "goods_type_id", "goods_type_ID"),
+                score_keys=("score", "goods_types_score", "match_score"),
+            )
+            continue
+        if key in {"equipment", "equipment_site"}:
+            sanitized[key] = _sanitize_catalog_items(
+                value,
+                name_keys=("name", "equipment"),
+                id_keys=("match_id", "id", "equipment_id", "equipment_ID"),
+                score_keys=("score", "equipment_score", "match_score"),
+            )
+            continue
+        if key == "prodclass" and isinstance(value, Mapping):
+            candidate_id = _safe_int(
+                value.get("id")
+                or value.get("prodclass")
+                or value.get("prodclass_id")
+            )
+            candidate_score = _normalize_score(
+                value.get("score")
+                or value.get("prodclass_score")
+            )
+            sanitized[key] = _compact_dict(
+                {
+                    "id": candidate_id,
+                    "score": candidate_score,
+                    "name": (value.get("name") or value.get("prodclass_name") or "").strip() or None,
+                }
+            )
+            continue
+        sanitized[key] = value
+    return _compact_dict(sanitized)
+
+
+def _sanitize_external_response(payload: Any) -> Any:
+    """Удаляет тяжёлые поля из ответа внешнего сервиса перед возвратом клиенту."""
+
+    if isinstance(payload, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in _LARGE_VECTOR_KEYS:
+                continue
+            if key in _LARGE_TEXT_KEYS:
+                if isinstance(value, str):
+                    sanitized[key] = {"length": len(value)}
+                elif isinstance(value, (list, tuple)):
+                    sanitized[key] = {"items": len(value)}
+                continue
+            if key == "db_payload" and isinstance(value, Mapping):
+                sanitized[key] = _sanitize_db_payload(value)
+                continue
+            sanitized[key] = _sanitize_external_response(value)
+        return _compact_dict(sanitized)
+    if isinstance(payload, list):
+        return [
+            item
+            for item in (_sanitize_external_response(item) for item in payload)
+            if item not in (None, {}, [])
+        ]
+    return payload
+
+
 async def _apply_db_payload(
     engine: AsyncEngine,
     snapshot: ParsSiteSnapshot,
@@ -1288,7 +1448,7 @@ async def _run_analyze(
             prodclass_score=prodclass_score,
             external_request=sanitized_request_payload,
             external_status=response.status_code,
-            external_response=response_json,
+            external_response=_sanitize_external_response(response_json),
         )
         runs.append(run)
 
