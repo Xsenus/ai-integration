@@ -458,13 +458,15 @@ async def _collect_latest_pars_site(engine: AsyncEngine, inn: str) -> list[ParsS
     columns = await _get_pars_site_columns()
     log.info("analyze-json: detected pars_site columns for inn=%s → %s", inn, sorted(columns))
 
-    select_fields = ["ps.id", "ps.domain_1", "ps.url", "ps.created_at"]
-    if "text_par" in columns:
-        select_fields.insert(1, "ps.text_par")
-    if "text" in columns:
-        # Сохраняем совместимость с инсталляциями, где присутствует колонка text.
-        select_fields.insert(2 if "text_par" in columns else 1, "ps.text")
-    if "domain_2" in columns and "ps.domain_2" not in select_fields:
+    select_fields = [
+        "ps.id",
+        "ps.text_par",
+        "ps.text",
+        "ps.domain_1",
+        "ps.url",
+        "ps.created_at",
+    ]
+    if "domain_2" in columns:
         select_fields.append("ps.domain_2")
     select_clause = ", ".join(select_fields)
 
