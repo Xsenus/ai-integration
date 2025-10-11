@@ -64,6 +64,7 @@ class DaDataResult(BaseBitrix):
 
     phones: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
     emails: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
+    web_sites: Mapped[Optional[str]] = mapped_column(String(2048))
 
     # Исторические показатели: маппинг на колонки с дефисами из БД
     revenue_1: Mapped[Optional[Decimal]] = mapped_column("revenue-1", Numeric(18, 0))

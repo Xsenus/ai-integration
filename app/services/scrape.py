@@ -18,6 +18,14 @@ class FetchError(RuntimeError):
     pass
 
 
+def _looks_like_redirect_placeholder(html: str) -> bool:
+    snippet = (html or "")[:1024].lower()
+    if "moved permanently" not in snippet:
+        return False
+    # типичная заглушка IBM_HTTP_Server: "The document has moved here."
+    return "document has moved" in snippet or "http server" in snippet
+
+
 def normalize_whitespace(text: str) -> str:
     text = re.sub(r"\r", "\n", text)
     text = re.sub(r"[ \t\f\v]+", " ", text)
@@ -64,6 +72,8 @@ async def fetch_home_via_scraperapi(domain_or_url: str, *, retries: int = 5) -> 
                 html = r.text or ""
                 if len(html) < settings.PARSE_MIN_HTML_LEN:
                     raise FetchError("Ответ слишком короткий")
+                if _looks_like_redirect_placeholder(html):
+                    raise FetchError("Получена страница перенаправления вместо контента")
                 log.info("HTTP: OK, %s символов HTML", len(html))
                 return html
             except Exception as e:  # noqa: BLE001
@@ -95,4 +105,10 @@ async def fetch_and_chunk(domain_or_url: str) -> tuple[str, list[str], str]:
     html = await fetch_home_via_scraperapi(normalized_domain)
     text = html_to_full_text(html)
     chunks = hard_split(text, settings.PARSE_MAX_CHUNK_SIZE)
+    log.info(
+        "scrape: домен %s → текст %s символов, чанков %s",
+        normalized_domain,
+        len(text),
+        len(chunks),
+    )
     return home_url, chunks, normalized_domain

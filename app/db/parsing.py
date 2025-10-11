@@ -102,7 +102,11 @@ def _ensure_www(domain: Optional[str]) -> Optional[str]:
     return f"www.{base}"
 
 
-def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> dict:
+def _prepare_row_from_summary(
+    summary: dict,
+    domain: Optional[str] = None,
+    domain_secondary: Optional[str] = None,
+) -> dict:
     """
     Готовит поля под INSERT/UPDATE в public.clients_requests:
       - company_name, inn
@@ -110,13 +114,6 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
       - okved_main
       - okved_vtor_1..7 (до 7 вторичных ОКВЭД, без дубликата главного)
     """
-    # emails -> строка
-    emails = summary.get("emails") or []
-    if isinstance(emails, list):
-        emails_str = ", ".join(str(e) for e in emails if e)
-    else:
-        emails_str = str(emails) if emails else None
-
     main_okved = summary.get("main_okved")
     okveds = summary.get("okveds") or []
 
@@ -144,7 +141,7 @@ def _prepare_row_from_summary(summary: dict, domain: Optional[str] = None) -> di
         "inn": summary.get("inn"),
         # ВАЖНО: для clients_requests.domain_1 храним С 'www.'
         "domain_1": _ensure_www(domain),
-        "domain_2": emails_str,
+        "domain_2": _ensure_www(domain_secondary),
         "okved_main": main_okved,
         "okved_vtor_1": pick(0),
         "okved_vtor_2": pick(1),
@@ -218,7 +215,42 @@ async def get_last_domain_by_inn(inn: str) -> Optional[str]:
             return str(dom) if dom is not None else None
 
 
-async def push_clients_request(summary: dict, domain: Optional[str] = None) -> bool:
+async def get_domains_by_inn(inn: str) -> list[str]:
+    """Возвращает все домены (domain_1/domain_2) для ИНН из parsing_data.clients_requests."""
+
+    eng = get_parsing_engine()
+    if eng is None:
+        return []
+
+    sql = text(
+        """
+        SELECT domain_1, domain_2
+        FROM public.clients_requests
+        WHERE inn = :inn
+        ORDER BY id DESC
+        """
+    )
+
+    async with eng.begin() as conn:
+        rows = await conn.execute(sql, {"inn": inn})
+        values: list[str] = []
+        for row in rows:
+            if not row:
+                continue
+            for value in row:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    values.append(text)
+        return values
+
+
+async def push_clients_request(
+    summary: dict,
+    domain: Optional[str] = None,
+    domain_secondary: Optional[str] = None,
+) -> bool:
     """
     Upsert по inn: UPDATE … WHERE inn; если 0 строк — INSERT.
     Если нет соединения/таблицы — тихо выходим (best-effort).
@@ -229,7 +261,7 @@ async def push_clients_request(summary: dict, domain: Optional[str] = None) -> b
     if not await clients_requests_exists():
         return False
 
-    row = _prepare_row_from_summary(summary, domain=domain)
+    row = _prepare_row_from_summary(summary, domain=domain, domain_secondary=domain_secondary)
     if not row.get("inn"):
         log.info("Не указан ИНН — запись в clients_requests пропущена.")
         return False
