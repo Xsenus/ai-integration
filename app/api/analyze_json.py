@@ -261,9 +261,24 @@ async def _collect_snapshot_for_domain(
     if not domain_value:
         return None
 
-    domain_condition = "LOWER(ps.domain_1) = LOWER(:domain)"
+    domain_clauses: list[str] = []
+    if "domain_1" in columns:
+        domain_clauses.append("LOWER(ps.domain_1) = LOWER(:domain)")
     if "domain_2" in columns:
-        domain_condition = f"({domain_condition} OR LOWER(ps.domain_2) = LOWER(:domain))"
+        domain_clauses.append("LOWER(ps.domain_2) = LOWER(:domain)")
+
+    if not domain_clauses:
+        log.info(
+            "analyze-json: skipping domain snapshot due to missing domain columns (inn=%s, company_id=%s, domain=%s)",
+            inn,
+            company_id,
+            domain_value,
+        )
+        return None
+
+    domain_condition = " OR ".join(domain_clauses)
+    if len(domain_clauses) > 1:
+        domain_condition = f"({domain_condition})"
 
     sql_created_at = text(
         f"""
@@ -458,14 +473,31 @@ async def _collect_latest_pars_site(engine: AsyncEngine, inn: str) -> list[ParsS
     columns = await _get_pars_site_columns()
     log.info("analyze-json: detected pars_site columns for inn=%s → %s", inn, sorted(columns))
 
-    select_fields = [
-        "ps.id",
-        "ps.text_par",
-        "ps.text",
-        "ps.domain_1",
-        "ps.url",
-        "ps.created_at",
-    ]
+    select_fields: list[str] = ["ps.id"]
+
+    text_columns = []
+    if "text_par" in columns:
+        select_fields.append("ps.text_par")
+        text_columns.append("text_par")
+    if "text" in columns:
+        select_fields.append("ps.text")
+        text_columns.append("text")
+
+    if not text_columns:
+        log.error(
+            "analyze-json: pars_site table is missing text columns (expected one of text_par/text)",
+        )
+        return []
+
+    if "domain_1" in columns:
+        select_fields.append("ps.domain_1")
+    if "url" in columns:
+        select_fields.append("ps.url")
+    if "created_at" in columns:
+        select_fields.append("ps.created_at")
+    else:
+        log.error("analyze-json: pars_site table is missing created_at column")
+        return []
     if "domain_2" in columns:
         select_fields.append("ps.domain_2")
     select_clause = ", ".join(select_fields)
@@ -500,6 +532,8 @@ async def _collect_latest_pars_site(engine: AsyncEngine, inn: str) -> list[ParsS
             if company_id is None:
                 continue
             for domain_field in ("domain_1", "domain_2"):
+                if domain_field not in columns:
+                    continue
                 raw_domain = row.get(domain_field)
                 domain_value = str(raw_domain).strip() if raw_domain else ""
                 if not domain_value:
