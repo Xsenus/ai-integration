@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, status
+from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.engine import Result
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -29,6 +30,57 @@ router = APIRouter(prefix="/v1", tags=["analyze-json"])
 
 _http_client: httpx.AsyncClient | None = None
 _http_client_lock = asyncio.Lock()
+
+_TEXT_PREVIEW_LIMIT = 400
+
+
+def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Готовит компактное представление тела запроса для логов."""
+
+    summary: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "text_par" and isinstance(value, str):
+            summary[key] = {
+                "length": len(value),
+                "preview": value[:_TEXT_PREVIEW_LIMIT],
+            }
+        elif key in {"goods_catalog", "equipment_catalog"} and isinstance(value, list):
+            summary[key] = {"items": len(value)}
+        else:
+            summary[key] = value
+    return summary
+
+
+def _log_and_raise(
+    status_code: int,
+    *,
+    inn: str,
+    detail: str,
+    request_context: Mapping[str, Any],
+    extra: Optional[Mapping[str, Any]] = None,
+    level: int = logging.ERROR,
+) -> None:
+    """Формирует структурированную ошибку, логирует и выбрасывает HTTPException."""
+
+    payload: dict[str, Any] = {"request": dict(request_context)} if request_context else {}
+    if extra:
+        payload["extra"] = dict(extra)
+
+    log.log(
+        level,
+        "analyze-json: %s (inn=%s, status=%s, context=%s)",
+        detail,
+        inn,
+        status_code,
+        payload,
+    )
+
+    error = AnalyzeFromInnError(
+        inn=inn,
+        detail=detail,
+        payload=payload or None,
+    )
+    raise HTTPException(status_code=status_code, detail=error.model_dump())
 
 
 @dataclass(slots=True)
@@ -261,9 +313,24 @@ async def _collect_snapshot_for_domain(
     if not domain_value:
         return None
 
-    domain_condition = "LOWER(ps.domain_1) = LOWER(:domain)"
+    domain_clauses: list[str] = []
+    if "domain_1" in columns:
+        domain_clauses.append("LOWER(ps.domain_1) = LOWER(:domain)")
     if "domain_2" in columns:
-        domain_condition = f"({domain_condition} OR LOWER(ps.domain_2) = LOWER(:domain))"
+        domain_clauses.append("LOWER(ps.domain_2) = LOWER(:domain)")
+
+    if not domain_clauses:
+        log.info(
+            "analyze-json: skipping domain snapshot due to missing domain columns (inn=%s, company_id=%s, domain=%s)",
+            inn,
+            company_id,
+            domain_value,
+        )
+        return None
+
+    domain_condition = " OR ".join(domain_clauses)
+    if len(domain_clauses) > 1:
+        domain_condition = f"({domain_condition})"
 
     sql_created_at = text(
         f"""
@@ -458,14 +525,31 @@ async def _collect_latest_pars_site(engine: AsyncEngine, inn: str) -> list[ParsS
     columns = await _get_pars_site_columns()
     log.info("analyze-json: detected pars_site columns for inn=%s → %s", inn, sorted(columns))
 
-    select_fields = [
-        "ps.id",
-        "ps.text_par",
-        "ps.text",
-        "ps.domain_1",
-        "ps.url",
-        "ps.created_at",
-    ]
+    select_fields: list[str] = ["ps.id"]
+
+    text_columns = []
+    if "text_par" in columns:
+        select_fields.append("ps.text_par")
+        text_columns.append("text_par")
+    if "text" in columns:
+        select_fields.append("ps.text")
+        text_columns.append("text")
+
+    if not text_columns:
+        log.error(
+            "analyze-json: pars_site table is missing text columns (expected one of text_par/text)",
+        )
+        return []
+
+    if "domain_1" in columns:
+        select_fields.append("ps.domain_1")
+    if "url" in columns:
+        select_fields.append("ps.url")
+    if "created_at" in columns:
+        select_fields.append("ps.created_at")
+    else:
+        log.error("analyze-json: pars_site table is missing created_at column")
+        return []
     if "domain_2" in columns:
         select_fields.append("ps.domain_2")
     select_clause = ", ".join(select_fields)
@@ -500,6 +584,8 @@ async def _collect_latest_pars_site(engine: AsyncEngine, inn: str) -> list[ParsS
             if company_id is None:
                 continue
             for domain_field in ("domain_1", "domain_2"):
+                if domain_field not in columns:
+                    continue
                 raw_domain = row.get(domain_field)
                 domain_value = str(raw_domain).strip() if raw_domain else ""
                 if not domain_value:
@@ -797,29 +883,46 @@ async def _apply_db_payload(
     return goods_saved, equipment_saved, prodclass_id, prodclass_score
 
 
-@router.post(
-    "/analyze-json",
-    response_model=AnalyzeFromInnResponse,
-    responses={
-        400: {"model": AnalyzeFromInnError},
-        404: {"model": AnalyzeFromInnError},
-        502: {"model": AnalyzeFromInnError},
-    },
-)
-async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResponse:
-    """Полный цикл анализа: pars_site → внешний сервис → запись в БД."""
+async def _run_analyze(
+    payload: AnalyzeFromInnRequest,
+    *,
+    source: str,
+) -> AnalyzeFromInnResponse:
+    """Общий пайплайн анализа с подробным логированием."""
 
-    inn = payload.inn.strip()
+    payload_data = payload.model_dump()
+    inn = (payload_data.get("inn") or "").strip()
+    payload_data["inn"] = inn
+    payload_data["source"] = source
+
+    log.info("analyze-json: %s request accepted → %s", source, payload_data)
+
     if not inn:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ИНН не может быть пустым")
+        _log_and_raise(
+            status.HTTP_400_BAD_REQUEST,
+            inn=inn,
+            detail="ИНН не может быть пустым",
+            request_context=payload_data,
+            level=logging.WARNING,
+        )
 
     engine = get_postgres_engine()
     if engine is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Postgres DSN is not configured")
+        _log_and_raise(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            inn=inn,
+            detail="Postgres DSN is not configured",
+            request_context=payload_data,
+        )
 
     base_url = settings.analyze_base
     if not base_url:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="ANALYZE_BASE is not configured")
+        _log_and_raise(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            inn=inn,
+            detail="ANALYZE_BASE is not configured",
+            request_context=payload_data,
+        )
 
     if payload.refresh_site:
         await _trigger_parse_site(inn)
@@ -830,13 +933,18 @@ async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResp
         snapshots = await _collect_latest_pars_site(engine, inn)
 
     if not snapshots:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+        _log_and_raise(
+            status.HTTP_404_NOT_FOUND,
+            inn=inn,
             detail="В pars_site нет текста для указанного ИНН",
+            request_context=payload_data,
+            level=logging.WARNING,
         )
 
     log.info(
-        "analyze-json: snapshots to process for inn=%s → %s", inn, len(snapshots)
+        "analyze-json: snapshots to process for inn=%s → %s",
+        inn,
+        len(snapshots),
     )
     log.info(
         "analyze-json: domains detected for inn=%s → %s",
@@ -869,9 +977,11 @@ async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResp
         except Exception as exc:  # noqa: BLE001
             log.warning("analyze-json: failed to load equipment catalog: %s", exc)
             equipment_catalog = []
+    else:
+        log.info("analyze-json: catalogs loading skipped by request")
 
-    url = base_url.rstrip("/") + "/v1/analyze/json"
-    log.info("analyze-json: external endpoint resolved → %s", url)
+    base_endpoint = base_url.rstrip("/")
+    log.info("analyze-json: external endpoint resolved → %s", base_endpoint)
     client = await _get_http_client()
 
     runs: list[AnalyzeFromInnRun] = []
@@ -885,15 +995,19 @@ async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResp
         domain_source = snapshot.domain_source or ("domain_1" if domain_label else "auto")
         domains_processed.append(domain_label or "(unknown)")
         text_length = len(snapshot.text)
+        snapshot_context = {
+            "pars_id": snapshot.pars_id,
+            "company_id": snapshot.company_id,
+            "domain": domain_label or None,
+            "domain_source": domain_source,
+            "chunks": len(snapshot.chunk_ids),
+            "text_length": text_length,
+        }
         log.info(
-            "analyze-json: preparing request #%s (inn=%s, domain=%s, source=%s, pars_id=%s, text_len=%s, chunks=%s)",
+            "analyze-json: preparing request #%s (inn=%s, snapshot=%s)",
             idx,
             inn,
-            domain_label,
-            domain_source,
-            snapshot.pars_id,
-            text_length,
-            len(snapshot.chunk_ids),
+            snapshot_context,
         )
 
         request_payload: dict[str, Any] = {
@@ -918,25 +1032,32 @@ async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResp
         if equipment_catalog:
             request_payload["equipment_catalog"] = equipment_catalog
 
+        payload_summary = _summarize_external_payload(request_payload)
+
+        run_url = f"{base_endpoint}/v1/analyze/{snapshot.pars_id}"
         log.info(
-            "analyze-json: sending request #%s to external service (inn=%s, domain=%s, payload_keys=%s)",
+            "analyze-json: sending request #%s to external service (inn=%s, url=%s, payload=%s)",
             idx,
             inn,
-            domain_label,
-            sorted(request_payload.keys()),
+            run_url,
+            payload_summary,
         )
 
         try:
-            response = await client.post(url, json=request_payload)
+            response = await client.post(run_url, json=request_payload)
         except httpx.RequestError as exc:
-            detail = f"analyze-json request failed: {exc}".strip()
-            log.warning(
-                "analyze-json: HTTP error (inn=%s, domain=%s) → %s",
-                inn,
-                domain_label,
-                detail,
+            detail = f"Не удалось выполнить запрос к внешнему сервису: {exc}".strip()
+            _log_and_raise(
+                status.HTTP_502_BAD_GATEWAY,
+                inn=inn,
+                detail=detail,
+                request_context=payload_data,
+                extra={
+                    "url": run_url,
+                    "snapshot": snapshot_context,
+                    "payload": payload_summary,
+                },
             )
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
         log.info(
             "analyze-json: response received #%s (inn=%s, domain=%s, status=%s)",
@@ -947,38 +1068,53 @@ async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResp
         )
 
         if response.status_code >= 400:
-            detail = response.text or f"HTTP {response.status_code}"
-            log.warning(
-                "analyze-json: non-success status from external service (inn=%s, domain=%s, status=%s, body=%s)",
-                inn,
-                domain_label,
-                response.status_code,
-                detail,
+            detail = f"Внешний сервис вернул ошибку: HTTP {response.status_code}"
+            _log_and_raise(
+                status.HTTP_502_BAD_GATEWAY,
+                inn=inn,
+                detail=detail,
+                request_context=payload_data,
+                extra={
+                    "url": run_url,
+                    "snapshot": snapshot_context,
+                    "payload": payload_summary,
+                    "status": response.status_code,
+                    "body": response.text or "",
+                },
             )
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
 
         try:
             response_json = response.json()
         except Exception as exc:  # noqa: BLE001
-            detail = f"Не удалось распарсить ответ внешнего сервиса: {exc}"
-            log.warning(
-                "analyze-json: invalid JSON (inn=%s, domain=%s) → %s",
-                inn,
-                domain_label,
-                exc,
+            detail = f"Не удалось распарсить ответ внешнего сервиса: {exc}".strip()
+            _log_and_raise(
+                status.HTTP_502_BAD_GATEWAY,
+                inn=inn,
+                detail=detail,
+                request_context=payload_data,
+                extra={
+                    "url": run_url,
+                    "snapshot": snapshot_context,
+                    "payload": payload_summary,
+                    "status": response.status_code,
+                    "body": response.text,
+                },
             )
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
         db_payload = response_json.get("db_payload") if isinstance(response_json, dict) else None
         if not isinstance(db_payload, dict):
-            log.warning(
-                "analyze-json: missing db_payload in response (inn=%s, domain=%s)",
-                inn,
-                domain_label,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
+            _log_and_raise(
+                status.HTTP_502_BAD_GATEWAY,
+                inn=inn,
                 detail="Во внешнем ответе отсутствует блок db_payload",
+                request_context=payload_data,
+                extra={
+                    "url": run_url,
+                    "snapshot": snapshot_context,
+                    "payload": payload_summary,
+                    "status": response.status_code,
+                    "response": response_json,
+                },
             )
 
         goods_saved, equipment_saved, prodclass_id, prodclass_score = await _apply_db_payload(
@@ -1049,3 +1185,76 @@ async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResp
         domains_processed=domains_processed,
         runs=runs,
     )
+
+
+@router.post(
+    "/analyze-json",
+    response_model=AnalyzeFromInnResponse,
+    responses={
+        400: {"model": AnalyzeFromInnError},
+        404: {"model": AnalyzeFromInnError},
+        502: {"model": AnalyzeFromInnError},
+    },
+)
+async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResponse:
+    """Полный цикл анализа через POST-запрос."""
+
+    return await _run_analyze(payload, source="POST")
+
+
+@router.get(
+    "/analyze-json/{inn}",
+    response_model=AnalyzeFromInnResponse,
+    responses={
+        400: {"model": AnalyzeFromInnError},
+        404: {"model": AnalyzeFromInnError},
+        502: {"model": AnalyzeFromInnError},
+    },
+)
+async def analyze_from_inn_get(
+    inn: str,
+    refresh_site: bool = False,
+    include_catalogs: bool = True,
+    chat_model: Optional[str] = None,
+    embed_model: Optional[str] = None,
+    return_prompt: Optional[bool] = None,
+    return_answer_raw: Optional[bool] = None,
+) -> AnalyzeFromInnResponse:
+    """Упрощённый запуск анализа по ИНН через GET-запрос."""
+
+    query_context = {
+        "inn": inn,
+        "refresh_site": refresh_site,
+        "include_catalogs": include_catalogs,
+        "chat_model": chat_model,
+        "embed_model": embed_model,
+        "return_prompt": return_prompt,
+        "return_answer_raw": return_answer_raw,
+    }
+
+    try:
+        payload = AnalyzeFromInnRequest(
+            inn=inn,
+            refresh_site=refresh_site,
+            include_catalogs=include_catalogs,
+            chat_model=chat_model,
+            embed_model=embed_model,
+            return_prompt=return_prompt,
+            return_answer_raw=return_answer_raw,
+        )
+    except ValidationError as exc:
+        def _fmt(err: Mapping[str, Any]) -> str:
+            location = "->".join(str(part) for part in err.get("loc", ())) or "payload"
+            message = err.get("msg", "unknown error")
+            return f"{location} → {message}"
+
+        detail = "Некорректные параметры запроса: " + "; ".join(_fmt(err) for err in exc.errors())
+        _log_and_raise(
+            status.HTTP_400_BAD_REQUEST,
+            inn=(inn or "").strip(),
+            detail=detail,
+            request_context=query_context,
+            level=logging.WARNING,
+        )
+
+    return await _run_analyze(payload, source="GET")
