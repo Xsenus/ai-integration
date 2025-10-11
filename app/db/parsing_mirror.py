@@ -55,6 +55,99 @@ async def get_last_domain_by_inn_pg(inn: str) -> Optional[str]:
             return str(dom) if dom is not None else None
 
 
+async def get_domains_by_inn_pg(inn: str) -> list[str]:
+    """Возвращает все clients_requests.domain_1 для заданного ИНН из основной БД."""
+
+    eng = _pg_engine()
+    if eng is None:
+        return []
+
+    sql = text(
+        """
+        SELECT domain_1, domain_2
+        FROM public.clients_requests
+        WHERE inn = :inn
+        ORDER BY id DESC
+        """
+    )
+
+    async with eng.begin() as conn:
+        rows = await conn.execute(sql, {"inn": inn})
+        values: list[str] = []
+        for row in rows:
+            if not row:
+                continue
+            for value in row:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    values.append(text)
+        return values
+
+
+_IB_CLIENTS_SITE_COLUMNS: Optional[list[str]] = None
+
+
+async def _get_ib_clients_site_columns() -> list[str]:
+    """Определяет список колонок с сайтами в public.ib_clients."""
+
+    global _IB_CLIENTS_SITE_COLUMNS
+    if _IB_CLIENTS_SITE_COLUMNS is not None:
+        return _IB_CLIENTS_SITE_COLUMNS
+
+    eng = _pg_engine()
+    if eng is None:
+        _IB_CLIENTS_SITE_COLUMNS = []
+        return []
+
+    sql = text(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'ib_clients'
+          AND column_name ILIKE '%site%'
+        ORDER BY ordinal_position
+        """
+    )
+
+    async with eng.begin() as conn:
+        res = await conn.execute(sql)
+        cols = [str(row[0]) for row in res if row and row[0]]
+
+    _IB_CLIENTS_SITE_COLUMNS = cols
+    return cols
+
+
+async def get_ib_clients_domains_pg(inn: str) -> list[str]:
+    """Возвращает значения колонок с сайтами из public.ib_clients для заданного ИНН."""
+
+    eng = _pg_engine()
+    if eng is None:
+        return []
+
+    columns = await _get_ib_clients_site_columns()
+    if not columns:
+        return []
+
+    cols_sql = ", ".join(f'"{col}"' for col in columns)
+    sql = text(f"SELECT {cols_sql} FROM public.ib_clients WHERE inn = :inn")
+
+    async with eng.begin() as conn:
+        res = await conn.execute(sql, {"inn": inn})
+        rows = res.fetchall()
+
+    values: list[str] = []
+    for row in rows:
+        for value in row:
+            if value is None:
+                continue
+            values.append(str(value))
+
+    return values
+
+
 async def get_clients_request_id_pg(inn: str, domain_1: Optional[str] = None) -> Optional[int]:
     """
     Возвращает id последней записи из POSTGRES.public.clients_requests по ИНН (+ опц. domain_1).
@@ -82,7 +175,11 @@ async def get_clients_request_id_pg(inn: str, domain_1: Optional[str] = None) ->
         return int(row[0]) if row else None
 
 
-async def push_clients_request_pg(summary: dict, domain: Optional[str] = None) -> bool:
+async def push_clients_request_pg(
+    summary: dict,
+    domain: Optional[str] = None,
+    domain_secondary: Optional[str] = None,
+) -> bool:
     """
     Upsert в POSTGRES.public.clients_requests по inn.
     По соглашению domain_1 пишем С 'www.'.
@@ -92,12 +189,6 @@ async def push_clients_request_pg(summary: dict, domain: Optional[str] = None) -
         return False
 
     # подготовка ряда
-    emails = summary.get("emails") or []
-    if isinstance(emails, list):
-        emails_str = ", ".join(str(e) for e in emails if e)
-    else:
-        emails_str = str(emails) if emails else None
-
     main_okved = summary.get("main_okved")
     okveds = summary.get("okveds") or []
 
@@ -123,7 +214,7 @@ async def push_clients_request_pg(summary: dict, domain: Optional[str] = None) -
         "company_name": summary.get("short_name"),
         "inn": summary.get("inn"),
         "domain_1": _ensure_www(domain),
-        "domain_2": emails_str,
+        "domain_2": _ensure_www(domain_secondary),
         "okved_main": main_okved,
         "okved_vtor_1": pick(0),
         "okved_vtor_2": pick(1),
