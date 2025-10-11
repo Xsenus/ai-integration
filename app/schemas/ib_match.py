@@ -17,6 +17,18 @@ class IbMatchRequest(BaseModel):
     )
 
 
+class IbMatchInnRequest(BaseModel):
+    """Запрос на присвоение соответствий по ИНН."""
+
+    inn: str = Field(..., min_length=4, max_length=20, description="ИНН клиента")
+    reembed_if_exists: bool = Field(
+        False,
+        description=(
+            "Если true, заново генерирует эмбеддинги даже при наличии text_vector"
+        ),
+    )
+
+
 class GoodsMatchItem(BaseModel):
     ai_goods_id: int = Field(..., description="ID строки в ai_site_goods_types")
     ai_goods_type: str = Field(..., description="Исходный текст типа продукции")
@@ -76,6 +88,7 @@ class IbMatchResponse(BaseModel):
 
 __all__ = [
     "IbMatchRequest",
+    "IbMatchInnRequest",
     "IbMatchResponse",
     "IbMatchSummary",
     "GoodsMatchItem",

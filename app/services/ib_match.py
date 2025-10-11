@@ -52,6 +52,11 @@ class MatchResult:
 
 
 async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[str, Any]:
+    log.info(
+        "ib-match: start assignment for client_id=%s (reembed_if_exists=%s)",
+        client_id,
+        reembed_if_exists,
+    )
     engine = get_postgres_engine()
     if engine is None:
         raise IbMatchServiceError("Postgres DSN is not configured", status_code=503)
@@ -98,6 +103,12 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             )
             for row in equip_rows_raw.mappings()
         ]
+        log.info(
+            "ib-match: loaded %s goods rows and %s equipment rows for client_id=%s",
+            len(goods_rows),
+            len(equipment_rows),
+            client_id,
+        )
 
         ib_goods_raw = await conn.execute(
             text(
@@ -148,9 +159,20 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
                     vector=vector,
                 )
             )
+        log.info(
+            "ib-match: loaded %s ib_goods_types and %s ib_equipment entries",
+            len(ib_goods),
+            len(ib_equipment),
+        )
 
     goods_embed_targets = _select_for_embedding(goods_rows, reembed_if_exists)
     equipment_embed_targets = _select_for_embedding(equipment_rows, reembed_if_exists)
+    log.info(
+        "ib-match: embedding targets for client_id=%s → goods=%s, equipment=%s",
+        client_id,
+        len(goods_embed_targets),
+        len(equipment_embed_targets),
+    )
 
     goods_embeddings_generated = 0
     equipment_embeddings_generated = 0
@@ -170,6 +192,12 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
 
     goods_matches, goods_updates = _match_rows(goods_rows, ib_goods)
     equipment_matches, equipment_updates = _match_rows(equipment_rows, ib_equipment)
+    log.info(
+        "ib-match: prepared %s goods updates and %s equipment updates for client_id=%s",
+        len(goods_updates),
+        len(equipment_updates),
+        client_id,
+    )
 
     async with engine.begin() as conn:
         if goods_embed_targets:
@@ -226,6 +254,9 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             )
             for payload in equipment_updates:
                 await conn.execute(update_equipment_sql, payload)
+    log.info(
+        "ib-match: database updates applied for client_id=%s", client_id
+    )
 
     goods_updated = len(goods_updates)
     equipment_updated = len(equipment_updates)
@@ -244,6 +275,13 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         equipment_updated=equipment_updated,
     )
 
+    log.info(
+        "ib-match: finished assignment for client_id=%s (goods_processed=%s, equipment_processed=%s)",
+        client_id,
+        len(goods_rows),
+        len(equipment_rows),
+    )
+
     return {
         "client_id": client_id,
         "goods": [match.__dict__ for match in goods_matches],
@@ -260,6 +298,57 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         },
         "report": report_text,
     }
+
+
+async def assign_ib_matches_by_inn(*, inn: str, reembed_if_exists: bool) -> dict[str, Any]:
+    normalized_inn = (inn or "").strip()
+    if not normalized_inn:
+        raise IbMatchServiceError("ИНН не может быть пустым", status_code=400)
+
+    engine = get_postgres_engine()
+    if engine is None:
+        raise IbMatchServiceError("Postgres DSN is not configured", status_code=503)
+
+    async with engine.connect() as conn:
+        log.info("ib-match: resolving client_id by INN %s", normalized_inn)
+        query = text(
+            """
+            SELECT id
+            FROM public.clients_requests
+            WHERE inn = :inn
+            ORDER BY COALESCE(ended_at, created_at) DESC NULLS LAST, id DESC
+            """
+        )
+        result = await conn.execute(query, {"inn": normalized_inn})
+        candidate_ids = [int(row["id"]) for row in result.mappings()]
+
+    if not candidate_ids:
+        log.info("ib-match: clients_requests not found for INN %s", normalized_inn)
+        raise IbMatchServiceError("Не найдена запись clients_requests по ИНН", status_code=404)
+
+    log.info(
+        "ib-match: found %s client(s) for INN %s → %s",
+        len(candidate_ids),
+        normalized_inn,
+        candidate_ids,
+    )
+    client_id = candidate_ids[0]
+    log.info(
+        "ib-match: using clients_requests.id=%s for INN %s (reembed_if_exists=%s)",
+        client_id,
+        normalized_inn,
+        reembed_if_exists,
+    )
+    result = await assign_ib_matches(
+        client_id=client_id,
+        reembed_if_exists=reembed_if_exists,
+    )
+    log.info(
+        "ib-match: assignment via INN %s completed (client_id=%s)",
+        normalized_inn,
+        client_id,
+    )
+    return result
 
 
 def _select_for_embedding(rows: Sequence[SourceRow], reembed: bool) -> List[SourceRow]:
