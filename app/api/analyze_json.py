@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import copy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional
@@ -1048,22 +1049,33 @@ async def _run_analyze(
             "company_id": snapshot.company_id,
             "text_par": snapshot.text,
         }
+        request_payload_for_response = copy.deepcopy(request_payload)
         if payload.chat_model:
             request_payload["chat_model"] = payload.chat_model
+            request_payload_for_response["chat_model"] = payload.chat_model
         elif settings.CHAT_MODEL:
             request_payload["chat_model"] = settings.CHAT_MODEL
+            request_payload_for_response["chat_model"] = settings.CHAT_MODEL
         if payload.embed_model:
             request_payload["embed_model"] = payload.embed_model
+            request_payload_for_response["embed_model"] = payload.embed_model
         elif settings.embed_model:
             request_payload["embed_model"] = settings.embed_model
+            request_payload_for_response["embed_model"] = settings.embed_model
         if payload.return_prompt is not None:
             request_payload["return_prompt"] = payload.return_prompt
+            request_payload_for_response["return_prompt"] = payload.return_prompt
         if payload.return_answer_raw is not None:
             request_payload["return_answer_raw"] = payload.return_answer_raw
+            request_payload_for_response["return_answer_raw"] = payload.return_answer_raw
         if goods_catalog:
             request_payload["goods_catalog"] = goods_catalog
+            request_payload_for_response["goods_catalog"] = copy.deepcopy(goods_catalog)
         if equipment_catalog:
             request_payload["equipment_catalog"] = equipment_catalog
+            request_payload_for_response["equipment_catalog"] = copy.deepcopy(
+                equipment_catalog
+            )
 
         payload_summary = _summarize_external_payload(request_payload)
 
@@ -1184,6 +1196,7 @@ async def _run_analyze(
             saved_equipment=equipment_saved,
             prodclass_id=prodclass_id,
             prodclass_score=prodclass_score,
+            external_request=request_payload_for_response,
             external_status=response.status_code,
             external_response=response_json,
         )
@@ -1210,6 +1223,7 @@ async def _run_analyze(
         saved_equipment=first_run.saved_equipment if first_run else 0,
         prodclass_id=first_run.prodclass_id,
         prodclass_score=first_run.prodclass_score,
+        external_request=first_run.external_request if first_run else None,
         external_status=first_run.external_status if first_run else 0,
         external_response=first_run.external_response,
         total_text_length=total_text_length,
