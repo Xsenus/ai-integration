@@ -10,10 +10,11 @@ from typing import Any, Iterable, Mapping, Optional
 import httpx
 from fastapi import APIRouter, HTTPException, status
 from pydantic import ValidationError
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Result
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.sql.sqltypes import Text
 
 from app.api.routes import ParseSiteRequest, _parse_site_impl
 from app.config import settings
@@ -830,7 +831,8 @@ async def _apply_db_payload(
                 bool(vector_literal),
                 update_sql,
             )
-            await conn.execute(text(update_sql), {"vec": vector_literal, "id": snapshot.pars_id})
+            statement = text(update_sql).bindparams(bindparam("vec", type_=Text()))
+            await conn.execute(statement, {"vec": vector_literal, "id": snapshot.pars_id})
 
         if "prodclass" in payload:
             delete_prodclass_sql = "DELETE FROM public.ai_site_prodclass WHERE text_pars_id = :pid"
