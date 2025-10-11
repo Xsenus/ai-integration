@@ -42,12 +42,14 @@ from app.repo.bitrix_repo import (
     replace_dadata_raw,
     upsert_company_summary,
 )
+from app.schemas.ib_match import IbMatchRequest, IbMatchResponse
 from app.schemas.org import (
     CompanyCard,
     CompanySummaryOut,
     OrgExtendedResponse,
 )
 from app.services.dadata_client import find_party_by_inn
+from app.services.ib_match import assign_ib_matches, IbMatchServiceError
 from app.services.mapping import map_summary_from_dadata
 from app.services.scrape import fetch_and_chunk, FetchError, to_home_url
 
@@ -457,6 +459,26 @@ async def lookup_card_get(
         raw_last=raw_payload,
         card=card,
     )
+
+
+# ==========================
+#      IB matching route
+# ==========================
+
+
+@router.post("/ib-match", response_model=IbMatchResponse)
+async def ib_match(payload: IbMatchRequest = Body(...)) -> IbMatchResponse:
+    """Присваивает соответствия товаров и оборудования из справочников IB."""
+
+    try:
+        result = await assign_ib_matches(
+            client_id=payload.client_id,
+            reembed_if_exists=payload.reembed_if_exists,
+        )
+    except IbMatchServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    return IbMatchResponse.model_validate(result)
 
 
 # ==========================================
