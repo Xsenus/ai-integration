@@ -1308,14 +1308,31 @@ async def parse_site_by_inn(
 async def get_equipment_selection(
     client_request_id: int = Query(..., ge=1, description="ID записи в clients_requests"),
 ):
+    log.info(
+        "equipment-selection GET: starting computation for clients_requests.id=%s",
+        client_request_id,
+    )
     engine = get_postgres_engine()
     if engine is None:
+        log.error("equipment-selection GET: postgres engine is not configured")
         raise HTTPException(status_code=503, detail="Postgres engine is not configured")
     async with engine.connect() as conn:
         try:
             result = await compute_equipment_selection(conn, client_request_id)
         except EquipmentSelectionNotFound as exc:  # pragma: no cover - network/db required
+            log.warning(
+                "equipment-selection GET: selection not found for clients_requests.id=%s",
+                client_request_id,
+            )
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+    log.info(
+        "equipment-selection GET: finished computation for clients_requests.id=%s",
+        client_request_id,
+    )
+    log.debug(
+        "equipment-selection GET: response payload %s",
+        result.model_dump(),
+    )
     return result
 
 
@@ -1327,15 +1344,35 @@ async def get_equipment_selection(
 async def get_equipment_selection_by_inn(
     inn: str = Path(..., min_length=4, max_length=20, regex=r"^\d+$"),
 ):
+    log.info("equipment-selection GET/by-inn: starting for INN %s", inn)
     engine = get_postgres_engine()
     if engine is None:
+        log.error("equipment-selection GET/by-inn: postgres engine is not configured")
         raise HTTPException(status_code=503, detail="Postgres engine is not configured")
     async with engine.connect() as conn:
         client_request_id = await resolve_client_request_id(conn, inn)
         if client_request_id is None:
+            log.warning(
+                "equipment-selection GET/by-inn: clients_requests not found for INN %s",
+                inn,
+            )
             raise HTTPException(status_code=404, detail=f"clients_requests for INN {inn} not found")
         try:
             result = await compute_equipment_selection(conn, client_request_id)
         except EquipmentSelectionNotFound as exc:  # pragma: no cover - network/db required
+            log.warning(
+                "equipment-selection GET/by-inn: selection not found for INN %s (id=%s)",
+                inn,
+                client_request_id,
+            )
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+    log.info(
+        "equipment-selection GET/by-inn: finished for INN %s (clients_requests.id=%s)",
+        inn,
+        client_request_id,
+    )
+    log.debug(
+        "equipment-selection GET/by-inn: response payload %s",
+        result.model_dump(),
+    )
     return result

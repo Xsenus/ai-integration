@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -10,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from pydantic import BaseModel, Field
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncConnection
+
+log = logging.getLogger("services.equipment_selection")
 
 
 class EquipmentSelectionNotFound(Exception):
@@ -111,6 +114,7 @@ class _EquipmentEntry:
 
 
 async def _fetch_client(conn: AsyncConnection, client_id: int) -> ClientInfo:
+    log.info("equipment-selection: fetching client %s", client_id)
     sql = text(
         """
         SELECT id, company_name, inn, domain_1, domain_2, started_at, ended_at
@@ -120,11 +124,15 @@ async def _fetch_client(conn: AsyncConnection, client_id: int) -> ClientInfo:
     )
     row = (await conn.execute(sql, {"cid": client_id})).first()
     if row is None:
+        log.warning("equipment-selection: client %s not found", client_id)
         raise EquipmentSelectionNotFound(f"clients_requests.id={client_id} not found")
-    return ClientInfo(**_row_to_dict(row))
+    data = _row_to_dict(row)
+    log.debug("equipment-selection: fetched client data %s", data)
+    return ClientInfo(**data)
 
 
 async def _fetch_goods_types(conn: AsyncConnection, client_id: int) -> List[GoodsTypeItem]:
+    log.info("equipment-selection: loading goods types for client %s", client_id)
     sql = text(
         """
         SELECT
@@ -148,10 +156,18 @@ async def _fetch_goods_types(conn: AsyncConnection, client_id: int) -> List[Good
         score = _as_float(data.get("goods_types_score"))
         data["goods_types_score"] = score
         items.append(GoodsTypeItem(**data))
+    log.info(
+        "equipment-selection: loaded %s goods types for client %s", len(items), client_id
+    )
+    log.debug(
+        "equipment-selection: goods types payload %s",
+        [item.model_dump() for item in items],
+    )
     return items
 
 
 async def _fetch_site_equipment(conn: AsyncConnection, client_id: int) -> List[SiteEquipmentItem]:
+    log.info("equipment-selection: loading site equipment for client %s", client_id)
     sql = text(
         """
         SELECT
@@ -175,10 +191,20 @@ async def _fetch_site_equipment(conn: AsyncConnection, client_id: int) -> List[S
         score = _as_float(data.get("equipment_score"))
         data["equipment_score"] = score
         items.append(SiteEquipmentItem(**data))
+    log.info(
+        "equipment-selection: loaded %s site equipment items for client %s",
+        len(items),
+        client_id,
+    )
+    log.debug(
+        "equipment-selection: site equipment payload %s",
+        [item.model_dump() for item in items],
+    )
     return items
 
 
 async def _fetch_prodclass_rows(conn: AsyncConnection, client_id: int) -> List[ProdclassRow]:
+    log.info("equipment-selection: loading prodclass rows for client %s", client_id)
     sql = text(
         """
         SELECT
@@ -202,6 +228,15 @@ async def _fetch_prodclass_rows(conn: AsyncConnection, client_id: int) -> List[P
         data["prodclass_id"] = int(data.pop("prodclass"))
         data["prodclass_score"] = _as_float(data.get("prodclass_score"))
         items.append(ProdclassRow(**data))
+    log.info(
+        "equipment-selection: loaded %s prodclass rows for client %s",
+        len(items),
+        client_id,
+    )
+    log.debug(
+        "equipment-selection: prodclass rows payload %s",
+        [item.model_dump() for item in items],
+    )
     return items
 
 
@@ -209,7 +244,12 @@ async def _fetch_equipment_for_workshops(
     conn: AsyncConnection, workshop_ids: Sequence[int]
 ) -> List[dict]:
     if not workshop_ids:
+        log.info("equipment-selection: equipment request skipped, no workshop ids provided")
         return []
+    log.info(
+        "equipment-selection: loading equipment for workshops %s",
+        list(workshop_ids),
+    )
     sql = (
         text(
             """
@@ -232,12 +272,20 @@ async def _fetch_equipment_for_workshops(
         rec["equipment_score"] = _as_float(rec.get("equipment_score"))
         rec["equipment_score_real"] = _as_float(rec.get("equipment_score_real"))
         data.append(rec)
+    log.info(
+        "equipment-selection: loaded %s equipment rows for workshops %s",
+        len(data),
+        list(workshop_ids),
+    )
+    log.debug("equipment-selection: equipment rows payload %s", data)
     return data
 
 
 async def _fetch_workshops(conn: AsyncConnection, prodclass_ids: Sequence[int]) -> List[dict]:
     if not prodclass_ids:
+        log.info("equipment-selection: workshop request skipped, no prodclass ids provided")
         return []
+    log.info("equipment-selection: loading workshops for prodclasses %s", list(prodclass_ids))
     sql = (
         text(
             """
@@ -254,21 +302,40 @@ async def _fetch_workshops(conn: AsyncConnection, prodclass_ids: Sequence[int]) 
         rec = _row_to_dict(row)
         rec["workshop_score"] = _as_float(rec.get("workshop_score"))
         data.append(rec)
+    log.info(
+        "equipment-selection: loaded %s workshops for prodclasses %s",
+        len(data),
+        list(prodclass_ids),
+    )
+    log.debug("equipment-selection: workshop rows payload %s", data)
     return data
 
 
 async def _fetch_industry_id(conn: AsyncConnection, prodclass_id: int) -> Optional[int]:
+    log.info(
+        "equipment-selection: resolving industry id for prodclass %s", prodclass_id
+    )
     sql = text("SELECT industry_id FROM ib_prodclass WHERE id = :pid")
     row = (await conn.execute(sql, {"pid": prodclass_id})).first()
     if row is None:
+        log.info(
+            "equipment-selection: no industry found for prodclass %s", prodclass_id
+        )
         return None
     value = row[0]
     if value is None:
+        log.info(
+            "equipment-selection: prodclass %s has NULL industry", prodclass_id
+        )
         return None
+    log.info(
+        "equipment-selection: prodclass %s mapped to industry %s", prodclass_id, value
+    )
     return int(value)
 
 
 def _aggregate_prodclass(rows: Iterable[ProdclassRow]) -> List[ProdclassDetail]:
+    log.info("equipment-selection: aggregating prodclass rows")
     grouped: Dict[int, Dict[str, Any]] = {}
     for row in rows:
         key = row.prodclass_id
@@ -301,6 +368,14 @@ def _aggregate_prodclass(rows: Iterable[ProdclassRow]) -> List[ProdclassDetail]:
             )
         )
     details.sort(key=lambda x: (-x.score_1, -x.votes, x.prodclass_id))
+    log.info(
+        "equipment-selection: aggregated prodclass details count=%s",
+        len(details),
+    )
+    log.debug(
+        "equipment-selection: prodclass details payload %s",
+        [detail.model_dump() for detail in details],
+    )
     return details
 
 
@@ -336,8 +411,17 @@ async def _compute_1way(
     conn: AsyncConnection,
     prodclass_details: List[ProdclassDetail],
 ) -> Dict[int, _EquipmentEntry]:
+    log.info(
+        "equipment-selection: computing 1way scores for %s prodclasses",
+        len(prodclass_details),
+    )
     equipment: Dict[int, _EquipmentEntry] = {}
     for detail in prodclass_details:
+        log.debug(
+            "equipment-selection: 1way processing prodclass %s with score %s",
+            detail.prodclass_id,
+            detail.score_1,
+        )
         score_multiplier = detail.score_1
         # direct workshops
         workshops = await _fetch_workshops(conn, [detail.prodclass_id])
@@ -346,6 +430,12 @@ async def _compute_1way(
             detail.workshops_count = len(workshops)
             equip_rows = await _fetch_equipment_for_workshops(conn, [w["id"] for w in workshops])
             detail.equipment_count = len(equip_rows)
+            log.debug(
+                "equipment-selection: 1way direct path prodclass %s -> workshops=%s equipment=%s",
+                detail.prodclass_id,
+                detail.workshops_count,
+                detail.equipment_count,
+            )
             direct_scores = _calc_equipment_scores(equip_rows, score_multiplier)
             for equipment_id, entry in direct_scores.items():
                 current = equipment.get(equipment_id)
@@ -364,6 +454,10 @@ async def _compute_1way(
         detail.industry_id = industry_id
         if industry_id is None:
             detail.path = "no-industry"
+            log.debug(
+                "equipment-selection: 1way no industry for prodclass %s",
+                detail.prodclass_id,
+            )
             continue
 
         industry_prodclasses_sql = text(
@@ -373,17 +467,34 @@ async def _compute_1way(
         prodclass_ids = [int(r[0]) for r in rows]
         if not prodclass_ids:
             detail.path = "industry-no-prodclass"
+            log.debug(
+                "equipment-selection: 1way industry %s has no prodclasses for prodclass %s",
+                industry_id,
+                detail.prodclass_id,
+            )
             continue
 
         workshops = await _fetch_workshops(conn, prodclass_ids)
         if not workshops:
             detail.path = "industry-no-workshops"
+            log.debug(
+                "equipment-selection: 1way industry %s has no workshops for prodclass %s",
+                industry_id,
+                detail.prodclass_id,
+            )
             continue
 
         detail.path = "industry"
         detail.workshops_count = len(workshops)
         equip_rows = await _fetch_equipment_for_workshops(conn, [w["id"] for w in workshops])
         detail.equipment_count = len(equip_rows)
+        log.debug(
+            "equipment-selection: 1way industry path prodclass %s -> industry %s workshops=%s equipment=%s",
+            detail.prodclass_id,
+            industry_id,
+            detail.workshops_count,
+            detail.equipment_count,
+        )
         multiplier = score_multiplier * 0.75
         industry_scores = _calc_equipment_scores(equip_rows, multiplier)
         for equipment_id, entry in industry_scores.items():
@@ -397,6 +508,10 @@ async def _compute_1way(
                     source=current.source,
                 )
 
+    log.info(
+        "equipment-selection: computed 1way scores for %s equipment ids",
+        len(equipment),
+    )
     return equipment
 
 
@@ -417,7 +532,12 @@ async def _compute_2way(
 ) -> Dict[int, _EquipmentEntry]:
     goods_scores = _merge_goods_type_scores(goods_types)
     if not goods_scores:
+        log.info("equipment-selection: skipping 2way computation — no goods type scores")
         return {}
+    log.info(
+        "equipment-selection: computing 2way scores for goods type ids %s",
+        list(goods_scores.keys()),
+    )
 
     sql = (
         text(
@@ -454,12 +574,20 @@ async def _compute_2way(
         current = scores.get(equipment_id)
         if current is None or score > current.score:
             scores[equipment_id] = entry
+    log.info(
+        "equipment-selection: computed 2way scores for %s equipment ids",
+        len(scores),
+    )
     return scores
 
 
 async def _compute_3way(
     conn: AsyncConnection, site_equipment: Sequence[SiteEquipmentItem]
 ) -> Dict[int, _EquipmentEntry]:
+    log.info(
+        "equipment-selection: computing 3way scores for %s site equipment items",
+        len(site_equipment),
+    )
     equipment_scores: Dict[int, _EquipmentEntry] = {}
     equipment_ids: List[int] = []
     for item in site_equipment:
@@ -477,6 +605,7 @@ async def _compute_3way(
             equipment_scores[item.equipment_id] = entry
 
     if not equipment_scores:
+        log.info("equipment-selection: skipping 3way name resolution — no scores computed")
         return {}
 
     sql = (
@@ -494,12 +623,20 @@ async def _compute_3way(
             equipment_name=name,
             source="3way",
         )
+    log.info(
+        "equipment-selection: computed 3way scores for %s equipment ids",
+        len(equipment_scores),
+    )
     return equipment_scores
 
 
 def _merge_equipment_lists(
     *sources: Dict[int, _EquipmentEntry],
 ) -> List[EquipmentScore]:
+    log.info(
+        "equipment-selection: merging equipment lists from sources %s",
+        [len(src) for src in sources],
+    )
     priority = {"1way": 1, "2way": 2, "3way": 3}
     merged: Dict[int, _EquipmentEntry] = {}
     for source in sources:
@@ -535,12 +672,23 @@ def _merge_equipment_lists(
         for equipment_id, entry in merged.items()
     ]
     items.sort(key=lambda item: (-item.score, priority.get(item.source or "", 99), item.id))
+    log.info(
+        "equipment-selection: merged equipment list size=%s", len(items)
+    )
+    log.debug(
+        "equipment-selection: merged equipment payload %s",
+        [item.model_dump() for item in items],
+    )
     return items
 
 
 async def compute_equipment_selection(
     conn: AsyncConnection, client_request_id: int
 ) -> EquipmentSelectionResult:
+    log.info(
+        "equipment-selection: starting computation for clients_requests.id=%s",
+        client_request_id,
+    )
     client = await _fetch_client(conn, client_request_id)
     goods_types = await _fetch_goods_types(conn, client_request_id)
     site_equipment = await _fetch_site_equipment(conn, client_request_id)
@@ -570,7 +718,7 @@ async def compute_equipment_selection(
         equipment_3way_map,
     )
 
-    return EquipmentSelectionResult(
+    result = EquipmentSelectionResult(
         client=client,
         goods_types=goods_types,
         site_equipment=site_equipment,
@@ -581,11 +729,18 @@ async def compute_equipment_selection(
         equipment_3way=_to_list(equipment_3way_map),
         equipment_all=equipment_all,
     )
+    log.info(
+        "equipment-selection: finished computation for clients_requests.id=%s",
+        client_request_id,
+    )
+    log.debug("equipment-selection: final payload %s", result.model_dump())
+    return result
 
 
 async def resolve_client_request_id(
     conn: AsyncConnection, inn: str
 ) -> Optional[int]:
+    log.info("equipment-selection: resolving latest clients_requests id for INN %s", inn)
     sql = text(
         """
         SELECT id
@@ -597,6 +752,13 @@ async def resolve_client_request_id(
     )
     row = (await conn.execute(sql, {"inn": inn.strip()})).first()
     if row is None:
+        log.info(
+            "equipment-selection: no clients_requests entries found for INN %s", inn
+        )
         return None
-    return int(row[0])
+    resolved = int(row[0])
+    log.info(
+        "equipment-selection: resolved INN %s to clients_requests.id=%s", inn, resolved
+    )
+    return resolved
 
