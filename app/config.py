@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # === Внешний AI-сервис (JSON-интеграция) ===
     CHAT_MODEL: str = "gpt-4o"
-    OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
+    OPENAI_EMBED_MODEL: str = "text-embedding-3-large"
     EMBED_MODEL: Optional[str] = None
 
     IB_GOODS_TYPES_TABLE: str = "ib_goods_types"
