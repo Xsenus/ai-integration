@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.engine import Result
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.routes import ParseSiteRequest, _parse_site_impl
 from app.config import settings
@@ -679,6 +680,25 @@ def _normalize_score(value: Any) -> Optional[float]:
     return float(f"{num:.2f}")
 
 
+async def _prodclass_exists(conn: AsyncConnection, prodclass_id: int) -> bool:
+    """Проверяет наличие prodclass в справочнике ib_prodclass."""
+
+    check_sql = text(
+        "SELECT 1 FROM public.ib_prodclass WHERE id = :prodclass_id LIMIT 1"
+    )
+    try:
+        result = await conn.execute(check_sql, {"prodclass_id": prodclass_id})
+    except SQLAlchemyError:
+        log.warning(
+            "analyze-json: failed to verify prodclass in ib_prodclass (prodclass=%s)",
+            prodclass_id,
+            exc_info=True,
+        )
+        return False
+
+    return result.scalar_one_or_none() is not None
+
+
 def _safe_int(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -752,31 +772,44 @@ async def _apply_db_payload(
             await conn.execute(text(delete_prodclass_sql), {"pid": snapshot.pars_id})
             raw_prod = payload.get("prodclass")
             if isinstance(raw_prod, dict):
-                prodclass_id = _safe_int(
+                candidate_prodclass_id = _safe_int(
                     raw_prod.get("id")
                     or raw_prod.get("prodclass")
                     or raw_prod.get("prodclass_id")
                 )
-                prodclass_score = _normalize_score(
+                candidate_prodclass_score = _normalize_score(
                     raw_prod.get("score") or raw_prod.get("prodclass_score")
                 )
-                if prodclass_id is not None:
-                    insert_prodclass_sql = (
-                        "INSERT INTO public.ai_site_prodclass "
-                        "(text_pars_id, prodclass, prodclass_score) "
-                        "VALUES (:pid, :prodclass, :score)"
-                    )
-                    log.info(
-                        "analyze-json: inserting prodclass (pars_id=%s, prodclass=%s, score=%s) using SQL: %s",
-                        snapshot.pars_id,
-                        prodclass_id,
-                        prodclass_score,
-                        insert_prodclass_sql,
-                    )
-                    await conn.execute(
-                        text(insert_prodclass_sql),
-                        {"pid": snapshot.pars_id, "prodclass": prodclass_id, "score": prodclass_score},
-                    )
+                if candidate_prodclass_id is not None:
+                    if await _prodclass_exists(conn, candidate_prodclass_id):
+                        insert_prodclass_sql = (
+                            "INSERT INTO public.ai_site_prodclass "
+                            "(text_pars_id, prodclass, prodclass_score) "
+                            "VALUES (:pid, :prodclass, :score)"
+                        )
+                        log.info(
+                            "analyze-json: inserting prodclass (pars_id=%s, prodclass=%s, score=%s) using SQL: %s",
+                            snapshot.pars_id,
+                            candidate_prodclass_id,
+                            candidate_prodclass_score,
+                            insert_prodclass_sql,
+                        )
+                        await conn.execute(
+                            text(insert_prodclass_sql),
+                            {
+                                "pid": snapshot.pars_id,
+                                "prodclass": candidate_prodclass_id,
+                                "score": candidate_prodclass_score,
+                            },
+                        )
+                        prodclass_id = candidate_prodclass_id
+                        prodclass_score = candidate_prodclass_score
+                    else:
+                        log.warning(
+                            "analyze-json: skipping prodclass insert due to missing ib_prodclass entry (pars_id=%s, prodclass=%s)",
+                            snapshot.pars_id,
+                            candidate_prodclass_id,
+                        )
 
         if "goods_types" in payload:
             delete_goods_sql = "DELETE FROM public.ai_site_goods_types WHERE text_par_id = :pid"
