@@ -35,6 +35,7 @@ from app.db.parsing_mirror import (
     get_domains_by_inn_pg,
     get_ib_clients_domains_pg,
 )
+from app.db.postgres import get_postgres_engine
 
 from app.models.bitrix import DaDataResult
 from app.repo.bitrix_repo import (
@@ -56,6 +57,12 @@ from app.services.ib_match import (
 )
 from app.services.mapping import map_summary_from_dadata
 from app.services.scrape import fetch_and_chunk, FetchError, to_home_url
+from app.services.equipment_selection import (
+    EquipmentSelectionNotFound,
+    EquipmentSelectionResult,
+    compute_equipment_selection,
+    resolve_client_request_id,
+)
 
 log = logging.getLogger("api.routes")
 router = APIRouter(prefix="/v1")
@@ -1291,3 +1298,44 @@ async def parse_site_by_inn(
     response = await _parse_site_impl(payload, session)
     log.info("parse-site GET: завершено для ИНН %s → %s", inn, response.model_dump())
     return response
+
+
+@router.get(
+    "/equipment-selection",
+    response_model=EquipmentSelectionResult,
+    summary="Расчёт оборудования по clients_requests.id",
+)
+async def get_equipment_selection(
+    client_request_id: int = Query(..., ge=1, description="ID записи в clients_requests"),
+):
+    engine = get_postgres_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Postgres engine is not configured")
+    async with engine.connect() as conn:
+        try:
+            result = await compute_equipment_selection(conn, client_request_id)
+        except EquipmentSelectionNotFound as exc:  # pragma: no cover - network/db required
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return result
+
+
+@router.get(
+    "/equipment-selection/by-inn/{inn}",
+    response_model=EquipmentSelectionResult,
+    summary="Расчёт оборудования по последней записи клиента с указанным ИНН",
+)
+async def get_equipment_selection_by_inn(
+    inn: str = Path(..., min_length=4, max_length=20, regex=r"^\d+$"),
+):
+    engine = get_postgres_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Postgres engine is not configured")
+    async with engine.connect() as conn:
+        client_request_id = await resolve_client_request_id(conn, inn)
+        if client_request_id is None:
+            raise HTTPException(status_code=404, detail=f"clients_requests for INN {inn} not found")
+        try:
+            result = await compute_equipment_selection(conn, client_request_id)
+        except EquipmentSelectionNotFound as exc:  # pragma: no cover - network/db required
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return result
