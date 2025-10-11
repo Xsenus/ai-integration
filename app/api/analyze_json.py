@@ -183,7 +183,7 @@ def _normalize_catalog_vector(value: Any) -> Any:
     return value
 
 
-def _format_catalog_vector(value: Any) -> Optional[dict[str, Any]]:
+def _format_catalog_vector(value: Any) -> Optional[Any]:
     """Подготавливает представление вектора каталога для внешнего API."""
 
     if value is None:
@@ -196,26 +196,26 @@ def _format_catalog_vector(value: Any) -> Optional[dict[str, Any]]:
                 formatted_values.append(float(part))
             except Exception:  # noqa: BLE001
                 continue
-        if not formatted_values:
-            return None
-        literal = _vector_to_literal(formatted_values) or ""
-        payload: dict[str, Any] = {"values": formatted_values}
-        if literal:
-            payload["literal"] = literal
-        return payload
+        return formatted_values or None
 
     if isinstance(value, str):
         literal = value.strip()
-        return {"literal": literal} if literal else None
+        return literal or None
 
     try:
-        literal = str(value).strip()
+        numeric = float(value)
     except Exception:  # noqa: BLE001
-        return None
-    return {"literal": literal} if literal else None
+        try:
+            literal = str(value).strip()
+        except Exception:  # noqa: BLE001
+            return None
+        return literal or None
+    return [numeric]
 
 
-def _prepare_catalog_payload(catalog: Iterable[Mapping[str, Any]]) -> Optional[dict[str, Any]]:
+def _prepare_catalog_payload(
+    catalog: Iterable[Mapping[str, Any]]
+) -> Optional[list[dict[str, Any]]]:
     """Формирует структуру каталога в формате, ожидаемом внешним API."""
 
     items: list[dict[str, Any]] = []
@@ -235,7 +235,7 @@ def _prepare_catalog_payload(catalog: Iterable[Mapping[str, Any]]) -> Optional[d
                 prepared["id"] = item_id
 
         vec_payload = _format_catalog_vector(item.get("vec"))
-        if vec_payload:
+        if vec_payload is not None:
             prepared["vec"] = vec_payload
 
         items.append(prepared)
@@ -243,7 +243,7 @@ def _prepare_catalog_payload(catalog: Iterable[Mapping[str, Any]]) -> Optional[d
     if not items:
         return None
 
-    return {"items": items}
+    return items
 
 
 async def _load_catalog(
