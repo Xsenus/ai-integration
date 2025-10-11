@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional
@@ -18,6 +19,7 @@ from sqlalchemy.sql.sqltypes import Text
 from app.api.routes import ParseSiteRequest, _parse_site_impl
 from app.config import settings
 from app.db.bitrix import bitrix_session
+from app.db.parsing import _normalize_domain
 from app.db.parsing_mirror import _get_pars_site_columns
 from app.db.postgres import get_postgres_engine
 from app.schemas.analyze_json import (
@@ -53,6 +55,9 @@ _LARGE_TEXT_KEYS = {
     "text_chunks",
     "chunks_raw",
 }
+
+
+_DOMAIN_SPLIT_RE = re.compile(r"[\s,;]+")
 
 
 def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -145,6 +150,54 @@ class ParsSiteSnapshot:
     domain: Optional[str]
     url: Optional[str]
     domain_source: Optional[str] = None
+
+
+def _extract_domain_candidates(domain_field: str, raw_value: Any) -> list[str]:
+    """Возвращает список доменов, которые стоит попробовать обработать."""
+
+    if raw_value is None:
+        return []
+
+    text = str(raw_value).strip()
+    if not text:
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add_candidate(value: Optional[str]) -> None:
+        if not value:
+            return
+        lowered = value.lower()
+        if lowered in seen:
+            return
+        seen.add(lowered)
+        candidates.append(value)
+
+    if domain_field == "domain_2":
+        parts = _DOMAIN_SPLIT_RE.split(text)
+        for part in parts:
+            if not part:
+                continue
+            domain_part = part.strip()
+            if not domain_part:
+                continue
+            if "@" in domain_part:
+                domain_part = domain_part.split("@", 1)[-1]
+            domain_part = domain_part.strip(" \t\n\r<>\"'()")
+            normalized = _normalize_domain(domain_part)
+            if normalized:
+                _add_candidate(normalized)
+            else:
+                _add_candidate(domain_part.strip())
+    else:
+        normalized = _normalize_domain(text)
+        if normalized:
+            _add_candidate(normalized)
+        else:
+            _add_candidate(text)
+
+    return candidates
 
 
 async def _get_http_client() -> httpx.AsyncClient:
@@ -684,7 +737,7 @@ async def _collect_latest_pars_site(engine: AsyncEngine, inn: str) -> list[ParsS
     )
 
     snapshots: list[ParsSiteSnapshot] = []
-    processed_domains: set[tuple[str, str]] = set()
+    processed_domains: set[str] = set()
 
     async with engine.connect() as conn:
         client_rows = (await conn.execute(sql_clients, {"inn": inn})).mappings().all()
@@ -699,41 +752,39 @@ async def _collect_latest_pars_site(engine: AsyncEngine, inn: str) -> list[ParsS
             if company_id is None:
                 continue
             for domain_field in ("domain_1", "domain_2"):
-                if domain_field not in columns:
+                candidates = _extract_domain_candidates(domain_field, row.get(domain_field))
+                if not candidates:
                     continue
-                raw_domain = row.get(domain_field)
-                domain_value = str(raw_domain).strip() if raw_domain else ""
-                if not domain_value:
-                    continue
-                key = (domain_field, domain_value.lower())
-                if key in processed_domains:
+                for domain_value in candidates:
+                    key = domain_value.lower()
+                    if key in processed_domains:
+                        log.info(
+                            "analyze-json: domain skipped as duplicate (inn=%s, company_id=%s, domain_field=%s, domain=%s)",
+                            inn,
+                            company_id,
+                            domain_field,
+                            domain_value,
+                        )
+                        continue
                     log.info(
-                        "analyze-json: domain skipped as duplicate (inn=%s, company_id=%s, domain_field=%s, domain=%s)",
+                        "analyze-json: attempt to build snapshot (inn=%s, company_id=%s, domain_field=%s, domain=%s)",
                         inn,
                         company_id,
                         domain_field,
                         domain_value,
                     )
-                    continue
-                log.info(
-                    "analyze-json: attempt to build snapshot (inn=%s, company_id=%s, domain_field=%s, domain=%s)",
-                    inn,
-                    company_id,
-                    domain_field,
-                    domain_value,
-                )
-                snapshot = await _collect_snapshot_for_domain(
-                    conn,
-                    columns,
-                    select_clause,
-                    company_id=int(company_id),
-                    domain_value=domain_value,
-                    domain_field=domain_field,
-                    inn=inn,
-                )
-                processed_domains.add(key)
-                if snapshot:
-                    snapshots.append(snapshot)
+                    snapshot = await _collect_snapshot_for_domain(
+                        conn,
+                        columns,
+                        select_clause,
+                        company_id=int(company_id),
+                        domain_value=domain_value,
+                        domain_field=domain_field,
+                        inn=inn,
+                    )
+                    processed_domains.add(key)
+                    if snapshot:
+                        snapshots.append(snapshot)
 
         if not snapshots:
             log.info(
