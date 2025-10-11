@@ -22,6 +22,21 @@ class Settings(BaseSettings):
     DADATA_SECRET_KEY: Optional[str] = None
     SCRAPERAPI_KEY: Optional[str] = None
 
+    # === Внешний AI-сервис (JSON-интеграция) ===
+    CHAT_MODEL: str = "gpt-4o"
+    OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
+    EMBED_MODEL: Optional[str] = None
+
+    IB_GOODS_TYPES_TABLE: str = "ib_goods_types"
+    IB_GOODS_TYPES_ID_COLUMN: str = "id"
+    IB_GOODS_TYPES_NAME_COLUMN: str = "goods_type_name"
+    IB_GOODS_TYPES_VECTOR_COLUMN: str = "goods_type_vector"
+
+    IB_EQUIPMENT_TABLE: str = "ib_equipment"
+    IB_EQUIPMENT_ID_COLUMN: str = "id"
+    IB_EQUIPMENT_NAME_COLUMN: str = "equipment_name"
+    IB_EQUIPMENT_VECTOR_COLUMN: str = "equipment_vector"
+
     # === External analyze service (для POST /v1/lookup/ai-analyzer) ===
     # Можно указать любой из этих ключей в .env; приоритет у AI_ANALYZE_BASE/AI_ANALYZE_TIMEOUT
     AI_ANALYZE_BASE: Optional[str] = None     # напр.: http://37.221.125.221:8123
@@ -93,6 +108,11 @@ class Settings(BaseSettings):
     def analyze_timeout(self) -> int:
         """Таймаут ожидания ответа внешнего сервиса, сек."""
         return int(self.AI_ANALYZE_TIMEOUT or self.ANALYZE_TIMEOUT or 30)
+
+    @property
+    def embed_model(self) -> str:
+        """Имя модели эмбеддингов для внешнего сервиса JSON-анализа."""
+        return self.EMBED_MODEL or self.OPENAI_EMBED_MODEL
 
 
 settings: Final[Settings] = Settings()
