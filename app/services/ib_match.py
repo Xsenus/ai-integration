@@ -52,6 +52,28 @@ class MatchResult:
     note: str = ""
 
 
+def _serialize_goods_match(match: MatchResult) -> dict[str, Any]:
+    return {
+        "ai_goods_id": match.ai_id,
+        "ai_goods_type": match.text,
+        "match_ib_id": match.match_ib_id,
+        "match_ib_name": match.match_ib_name,
+        "score": match.score,
+        "note": match.note or None,
+    }
+
+
+def _serialize_equipment_match(match: MatchResult) -> dict[str, Any]:
+    return {
+        "ai_equip_id": match.ai_id,
+        "ai_equipment": match.text,
+        "match_ib_id": match.match_ib_id,
+        "match_ib_name": match.match_ib_name,
+        "score": match.score,
+        "note": match.note or None,
+    }
+
+
 async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[str, Any]:
     started_at = time.perf_counter()
     log.info(
@@ -288,8 +310,10 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
 
     return {
         "client_id": client_id,
-        "goods": [match.__dict__ for match in goods_matches],
-        "equipment": [match.__dict__ for match in equipment_matches],
+        "goods": [_serialize_goods_match(match) for match in goods_matches],
+        "equipment": [
+            _serialize_equipment_match(match) for match in equipment_matches
+        ],
         "summary": {
             "goods_processed": len(goods_rows),
             "goods_total": len(goods_rows),
