@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Sequence
 
@@ -52,6 +53,7 @@ class MatchResult:
 
 
 async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[str, Any]:
+    started_at = time.perf_counter()
     log.info(
         "ib-match: start assignment for client_id=%s (reembed_if_exists=%s)",
         client_id,
@@ -282,21 +284,31 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         len(equipment_rows),
     )
 
+    duration_ms = int((time.perf_counter() - started_at) * 1000)
+
     return {
         "client_id": client_id,
         "goods": [match.__dict__ for match in goods_matches],
         "equipment": [match.__dict__ for match in equipment_matches],
         "summary": {
             "goods_processed": len(goods_rows),
+            "goods_total": len(goods_rows),
             "goods_updated": goods_updated,
             "goods_embeddings_generated": goods_embeddings_generated,
+            "goods_embedded": goods_embeddings_generated,
             "equipment_processed": len(equipment_rows),
+            "equipment_total": len(equipment_rows),
             "equipment_updated": equipment_updated,
             "equipment_embeddings_generated": equipment_embeddings_generated,
+            "equipment_embedded": equipment_embeddings_generated,
             "ib_goods_with_vectors": len(ib_goods),
+            "catalog_goods_total": len(ib_goods),
             "ib_equipment_with_vectors": len(ib_equipment),
+            "catalog_equipment_total": len(ib_equipment),
         },
         "report": report_text,
+        "debug_report": report_text,
+        "duration_ms": duration_ms,
     }
 
 
@@ -481,7 +493,7 @@ def _match_rows(
             {
                 "id": row.ai_id,
                 "match_id": best_id,
-                "score": round(best_score, 2),
+                "score": round(best_score, 4),
             }
         )
     return matches, updates

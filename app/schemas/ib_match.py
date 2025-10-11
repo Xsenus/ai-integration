@@ -57,20 +57,38 @@ class EquipmentMatchItem(BaseModel):
 
 class IbMatchSummary(BaseModel):
     goods_processed: int = Field(..., description="Сколько строк товаров обработано")
+    goods_total: int = Field(
+        ..., description="Полное количество строк товаров (алиас goods_processed)"
+    )
     goods_updated: int = Field(..., description="Сколько строк товаров обновлено")
     goods_embeddings_generated: int = Field(
         ..., description="Сколько эмбеддингов товаров сгенерировано"
     )
+    goods_embedded: int = Field(
+        ..., description="Полное количество сгенерированных эмбеддингов товаров"
+    )
     equipment_processed: int = Field(..., description="Сколько строк оборудования обработано")
+    equipment_total: int = Field(
+        ..., description="Полное количество строк оборудования (алиас equipment_processed)"
+    )
     equipment_updated: int = Field(..., description="Сколько строк оборудования обновлено")
     equipment_embeddings_generated: int = Field(
         ..., description="Сколько эмбеддингов оборудования сгенерировано"
     )
+    equipment_embedded: int = Field(
+        ..., description="Полное количество сгенерированных эмбеддингов оборудования"
+    )
     ib_goods_with_vectors: int = Field(
         ..., description="Количество позиций в ib_goods_types с валидными векторами"
     )
+    catalog_goods_total: int = Field(
+        ..., description="Количество позиций в каталоге товаров (алиас ib_goods_with_vectors)"
+    )
     ib_equipment_with_vectors: int = Field(
         ..., description="Количество позиций в ib_equipment с валидными векторами"
+    )
+    catalog_equipment_total: int = Field(
+        ..., description="Количество позиций в каталоге оборудования (алиас ib_equipment_with_vectors)"
     )
 
 
@@ -84,6 +102,15 @@ class IbMatchResponse(BaseModel):
     )
     summary: IbMatchSummary = Field(..., description="Итоговая статистика обработки")
     report: str = Field(..., description="Текстовый отчёт по шагам обработки")
+    debug_report: Optional[str] = Field(
+        None,
+        description=(
+            "Расширенный отчёт для отладки. Если не задан, совпадает с основным report"
+        ),
+    )
+    duration_ms: Optional[int] = Field(
+        None, ge=0, description="Время выполнения операции в миллисекундах"
+    )
 
 
 __all__ = [
