@@ -4,7 +4,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Mapping, Optional
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
+from sqlalchemy.types import String
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.db.postgres import get_postgres_engine
@@ -80,9 +81,9 @@ async def get_domains_by_inn_pg(inn: str) -> list[str]:
             for value in row:
                 if value is None:
                     continue
-                text = str(value).strip()
-                if text:
-                    values.append(text)
+                value_text = str(value).strip()
+                if value_text:
+                    values.append(value_text)
         return values
 
 
@@ -173,6 +174,31 @@ async def get_clients_request_id_pg(inn: str, domain_1: Optional[str] = None) ->
     async with eng.begin() as conn:
         row = (await conn.execute(sql, params)).first()
         return int(row[0]) if row else None
+
+
+async def get_okved_main_pg(inn: str) -> Optional[str]:
+    """Возвращает последнее значение okved_main из POSTGRES.public.clients_requests."""
+
+    eng = _pg_engine()
+    if eng is None:
+        return None
+
+    sql = text(
+        """
+        SELECT okved_main
+        FROM public.clients_requests
+        WHERE inn = :inn
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+
+    async with eng.begin() as conn:
+        row = (await conn.execute(sql, {"inn": inn})).first()
+        if not row:
+            return None
+        value = row[0]
+        return str(value).strip() if value else None
 
 
 async def push_clients_request_pg(
@@ -329,22 +355,13 @@ async def pars_site_insert_chunks_pg(
     chunks: Iterable[Mapping[str, Any] | tuple[int, int, str]],
     batch_size: int = 500,
 ) -> int:
-    """
-    Массовая вставка чанков в ОСНОВНУЮ БД POSTGRES.public.pars_site.
+    """Обновляет (или создаёт) текст домена в основной БД."""
 
-    Схема основной БД из твоего дампа:
-      id, company_id, domain_1, text_par, url, created_at, text_vector, description
-
-    => Пишем в text_par (если он есть), иначе в description.
-       Колонок start/end/idx нет — дедуп по (company_id, domain_1, url, <text_col>).
-       domain_1 сохраняем БЕЗ 'www.'.
-    """
     eng = _pg_engine()
     if eng is None:
         return 0
 
     cols = await _get_pars_site_columns()
-    # определяем колонку для текста
     text_col: Optional[str] = None
     if "text_par" in cols:
         text_col = "text_par"
@@ -361,38 +378,136 @@ async def pars_site_insert_chunks_pg(
         raise RuntimeError(msg)
 
     dom = _normalize_domain(domain_1) or domain_1
-    inserted = 0
 
-    # Готовим SQL под выбранный text_col
-    sql = text(f"""
+    collected: list[str] = []
+    for ch in chunks:
+        t = _coerce_chunk(ch)
+        if not t:
+            continue
+        collected.append(t)
+
+    if not collected:
+        return 0
+
+    payload = {
+        "company_id": company_id,
+        "domain": dom,
+        "url": url,
+        "text": "\n\n".join(collected),
+    }
+
+    sql_update = text(
+        f"""
+        UPDATE public.pars_site
+        SET url = :url,
+            {text_col} = :text,
+            created_at = now()
+        WHERE company_id = :company_id
+          AND LOWER(domain_1) = LOWER(:domain)
+        """
+    )
+
+    sql_insert = text(
+        f"""
         INSERT INTO public.pars_site (company_id, domain_1, url, {text_col})
-        SELECT :company_id, :domain_1, :url, :text
-        WHERE NOT EXISTS (
-            SELECT 1 FROM public.pars_site ps
-            WHERE ps.company_id = :company_id
-              AND ps.domain_1 = :domain_1
-              AND ps.url = :url
-              AND ps.{text_col} = :text
-        )
-    """)
+        VALUES (:company_id, :domain, :url, :text)
+        """
+    )
 
-    # Батч-вставка
-    buf: list[dict] = []
     async with eng.begin() as conn:
-        for ch in chunks:
-            t = _coerce_chunk(ch)
-            if not t:
-                continue
-            buf.append({"company_id": company_id, "domain_1": dom, "url": url, "text": t})
-            if len(buf) >= batch_size:
-                for row in buf:
-                    res = await conn.execute(sql, row)
-                    inserted += int(getattr(res, "rowcount", 0) or 0)
-                buf.clear()
-        if buf:
-            for row in buf:
-                res = await conn.execute(sql, row)
-                inserted += int(getattr(res, "rowcount", 0) or 0)
-            buf.clear()
+        res = await conn.execute(sql_update, payload)
+        if getattr(res, "rowcount", 0) == 0:
+            await conn.execute(sql_insert, payload)
 
-    return inserted
+    return len(collected)
+
+
+async def pars_site_clear_domain_pg(*, company_id: int, domain_1: str) -> None:
+    """Удаляет существующие записи pars_site основной БД для домена."""
+
+    eng = _pg_engine()
+    if eng is None:
+        return
+
+    dom = _normalize_domain(domain_1) or domain_1
+    sql = text(
+        """
+        DELETE FROM public.pars_site
+        WHERE company_id = :company_id
+          AND LOWER(domain_1) = LOWER(:domain)
+        """
+    )
+
+    async with eng.begin() as conn:
+        await conn.execute(sql, {"company_id": company_id, "domain": dom})
+
+
+async def pars_site_update_metadata_pg(
+    *,
+    company_id: int,
+    domain_1: str,
+    description: Optional[str] = None,
+    vector_literal: Optional[str] = None,
+) -> None:
+    """Обновляет описание и/или вектор в последнем наборе pars_site основной БД."""
+
+    if not description and not vector_literal:
+        return
+
+    eng = _pg_engine()
+    if eng is None:
+        return
+
+    cols = await _get_pars_site_columns()
+    set_clauses: list[str] = []
+    params: dict[str, Any] = {
+        "company_id": company_id,
+        "domain": _normalize_domain(domain_1) or domain_1,
+    }
+
+    if description and "description" in cols:
+        set_clauses.append("description = :description")
+        params["description"] = description
+
+    if vector_literal is not None and "text_vector" in cols:
+        set_clauses.append(
+            "text_vector = CASE WHEN :vec IS NULL THEN NULL ELSE CAST((:vec)::text AS vector) END"
+        )
+        params["vec"] = vector_literal
+
+    if not set_clauses:
+        return
+
+    sql = text(
+        f"""
+        WITH latest AS (
+            SELECT MAX(created_at) AS created_at
+            FROM public.pars_site
+            WHERE company_id = :company_id
+              AND LOWER(domain_1) = LOWER(:domain)
+        )
+        UPDATE public.pars_site AS ps
+        SET {', '.join(set_clauses)}
+        FROM latest
+        WHERE ps.company_id = :company_id
+          AND LOWER(ps.domain_1) = LOWER(:domain)
+          AND (latest.created_at IS NULL OR ps.created_at = latest.created_at)
+        """
+    )
+
+    if "vec" in params:
+        sql = sql.bindparams(bindparam("vec", type_=String))
+
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(sql, params)
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc)
+        if "[parameters:" in message:
+            message = message.split("[parameters:", 1)[0].rstrip()
+        log.warning(
+            "PG: не удалось обновить pars_site metadata (company_id=%s, domain=%s): %s",
+            company_id,
+            domain_1,
+            message or exc.__class__.__name__,
+        )

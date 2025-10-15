@@ -5,9 +5,10 @@ import logging
 from typing import Any, Optional, Iterable, Mapping
 from urllib.parse import urlparse
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.types import String
 
 from app.config import settings
 
@@ -240,9 +241,9 @@ async def get_domains_by_inn(inn: str) -> list[str]:
             for value in row:
                 if value is None:
                     continue
-                text = str(value).strip()
-                if text:
-                    values.append(text)
+                value_text = str(value).strip()
+                if value_text:
+                    values.append(value_text)
         return values
 
 
@@ -317,80 +318,152 @@ async def pars_site_insert_chunks(
     chunks: Iterable[Mapping[str, Any] | tuple[int, int, str]],
     batch_size: int = 500,
 ) -> int:
-    """
-    Массовая вставка чанков в public.pars_site.
+    """Обновляет или добавляет чанки в parsing_data.public.pars_site."""
 
-    Ожидается, что каждый чанк — либо dict с полями:
-      - start: int
-      - end: int
-      - text: str
-    либо tuple(start, end, text).
-
-    Дубликаты по (company_id, domain_1, url, start, end) не вставляются
-    (делаем WHERE NOT EXISTS для совместимости даже без уникального индекса).
-    Возвращает количество реально вставленных записей.
-
-    Соглашение подтверждено:
-      - pars_site.domain_1 храним БЕЗ 'www.'
-    """
     eng = get_parsing_engine()
     if eng is None:
         return 0
 
-    dom = _normalize_domain(domain_1) or domain_1  # гарантируем хранение без 'www.'
-    inserted = 0
+    dom = _normalize_domain(domain_1) or domain_1
 
-    def _coerce_chunk(ch: Mapping[str, Any] | tuple[int, int, str]) -> Optional[dict]:
+    def _coerce_chunk(
+        ch: Mapping[str, Any] | tuple[int, int, str]
+    ) -> Optional[dict[str, Any]]:
         if isinstance(ch, tuple) and len(ch) == 3:
             start, end, txt = ch
             txt_par = None
         elif isinstance(ch, Mapping):
-            start = int(ch.get("start", 0))
-            end = int(ch.get("end", 0))
+            start = int(ch.get("start", 0) or 0)
+            end = int(ch.get("end", 0) or 0)
             txt = ch.get("text")
             txt_par = ch.get("text_par")
         else:
             return None
-        if txt is None and txt_par is None:
-            return None
-        s = int(start)
-        e = int(end)
+
         base_text = txt if txt is not None else txt_par
         if base_text is None:
             return None
-        t = str(base_text)
-        if not t:
-            return None
 
-        text_par_value = txt_par if txt_par is not None else base_text
-        text_par_str = str(text_par_value) if text_par_value is not None else t
+        s = int(start)
+        e = int(end)
+        text_value = str(txt) if txt is not None else None
+        text_par_value = str(txt_par) if txt_par is not None else str(base_text)
 
         return {
-            "company_id": company_id,
-            "domain_1": dom,
-            "url": url,
             "start": s,
             "end": e,
-            "text": t,
-            "text_par": text_par_str,
+            "text": text_value,
+            "text_par": text_par_value,
         }
 
-    # Подготовка батча
-    buf: list[dict] = []
-    async with eng.begin() as conn:
-        for ch in chunks:
-            row = _coerce_chunk(ch)
-            if not row:
-                continue
-            buf.append(row)
-            if len(buf) >= batch_size:
-                inserted += await _flush_pars_site_batch(conn, buf)
-                buf.clear()
-        if buf:
-            inserted += await _flush_pars_site_batch(conn, buf)
-            buf.clear()
+    rows: list[dict[str, Any]] = []
+    for ch in chunks:
+        row = _coerce_chunk(ch)
+        if not row:
+            continue
+        rows.append(row)
 
-    return inserted
+    if not rows:
+        return 0
+
+    params_base = {"company_id": company_id, "domain": dom}
+
+    sql_existing = text(
+        """
+        SELECT id
+        FROM public.pars_site
+        WHERE company_id = :company_id
+          AND LOWER(domain_1) = LOWER(:domain)
+        ORDER BY start NULLS FIRST, id
+        """
+    )
+
+    sql_update = text(
+        """
+        UPDATE public.pars_site
+        SET url = :url,
+            start = :start,
+            "end" = :end,
+            text = :text,
+            text_par = :text_par,
+            created_at = now()
+        WHERE id = :id
+        """
+    )
+
+    sql_insert = text(
+        """
+        INSERT INTO public.pars_site (company_id, domain_1, url, start, "end", text, text_par)
+        VALUES (:company_id, :domain, :url, :start, :end, :text, :text_par)
+        """
+    )
+
+    sql_clear_extra = text(
+        """
+        UPDATE public.pars_site
+        SET url = :url,
+            start = NULL,
+            "end" = NULL,
+            text = NULL,
+            text_par = NULL,
+            created_at = now()
+        WHERE id = :id
+        """
+    )
+
+    async with eng.begin() as conn:
+        existing_ids = [row[0] for row in (await conn.execute(sql_existing, params_base)).all()]
+
+        for idx, row in enumerate(rows):
+            payload = {
+                "company_id": company_id,
+                "domain": dom,
+                "url": url,
+                "start": row["start"],
+                "end": row["end"],
+                "text": row["text"],
+                "text_par": row["text_par"],
+            }
+
+            if idx < len(existing_ids):
+                payload["id"] = existing_ids[idx]
+                await conn.execute(sql_update, payload)
+            else:
+                await conn.execute(sql_insert, payload)
+
+        for leftover_id in existing_ids[len(rows):]:
+            await conn.execute(sql_clear_extra, {"id": leftover_id, "url": url})
+
+    return len(rows)
+
+
+
+async def pars_site_clear_domain(*, company_id: int, domain_1: str) -> None:
+    """Удаляет существующие записи pars_site для указанного домена компании."""
+
+    eng = get_parsing_engine()
+    if eng is None:
+        return
+
+    dom = _normalize_domain(domain_1) or domain_1
+    sql = text(
+        """
+        DELETE FROM public.pars_site
+        WHERE company_id = :company_id
+          AND LOWER(domain_1) = LOWER(:domain)
+        """
+    )
+
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(sql, {"company_id": company_id, "domain": dom})
+    except SQLAlchemyError as exc:  # noqa: BLE001
+        log.warning(
+            "parsing_data: не удалось очистить pars_site (company_id=%s, domain=%s): %s",
+            company_id,
+            dom,
+            exc,
+        )
 
 
 async def _flush_pars_site_batch(conn, rows: list[dict]) -> int:
@@ -424,6 +497,61 @@ async def _flush_pars_site_batch(conn, rows: list[dict]) -> int:
         except Exception:
             pass
     return total
+
+
+async def pars_site_update_vector(
+    *,
+    company_id: int,
+    domain_1: str,
+    vector_literal: Optional[str],
+) -> None:
+    """Обновляет text_vector в последнем наборе pars_site в зеркальной базе."""
+
+    if vector_literal is None:
+        return
+
+    eng = get_parsing_engine()
+    if eng is None:
+        return
+
+    sql = text(
+        """
+        WITH latest AS (
+            SELECT MAX(created_at) AS created_at
+            FROM public.pars_site
+            WHERE company_id = :company_id
+              AND domain_1 = :domain
+        )
+        UPDATE public.pars_site AS ps
+        SET text_vector = CASE WHEN :vec IS NULL THEN NULL ELSE CAST((:vec)::text AS vector) END
+        FROM latest
+        WHERE ps.company_id = :company_id
+          AND ps.domain_1 = :domain
+          AND (latest.created_at IS NULL OR ps.created_at = latest.created_at)
+        """
+    )
+
+    sql = sql.bindparams(bindparam("vec", type_=String))
+
+    params = {
+        "company_id": company_id,
+        "domain": _normalize_domain(domain_1) or domain_1,
+        "vec": vector_literal,
+    }
+
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(sql, params)
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc)
+        if "[parameters:" in message:
+            message = message.split("[parameters:", 1)[0].rstrip()
+        log.warning(
+            "parsing_data: не удалось обновить text_vector (company_id=%s, domain=%s): %s",
+            company_id,
+            domain_1,
+            message or exc.__class__.__name__,
+        )
 
 
 # ---------- Schema init (CREATE IF NOT EXISTS) ----------
