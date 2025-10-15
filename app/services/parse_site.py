@@ -126,7 +126,7 @@ class ParsedSiteResult(BaseModel):
     success: bool
     error: str | None = None
     description: str | None = None
-    description_vector: list[float] | None = None
+    has_description_vector: bool = False
     okved_score: float | None = None
 
 
@@ -1058,7 +1058,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             success=True,
             error=None,
             description=description,
-            description_vector=description_vector,
+            has_description_vector=bool(description_vector),
             okved_score=okved_score,
         )
         results.append(result)

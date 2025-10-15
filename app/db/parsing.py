@@ -5,9 +5,10 @@ import logging
 from typing import Any, Optional, Iterable, Mapping
 from urllib.parse import urlparse
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.types import String
 
 from app.config import settings
 
@@ -529,6 +530,8 @@ async def pars_site_update_vector(
           AND (latest.created_at IS NULL OR ps.created_at = latest.created_at)
         """
     )
+
+    sql = sql.bindparams(bindparam("vec", type_=String))
 
     params = {
         "company_id": company_id,

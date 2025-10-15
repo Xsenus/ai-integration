@@ -4,7 +4,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Mapping, Optional
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
+from sqlalchemy.types import String
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.db.postgres import get_postgres_engine
@@ -493,6 +494,9 @@ async def pars_site_update_metadata_pg(
           AND (latest.created_at IS NULL OR ps.created_at = latest.created_at)
         """
     )
+
+    if "vec" in params:
+        sql = sql.bindparams(bindparam("vec", type_=String))
 
     try:
         async with eng.begin() as conn:
