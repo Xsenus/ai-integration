@@ -80,9 +80,9 @@ async def get_domains_by_inn_pg(inn: str) -> list[str]:
             for value in row:
                 if value is None:
                     continue
-                text = str(value).strip()
-                if text:
-                    values.append(text)
+                value_text = str(value).strip()
+                if value_text:
+                    values.append(value_text)
         return values
 
 
