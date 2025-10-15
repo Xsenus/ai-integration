@@ -79,6 +79,29 @@ def _extract_html_redirect_target(html: str, base_url: str) -> str | None:
     return None
 
 
+SCRAPERAPI_HOST = "api.scraperapi.com"
+
+
+def _resolve_effective_url(requested_url: str, response: httpx.Response) -> str:
+    """Определяет фактический адрес, который вернул ScraperAPI."""
+
+    header_candidates = (
+        "X-Scraperapi-Location",
+        "X-Scraperapi-Redirect-Target",
+        "X-Final-Url",
+        "Location",
+    )
+    for header in header_candidates:
+        value = response.headers.get(header)
+        if value:
+            return urljoin(requested_url, value)
+
+    resolved = str(response.url)
+    if urlparse(resolved).netloc.lower() == SCRAPERAPI_HOST:
+        return requested_url
+    return resolved
+
+
 async def fetch_home_via_scraperapi(
     domain_or_url: str,
     *,
@@ -88,7 +111,7 @@ async def fetch_home_via_scraperapi(
     if not settings.SCRAPERAPI_KEY:
         raise FetchError("SCRAPERAPI_KEY is not configured")
 
-    current_url = to_home_url(domain_or_url)
+    target_url = to_home_url(domain_or_url)
     params_base = {"api_key": settings.SCRAPERAPI_KEY}
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/122 Safari/537.36"}
 
@@ -97,25 +120,41 @@ async def fetch_home_via_scraperapi(
     if redirect_limit < 0:
         redirect_limit = 0
 
-    follow_http_redirects = redirect_limit != 0
-    client_kwargs: dict[str, object] = {"timeout": 60, "follow_redirects": follow_http_redirects}
-    if follow_http_redirects:
-        client_kwargs["max_redirects"] = max(redirect_limit, 1)
+    client_kwargs: dict[str, object] = {"timeout": 60, "follow_redirects": False}
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         while True:
-            params = dict(params_base, url=current_url)
+            params = dict(params_base, url=target_url)
             backoff = 1.0
             redirect_followed = False
 
             for attempt in range(1, retries + 1):
                 try:
-                    log.info("HTTP: ScraperAPI → %s (try %s/%s)", current_url, attempt, retries)
+                    requested_url = target_url
+                    log.info("HTTP: ScraperAPI → %s (try %s/%s)", requested_url, attempt, retries)
                     r = await client.get(
                         "https://api.scraperapi.com/",
                         params=params,
                         headers=headers,
                     )
+                    if r.status_code in {301, 302, 303, 307, 308}:
+                        location = r.headers.get("Location")
+                        if not location:
+                            raise FetchError(f"HTTP {r.status_code} без заголовка Location")
+                        redirects_followed += 1
+                        if redirects_followed > redirect_limit:
+                            raise FetchError("Превышено число HTTP-редиректов")
+                        target_url = urljoin(requested_url, location)
+                        log.info(
+                            "HTTP: redirect (%s/%s): %s → %s",
+                            redirects_followed,
+                            redirect_limit,
+                            requested_url,
+                            target_url,
+                        )
+                        redirect_followed = True
+                        break
+
                     if r.status_code != 200:
                         body = (r.text or "")[:400]
                         raise FetchError(f"HTTP {r.status_code}: {body}")
@@ -123,26 +162,26 @@ async def fetch_home_via_scraperapi(
                     if len(html) < settings.PARSE_MIN_HTML_LEN:
                         raise FetchError("Ответ слишком короткий")
 
-                    current_url = str(r.url)
+                    effective_url = _resolve_effective_url(requested_url, r)
 
-                    redirect_target = _extract_html_redirect_target(html, current_url)
+                    redirect_target = _extract_html_redirect_target(html, effective_url)
                     if redirect_target:
                         redirects_followed += 1
                         log.info(
                             "HTTP: HTML redirect обнаружен (%s/%s): %s → %s",
                             redirects_followed,
                             redirect_limit,
-                            current_url,
+                            effective_url,
                             redirect_target,
                         )
                         if redirects_followed > redirect_limit:
                             raise FetchError("Превышено число HTML-редиректов")
-                        current_url = redirect_target
+                        target_url = redirect_target
                         redirect_followed = True
                         break
 
                     log.info("HTTP: OK, %s символов HTML", len(html))
-                    return html, current_url
+                    return html, effective_url
                 except Exception as e:  # noqa: BLE001
                     if attempt >= retries:
                         raise FetchError(f"Fetch failed after {attempt} tries: {e}") from e
