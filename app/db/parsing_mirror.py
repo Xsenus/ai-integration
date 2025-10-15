@@ -423,6 +423,26 @@ async def pars_site_insert_chunks_pg(
     return inserted
 
 
+async def pars_site_clear_domain_pg(*, company_id: int, domain_1: str) -> None:
+    """Удаляет существующие записи pars_site основной БД для домена."""
+
+    eng = _pg_engine()
+    if eng is None:
+        return
+
+    dom = _normalize_domain(domain_1) or domain_1
+    sql = text(
+        """
+        DELETE FROM public.pars_site
+        WHERE company_id = :company_id
+          AND LOWER(domain_1) = LOWER(:domain)
+        """
+    )
+
+    async with eng.begin() as conn:
+        await conn.execute(sql, {"company_id": company_id, "domain": dom})
+
+
 async def pars_site_update_metadata_pg(
     *,
     company_id: int,

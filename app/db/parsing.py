@@ -393,6 +393,34 @@ async def pars_site_insert_chunks(
     return inserted
 
 
+async def pars_site_clear_domain(*, company_id: int, domain_1: str) -> None:
+    """Удаляет существующие записи pars_site для указанного домена компании."""
+
+    eng = get_parsing_engine()
+    if eng is None:
+        return
+
+    dom = _normalize_domain(domain_1) or domain_1
+    sql = text(
+        """
+        DELETE FROM public.pars_site
+        WHERE company_id = :company_id
+          AND LOWER(domain_1) = LOWER(:domain)
+        """
+    )
+
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(sql, {"company_id": company_id, "domain": dom})
+    except SQLAlchemyError as exc:  # noqa: BLE001
+        log.warning(
+            "parsing_data: не удалось очистить pars_site (company_id=%s, domain=%s): %s",
+            company_id,
+            dom,
+            exc,
+        )
+
+
 async def _flush_pars_site_batch(conn, rows: list[dict]) -> int:
     """
     Вставка батча через INSERT ... SELECT WHERE NOT EXISTS,

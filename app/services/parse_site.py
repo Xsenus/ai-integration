@@ -8,7 +8,6 @@ import math
 import re
 from typing import Any, Iterable, Optional, Sequence
 
-import httpx
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -20,6 +19,7 @@ from app.db.bitrix import bitrix_session
 from app.db.parsing import (
     get_clients_request_id as get_clients_request_id_pd,
     get_domains_by_inn as get_domains_by_inn_pd,
+    pars_site_clear_domain,
     pars_site_insert_chunks as pars_site_insert_chunks_pd,
     pars_site_update_vector,
     push_clients_request as push_clients_request_pd,
@@ -28,6 +28,7 @@ from app.db.parsing_mirror import (
     get_clients_request_id_pg,
     get_domains_by_inn_pg,
     get_ib_clients_domains_pg,
+    pars_site_clear_domain_pg,
     pars_site_insert_chunks_pg,
     pars_site_update_metadata_pg,
     push_clients_request_pg,
@@ -37,6 +38,7 @@ from app.models.bitrix import DaDataResult
 from app.repo.bitrix_repo import replace_dadata_raw, upsert_company_summary
 from app.services.dadata_client import find_party_by_inn
 from app.services.mapping import map_summary_from_dadata
+from app.services.analyze_client import fetch_embedding, fetch_site_description
 from app.services.scrape import FetchError, fetch_and_chunk, to_home_url
 
 log = logging.getLogger("services.parse_site")
@@ -76,7 +78,6 @@ _PERSONAL_EMAIL_DOMAINS = {
 }
 
 
-_DEFAULT_EMBED_BASE = "http://37.221.125.221:8123"
 _OKVED_ALERT_THRESHOLD = 0.5
 
 
@@ -352,74 +353,11 @@ async def _generate_site_description(
     if not text.strip():
         return None, None
 
-    base_url = settings.analyze_base
-    if not base_url:
-        log.info(
-            "parse-site: ANALYZE_BASE не настроен — описание не будет запрошено (inn=%s, domain=%s)",
-            inn,
-            domain,
-        )
-        return None, None
-
-    endpoint = base_url.rstrip("/") + "/v1/analyze/json"
-    payload = {
-        "text_par": text,
-        "return_prompt": False,
-        "return_answer_raw": False,
-        "embed_model": settings.embed_model,
-    }
-    timeout = settings.analyze_timeout
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(endpoint, json=payload)
-    except httpx.HTTPError as exc:  # noqa: BLE001
-        log.warning(
-            "parse-site: описание не получено (inn=%s, domain=%s): %s",
-            inn,
-            domain,
-            exc,
-        )
-        return None, None
-
-    if response.status_code >= 400:
-        log.warning(
-            "parse-site: внешнее описание вернуло %s (inn=%s, domain=%s)",
-            response.status_code,
-            inn,
-            domain,
-        )
-        return None, None
-
-    try:
-        data = response.json()
-    except ValueError:  # noqa: BLE001
-        log.warning(
-            "parse-site: внешнее описание вернуло не-JSON (inn=%s, domain=%s)",
-            inn,
-            domain,
-        )
-        return None, None
-
-    description_raw = data.get("description")
-    description = str(description_raw).strip() if isinstance(description_raw, str) else None
-    vector = _coerce_vector(data.get("description_vector"))
-
-    if description:
-        log.info(
-            "parse-site: описание получено (inn=%s, domain=%s, length=%s, vector=%s)",
-            inn,
-            domain,
-            len(description),
-            bool(vector),
-        )
-    else:
-        log.info(
-            "parse-site: описание отсутствует в ответе (inn=%s, domain=%s)",
-            inn,
-            domain,
-        )
-
+    description, vector = await fetch_site_description(
+        text,
+        embed_model=settings.embed_model,
+        label=f"site:{inn}:{domain}",
+    )
     return description, vector
 
 
@@ -427,36 +365,7 @@ async def _embed_text(text: str, *, label: str) -> Optional[list[float]]:
     if not text.strip():
         return None
 
-    base = settings.analyze_base or _DEFAULT_EMBED_BASE
-    if not base:
-        log.info("parse-site: embedding base URL не настроен (%s)", label)
-        return None
-
-    endpoint = base.rstrip("/") + "/ai-search"
-    timeout = settings.analyze_timeout
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(endpoint, json={"q": text})
-    except httpx.HTTPError as exc:  # noqa: BLE001
-        log.warning("parse-site: embedding запрос не выполнен (%s): %s", label, exc)
-        return None
-
-    if response.status_code >= 400:
-        log.warning(
-            "parse-site: embedding сервис вернул %s (%s)",
-            response.status_code,
-            label,
-        )
-        return None
-
-    try:
-        data = response.json()
-    except ValueError:  # noqa: BLE001
-        log.warning("parse-site: embedding сервис вернул не-JSON (%s)", label)
-        return None
-
-    vector = _coerce_vector(data.get("embedding"))
+    vector = await fetch_embedding(text, label=label)
     if vector:
         log.info("parse-site: embedding получен (%s, size=%s)", label, len(vector))
     else:
@@ -1084,6 +993,13 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                 )
 
             log.info(
+                "parse-site: очищаем предыдущие записи в POSTGRES.pars_site (company_id=%s, домен=%s)",
+                company_id_pg,
+                domain_for_pars,
+            )
+            await pars_site_clear_domain_pg(company_id=company_id_pg, domain_1=domain_for_pars)
+
+            log.info(
                 "parse-site: сохраняем чанки в POSTGRES.pars_site (company_id=%s, домен=%s, url=%s)",
                 company_id_pg,
                 domain_for_pars,
@@ -1103,6 +1019,21 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             total_inserted += inserted_pg
 
             if company_id_pd:
+                log.info(
+                    "parse-site: очищаем предыдущие записи в parsing_data.pars_site (company_id=%s, домен=%s)",
+                    company_id_pd,
+                    domain_for_pars,
+                )
+                try:
+                    await pars_site_clear_domain(
+                        company_id=company_id_pd,
+                        domain_1=domain_for_pars,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    if not mirror_failed_logged:
+                        log.warning("mirror parsing_data failed для очистки pars_site (ИНН %s): %s", inn, e)
+                        mirror_failed_logged = True
+
                 try:
                     log.info(
                         "parse-site: сохраняем чанки в parsing_data.pars_site (company_id=%s, домен=%s, url=%s)",
