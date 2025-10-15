@@ -24,7 +24,7 @@ from app.schemas.ai_analyzer import (
     BulkAiAnalyzeLaunchResponse,
 )
 from app.services.ai_analyzer import analyze_company_by_inn
-from app.api.routes import ParseSiteRequest, _parse_site_impl
+from app.services.parse_site import ParseSiteRequest, run_parse_site
 
 log = logging.getLogger("api.ai_analyzer")
 router = APIRouter(prefix="/v1/lookup", tags=["ai-analyzer"])
@@ -184,7 +184,7 @@ async def _ensure_site_parsed_for_bulk(inn: str, site: str) -> None:
     )
     try:
         async with bitrix_session() as session:
-            await _parse_site_impl(payload, session)
+            await run_parse_site(payload, session)
         log.info(
             "Bulk analyze: pars_site refreshed for inn=%s, site=%s.",
             inn,
