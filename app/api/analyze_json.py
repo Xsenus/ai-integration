@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.sqltypes import Text
 
-from app.api.routes import ParseSiteRequest, _parse_site_impl
+from app.services.parse_site import ParseSiteRequest, run_parse_site
 from app.config import settings
 from app.db.bitrix import bitrix_session
 from app.db.parsing import _normalize_domain
@@ -236,7 +236,7 @@ async def _trigger_parse_site(inn: str) -> None:
     try:
         log.info("analyze-json: triggering parse-site (inn=%s)", inn)
         async with bitrix_session() as session:
-            await _parse_site_impl(payload, session)
+            await run_parse_site(payload, session)
         log.info("analyze-json: pars_site refreshed for inn=%s", inn)
     except HTTPException as exc:
         log.info("analyze-json: parse-site skipped for inn=%s → %s", inn, exc.detail)
