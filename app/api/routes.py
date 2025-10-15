@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import re
@@ -572,6 +573,34 @@ _DOMAIN_IN_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.IGNORECASE)
+
+_PERSONAL_EMAIL_DOMAINS = {
+    # RU
+    "mail.ru",
+    "inbox.ru",
+    "bk.ru",
+    "list.ru",
+    "yandex.ru",
+    "ya.ru",
+    "yandex.com",
+    "rambler.ru",
+    "lenta.ru",
+    "autorambler.ru",
+    "ro.ru",
+    # global
+    "gmail.com",
+    "hotmail.com",
+    "outlook.com",
+    "live.com",
+    "msn.com",
+    "icloud.com",
+    "me.com",
+    "aol.com",
+    "protonmail.com",
+    "proton.me",
+}
+
 
 def _normalize_domain_candidate(domain: str) -> Optional[str]:
     try:
@@ -626,10 +655,58 @@ def _normalize_domains(values: Iterable[object]) -> list[str]:
     return result
 
 
+def _extract_emails_from_value(value: object) -> Iterable[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        emails: list[str] = []
+        for item in value:
+            emails.extend(_extract_emails_from_value(item))
+        return emails
+
+    if isinstance(value, dict):
+        emails: list[str] = []
+        for item in value.values():
+            emails.extend(_extract_emails_from_value(item))
+        return emails
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+    except Exception:  # noqa: BLE001
+        parsed = None
+
+    if isinstance(parsed, (list, dict)):
+        return list(_extract_emails_from_value(parsed))
+
+    return [m.group(0) for m in _EMAIL_RE.finditer(text)]
+
+
+def _normalize_email_domains(values: Iterable[object]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        for raw_email in _extract_emails_from_value(value):
+            domain_part = raw_email.split("@", 1)[1].lower()
+            if domain_part in _PERSONAL_EMAIL_DOMAINS:
+                continue
+            norm = _normalize_domain_candidate(domain_part)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            result.append(norm)
+    return result
+
+
 async def _collect_domains_by_inn(inn: str, session: AsyncSession) -> list[str]:
     """Возвращает уникальный список доменов для ИНН из разных источников."""
 
     candidates: list[object] = []
+    email_candidates: list[object] = []
 
     log.info("parse-site: начинаем сбор доменов для ИНН %s", inn)
 
@@ -679,28 +756,74 @@ async def _collect_domains_by_inn(inn: str, session: AsyncSession) -> list[str]:
         log.warning("parse-site: ошибка чтения POSTGRES.ib_clients для ИНН %s: %s", inn, e)
 
     try:
-        res = await session.execute(select(DaDataResult.web_sites).where(DaDataResult.inn == inn))
-        web_sites = res.scalar_one_or_none()
-        if web_sites:
-            log.info(
-                "parse-site: найдены сайты в bitrix_data.dadata_result по ИНН %s → %s",
-                inn,
-                web_sites,
-            )
-            candidates.append(web_sites)
-        else:
-            log.info("parse-site: в bitrix_data.dadata_result нет сайтов для ИНН %s", inn)
-    except Exception as e:  # noqa: BLE001
-        log.warning("parse-site: ошибка чтения bitrix_data.dadata_result.web_sites для ИНН %s: %s", inn, e)
+        res = await session.execute(
+            select(DaDataResult.web_sites, DaDataResult.emails).where(DaDataResult.inn == inn)
+        )
+        row = res.one_or_none()
+        if row:
+            web_sites = row.web_sites
+            emails = row.emails
+            if web_sites:
+                log.info(
+                    "parse-site: найдены сайты в bitrix_data.dadata_result по ИНН %s → %s",
+                    inn,
+                    web_sites,
+                )
+                candidates.append(web_sites)
+            else:
+                log.info("parse-site: в bitrix_data.dadata_result нет сайтов для ИНН %s", inn)
 
-    normalized = _normalize_domains(candidates)
+            if emails:
+                log.info(
+                    "parse-site: найдены email в bitrix_data.dadata_result по ИНН %s → %s",
+                    inn,
+                    emails,
+                )
+                email_candidates.append(emails)
+            else:
+                log.info("parse-site: в bitrix_data.dadata_result нет email для ИНН %s", inn)
+        else:
+            log.info("parse-site: запись bitrix_data.dadata_result не найдена для ИНН %s", inn)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "parse-site: ошибка чтения bitrix_data.dadata_result (web_sites/emails) для ИНН %s: %s",
+            inn,
+            e,
+        )
+
+    normalized_domains = _normalize_domains(candidates)
+    if normalized_domains:
+        log.info(
+            "parse-site: нормализованные домены из БД по ИНН %s → %s",
+            inn,
+            normalized_domains,
+        )
+    else:
+        log.info("parse-site: нормализованные домены из БД по ИНН %s отсутствуют", inn)
+
+    email_domains = _normalize_email_domains(email_candidates)
+    if email_domains:
+        log.info(
+            "parse-site: домены, полученные из email bitrix_data.dadata_result по ИНН %s → %s",
+            inn,
+            email_domains,
+        )
+
+    combined: list[str] = []
+    seen: set[str] = set()
+    for dom in itertools.chain(normalized_domains, email_domains):
+        if dom in seen:
+            continue
+        seen.add(dom)
+        combined.append(dom)
+
     log.info(
         "parse-site: итоговый список доменов по ИНН %s (%s шт.) → %s",
         inn,
-        len(normalized),
-        normalized,
+        len(combined),
+        combined,
     )
-    return normalized
+    return combined
 
 
 class ParseSiteRequest(BaseModel):
@@ -708,19 +831,38 @@ class ParseSiteRequest(BaseModel):
     inn: str = Field(..., min_length=4, max_length=20, description="ИНН для clients_requests.inn")
     parse_domain: str | None = Field(
         None,
-        description="Одиночный домен или URL (например, 'uniconf.ru' или 'https://uniconf.ru')."
+        description="Одиночный домен или URL (например, 'uniconf.ru' или 'https://uniconf.ru').",
     )
     parse_domains: list[str] | None = Field(
         None,
-        description="Список доменов/URL для парсинга. Переданные значения дополняются доменами из БД."
+        description="Список доменов/URL для парсинга. Переданные значения дополняются доменами из БД.",
+    )
+    parse_emails: list[str] | None = Field(
+        None,
+        description="Список email-адресов. Домены из них будут использованы как кандидаты для парсинга.",
     )
 
     # Опциональные override'ы
-    company_name: str | None = Field(None, description="Название компании; если не задано — подтянем из своей БД (DaDataResult)")
-    client_domain_1: str | None = Field(None, description="clients_requests.domain_1; если не задано — 'www.{первый_домен}'")
-    pars_site_domain_1: str | None = Field(None, description="pars_site.domain_1; если не задано — домен без 'www.'")
-    url_override: str | None = Field(None, description="pars_site.url; если не задано — главная страница")
-    save_client_request: bool = Field(True, description="Создавать запись в clients_requests (по умолчанию — да)")
+    company_name: str | None = Field(
+        None,
+        description="Название компании; если не задано — подтянем из своей БД (DaDataResult)",
+    )
+    client_domain_1: str | None = Field(
+        None,
+        description="clients_requests.domain_1; если не задано — 'www.{первый_домен}'",
+    )
+    pars_site_domain_1: str | None = Field(
+        None,
+        description="pars_site.domain_1; если не задано — домен без 'www.'",
+    )
+    url_override: str | None = Field(
+        None,
+        description="pars_site.url; если не задано — главная страница",
+    )
+    save_client_request: bool = Field(
+        True,
+        description="Создавать запись в clients_requests (по умолчанию — да)",
+    )
 
 
 class ParsedSiteResult(BaseModel):
@@ -737,6 +879,8 @@ class ParseSiteResponse(BaseModel):
     domain_1: str | None
     domain_2: str | None
     url: str | None
+    planned_domains: list[str]
+    successful_domains: list[str]
     chunks_inserted: int
     results: list[ParsedSiteResult]
 
@@ -834,17 +978,40 @@ async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> 
     )
 
     manual_domains: list[object] = []
+    manual_emails: list[object] = []
     if payload.parse_domain:
         manual_domains.append(payload.parse_domain)
     if payload.parse_domains:
         manual_domains.extend(payload.parse_domains)
+    if payload.parse_emails:
+        manual_emails.extend(payload.parse_emails)
 
     if manual_domains:
         log.info("parse-site: переданные вручную домены → %s", manual_domains)
     else:
         log.info("parse-site: ручные домены не переданы")
 
-    normalized_manual = _normalize_domains(manual_domains)
+    if manual_emails:
+        log.info("parse-site: переданные вручную email → %s", manual_emails)
+    else:
+        log.info("parse-site: ручные email не переданы")
+
+    normalized_manual_domains = _normalize_domains(manual_domains)
+    manual_email_domains = _normalize_email_domains(manual_emails)
+    if manual_email_domains:
+        log.info(
+            "parse-site: домены из ручных email (отфильтровано) → %s",
+            manual_email_domains,
+        )
+
+    normalized_manual: list[str] = []
+    normalized_manual_seen: set[str] = set()
+    for dom in itertools.chain(normalized_manual_domains, manual_email_domains):
+        if dom in normalized_manual_seen:
+            continue
+        normalized_manual_seen.add(dom)
+        normalized_manual.append(dom)
+
     log.info("parse-site: нормализованные ручные домены → %s", normalized_manual)
     domains_to_process: list[str]
     if normalized_manual:
@@ -875,6 +1042,8 @@ async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> 
             detail="Не удалось определить домен: передайте 'parse_domain'/'parse_domains' или добавьте данные в БД",
         )
 
+    log.info("parse-site: итоговый набор доменов для обработки (до override) → %s", domains_to_process)
+
     company_name = (payload.company_name or "").strip()
     if not company_name:
         persisted = await session.get(DaDataResult, inn)
@@ -901,6 +1070,8 @@ async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> 
             domains_to_process.remove(normalized_client)
         domains_to_process.insert(0, normalized_client)
         log.info("parse-site: домен override установлен первым → %s", normalized_client)
+
+    log.info("parse-site: домены к обработке (после override) → %s", domains_to_process)
 
     primary_domain_norm = domains_to_process[0]
     secondary_domain_norm = domains_to_process[1] if len(domains_to_process) > 1 else None
@@ -1002,9 +1173,12 @@ async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> 
     client_domain_lookup: Optional[str] = None
     client_domains_success: list[str] = []
 
+    planned_domains = list(domains_to_process)
+
     results: list[ParsedSiteResult] = []
     successes: list[ParsedSiteResult] = []
     total_inserted = 0
+    successful_used_domains: list[str] = []
 
     for idx, domain_candidate in enumerate(domains_to_process, start=1):
         log.info(
@@ -1220,6 +1394,8 @@ async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> 
         )
         results.append(result)
         successes.append(result)
+        if domain_for_pars and domain_for_pars not in successful_used_domains:
+            successful_used_domains.append(domain_for_pars)
         log.info(
             "parse-site: домен %s обработан успешно (чанков=%s)",
             domain_for_pars,
@@ -1240,6 +1416,8 @@ async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> 
         f"www.{final_domain_2}" if final_domain_2 else None,
     )
 
+    log.info("parse-site: успешные домены для парсинга → %s", successful_used_domains)
+
     primary = successes[0]
     log.info(
         "parse-site: успешно обработано доменов %s/%s, всего вставлено чанков %s",
@@ -1252,6 +1430,8 @@ async def _parse_site_impl(payload: ParseSiteRequest, session: AsyncSession) -> 
         domain_1=f"www.{final_domain_1}" if final_domain_1 else None,
         domain_2=f"www.{final_domain_2}" if final_domain_2 else None,
         url=primary.url,
+        planned_domains=planned_domains,
+        successful_domains=successful_used_domains,
         chunks_inserted=total_inserted,
         results=results,
     )
