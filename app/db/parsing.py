@@ -426,6 +426,56 @@ async def _flush_pars_site_batch(conn, rows: list[dict]) -> int:
     return total
 
 
+async def pars_site_update_vector(
+    *,
+    company_id: int,
+    domain_1: str,
+    vector_literal: Optional[str],
+) -> None:
+    """Обновляет text_vector в последнем наборе pars_site в зеркальной базе."""
+
+    if vector_literal is None:
+        return
+
+    eng = get_parsing_engine()
+    if eng is None:
+        return
+
+    sql = text(
+        """
+        WITH latest AS (
+            SELECT MAX(created_at) AS created_at
+            FROM public.pars_site
+            WHERE company_id = :company_id
+              AND domain_1 = :domain
+        )
+        UPDATE public.pars_site AS ps
+        SET text_vector = CASE WHEN :vec IS NULL THEN NULL ELSE CAST(:vec AS vector) END
+        FROM latest
+        WHERE ps.company_id = :company_id
+          AND ps.domain_1 = :domain
+          AND (latest.created_at IS NULL OR ps.created_at = latest.created_at)
+        """
+    )
+
+    params = {
+        "company_id": company_id,
+        "domain": _normalize_domain(domain_1) or domain_1,
+        "vec": vector_literal,
+    }
+
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(sql, params)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "parsing_data: не удалось обновить text_vector (company_id=%s, domain=%s): %s",
+            company_id,
+            domain_1,
+            exc,
+        )
+
+
 # ---------- Schema init (CREATE IF NOT EXISTS) ----------
 
 async def _has_extension(conn, name: str) -> bool:

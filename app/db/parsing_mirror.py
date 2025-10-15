@@ -175,6 +175,31 @@ async def get_clients_request_id_pg(inn: str, domain_1: Optional[str] = None) ->
         return int(row[0]) if row else None
 
 
+async def get_okved_main_pg(inn: str) -> Optional[str]:
+    """Возвращает последнее значение okved_main из POSTGRES.public.clients_requests."""
+
+    eng = _pg_engine()
+    if eng is None:
+        return None
+
+    sql = text(
+        """
+        SELECT okved_main
+        FROM public.clients_requests
+        WHERE inn = :inn
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+
+    async with eng.begin() as conn:
+        row = (await conn.execute(sql, {"inn": inn})).first()
+        if not row:
+            return None
+        value = row[0]
+        return str(value).strip() if value else None
+
+
 async def push_clients_request_pg(
     summary: dict,
     domain: Optional[str] = None,
@@ -396,3 +421,68 @@ async def pars_site_insert_chunks_pg(
             buf.clear()
 
     return inserted
+
+
+async def pars_site_update_metadata_pg(
+    *,
+    company_id: int,
+    domain_1: str,
+    description: Optional[str] = None,
+    vector_literal: Optional[str] = None,
+) -> None:
+    """Обновляет описание и/или вектор в последнем наборе pars_site основной БД."""
+
+    if not description and not vector_literal:
+        return
+
+    eng = _pg_engine()
+    if eng is None:
+        return
+
+    cols = await _get_pars_site_columns()
+    set_clauses: list[str] = []
+    params: dict[str, Any] = {
+        "company_id": company_id,
+        "domain": _normalize_domain(domain_1) or domain_1,
+    }
+
+    if description and "description" in cols:
+        set_clauses.append("description = :description")
+        params["description"] = description
+
+    if vector_literal is not None and "text_vector" in cols:
+        set_clauses.append(
+            "text_vector = CASE WHEN :vec IS NULL THEN NULL ELSE CAST(:vec AS vector) END"
+        )
+        params["vec"] = vector_literal
+
+    if not set_clauses:
+        return
+
+    sql = text(
+        f"""
+        WITH latest AS (
+            SELECT MAX(created_at) AS created_at
+            FROM public.pars_site
+            WHERE company_id = :company_id
+              AND LOWER(domain_1) = LOWER(:domain)
+        )
+        UPDATE public.pars_site AS ps
+        SET {', '.join(set_clauses)}
+        FROM latest
+        WHERE ps.company_id = :company_id
+          AND LOWER(ps.domain_1) = LOWER(:domain)
+          AND (latest.created_at IS NULL OR ps.created_at = latest.created_at)
+        """
+    )
+
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(sql, params)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "PG: не удалось обновить pars_site metadata (company_id=%s, domain=%s): %s",
+            company_id,
+            domain_1,
+            exc,
+        )
