@@ -97,7 +97,12 @@ async def fetch_home_via_scraperapi(
     if redirect_limit < 0:
         redirect_limit = 0
 
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+    follow_http_redirects = redirect_limit != 0
+    client_kwargs: dict[str, object] = {"timeout": 60, "follow_redirects": follow_http_redirects}
+    if follow_http_redirects:
+        client_kwargs["max_redirects"] = max(redirect_limit, 1)
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
         while True:
             params = dict(params_base, url=current_url)
             backoff = 1.0
@@ -110,8 +115,6 @@ async def fetch_home_via_scraperapi(
                         "https://api.scraperapi.com/",
                         params=params,
                         headers=headers,
-                        follow_redirects=True,
-                        max_redirects=redirect_limit,
                     )
                     if r.status_code != 200:
                         body = (r.text or "")[:400]
@@ -119,6 +122,8 @@ async def fetch_home_via_scraperapi(
                     html = r.text or ""
                     if len(html) < settings.PARSE_MIN_HTML_LEN:
                         raise FetchError("Ответ слишком короткий")
+
+                    current_url = str(r.url)
 
                     redirect_target = _extract_html_redirect_target(html, current_url)
                     if redirect_target:
