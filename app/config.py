@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     # === Scrape params (используются в services/scrape.py) ===
     PARSE_MAX_CHUNK_SIZE: int = 100_000
     PARSE_MIN_HTML_LEN: int = 100
+    PARSE_MAX_REDIRECTS: int = 5
 
     # Можно хранить CORS-настройки в .env (используются через getattr в app/main.py)
     CORS_ALLOW_ORIGINS: Optional[str] = None
