@@ -19,7 +19,6 @@ from app.db.bitrix import bitrix_session
 from app.db.parsing import (
     get_clients_request_id as get_clients_request_id_pd,
     get_domains_by_inn as get_domains_by_inn_pd,
-    pars_site_clear_domain,
     pars_site_insert_chunks as pars_site_insert_chunks_pd,
     pars_site_update_vector,
     push_clients_request as push_clients_request_pd,
@@ -28,7 +27,6 @@ from app.db.parsing_mirror import (
     get_clients_request_id_pg,
     get_domains_by_inn_pg,
     get_ib_clients_domains_pg,
-    pars_site_clear_domain_pg,
     pars_site_insert_chunks_pg,
     pars_site_update_metadata_pg,
     push_clients_request_pg,
@@ -358,6 +356,8 @@ async def _generate_site_description(
         embed_model=settings.embed_model,
         label=f"site:{inn}:{domain}",
     )
+    if description and not vector:
+        vector = await _embed_text(description, label=f"site-desc:{inn}:{domain}")
     return description, vector
 
 
@@ -888,7 +888,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             len(chunks_payload),
         )
 
-        inserted_pg = 0
+        written_chunks = len(chunks_payload)
         if chunks_payload:
             if payload.save_client_request:
                 summary_for_client = dict(summary_for_client_base)
@@ -993,50 +993,28 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                 )
 
             log.info(
-                "parse-site: очищаем предыдущие записи в POSTGRES.pars_site (company_id=%s, домен=%s)",
-                company_id_pg,
-                domain_for_pars,
-            )
-            await pars_site_clear_domain_pg(company_id=company_id_pg, domain_1=domain_for_pars)
-
-            log.info(
-                "parse-site: сохраняем чанки в POSTGRES.pars_site (company_id=%s, домен=%s, url=%s)",
+                "parse-site: обновляем pars_site в POSTGRES (company_id=%s, домен=%s, url=%s)",
                 company_id_pg,
                 domain_for_pars,
                 url_for_pars,
             )
-            inserted_pg = await pars_site_insert_chunks_pg(
+            await pars_site_insert_chunks_pg(
                 company_id=company_id_pg,
                 domain_1=domain_for_pars,
                 url=url_for_pars,
                 chunks=chunks_payload,
             )
             log.info(
-                "parse-site: вставлено чанков в POSTGRES.pars_site для %s → %s",
+                "parse-site: сохранено чанков в POSTGRES.pars_site для %s → %s",
                 domain_for_pars,
-                inserted_pg,
+                written_chunks,
             )
-            total_inserted += inserted_pg
+            total_inserted += written_chunks
 
             if company_id_pd:
-                log.info(
-                    "parse-site: очищаем предыдущие записи в parsing_data.pars_site (company_id=%s, домен=%s)",
-                    company_id_pd,
-                    domain_for_pars,
-                )
-                try:
-                    await pars_site_clear_domain(
-                        company_id=company_id_pd,
-                        domain_1=domain_for_pars,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    if not mirror_failed_logged:
-                        log.warning("mirror parsing_data failed для очистки pars_site (ИНН %s): %s", inn, e)
-                        mirror_failed_logged = True
-
                 try:
                     log.info(
-                        "parse-site: сохраняем чанки в parsing_data.pars_site (company_id=%s, домен=%s, url=%s)",
+                        "parse-site: обновляем parsing_data.pars_site (company_id=%s, домен=%s, url=%s)",
                         company_id_pd,
                         domain_for_pars,
                         url_for_pars,
@@ -1053,8 +1031,9 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                         mirror_failed_logged = True
                 else:
                     log.info(
-                        "parse-site: чанки записаны в parsing_data.pars_site для %s",
+                        "parse-site: чанки записаны в parsing_data.pars_site для %s → %s",
                         domain_for_pars,
+                        written_chunks,
                     )
 
         if (description or vector_literal) and company_id_pg:
@@ -1075,7 +1054,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             requested_domain=domain_candidate,
             used_domain=domain_for_pars,
             url=url_for_pars,
-            chunks_inserted=inserted_pg,
+            chunks_inserted=written_chunks,
             success=True,
             error=None,
             description=description,
@@ -1089,7 +1068,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         log.info(
             "parse-site: домен %s обработан успешно (чанков=%s)",
             domain_candidate,
-            inserted_pg,
+            written_chunks,
         )
 
     if not successes:

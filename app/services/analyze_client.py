@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 from typing import Any, Optional
 
@@ -17,6 +18,8 @@ _RETRY_BASE_DELAY = 0.5
 
 _client_pool: dict[str, httpx.AsyncClient] = {}
 _client_lock = asyncio.Lock()
+
+_SECTION_RE = re.compile(r"\[(?P<name>[A-Z_]+)\]\s*=\s*\[(?P<value>.*?)\]", re.IGNORECASE | re.DOTALL)
 
 
 def _normalize_base(url: Optional[str]) -> Optional[str]:
@@ -79,6 +82,19 @@ def _coerce_vector(value: Any) -> Optional[list[float]]:
         except (TypeError, ValueError):
             continue
     return result or None
+
+
+def _extract_sections(answer: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if not answer:
+        return result
+
+    for match in _SECTION_RE.finditer(answer):
+        name = match.group("name").upper()
+        value = match.group("value").strip()
+        if value:
+            result[name] = value
+    return result
 
 
 async def _post_with_retries(
@@ -175,7 +191,34 @@ async def fetch_site_description(
             if isinstance(description_raw, str) and description_raw.strip()
             else None
         )
-        vector = _coerce_vector(data.get("description_vector"))
+        vector = _coerce_vector(
+            data.get("description_vector")
+            or data.get("vector")
+            or data.get("description_embedding")
+        )
+
+        if not description:
+            answer_raw = data.get("answer") or data.get("raw_answer") or data.get("result")
+            if isinstance(answer_raw, str):
+                sections = _extract_sections(answer_raw)
+                maybe_description = sections.get("DESCRIPTION")
+                if maybe_description:
+                    description = maybe_description
+
+        if vector is None:
+            literal = data.get("description_vector_literal") or data.get("vector_literal")
+            if isinstance(literal, str):
+                vector = _coerce_vector(literal)
+
+        if vector is None:
+            sections = None
+            answer_raw = data.get("answer") or data.get("raw_answer") or data.get("result")
+            if isinstance(answer_raw, str):
+                sections = sections or _extract_sections(answer_raw)
+            if sections:
+                literal = sections.get("DESCRIPTION_VECTOR") or sections.get("VECTOR")
+                if literal:
+                    vector = _coerce_vector(literal)
         if description:
             log.info(
                 "analyze-client: описание получено (%s, base=%s, vector=%s)",
@@ -217,7 +260,11 @@ async def fetch_embedding(text: str, *, label: str) -> Optional[list[float]]:
         except ValueError:  # noqa: BLE001
             log.warning("analyze-client: embedding ответ не-JSON (%s @ %s)", label, base)
             continue
-        vector = _coerce_vector(data.get("embedding"))
+        vector = _coerce_vector(
+            data.get("embedding")
+            or data.get("vector")
+            or data.get("description_vector")
+        )
         if vector:
             log.info(
                 "analyze-client: embedding получен (%s, base=%s, size=%s)",
