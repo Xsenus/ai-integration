@@ -1471,10 +1471,53 @@ async def parse_site_by_inn(
         regex=r"^\d+$",
         description="ИНН компании, для которой нужно подтянуть домен",
     ),
+    parse_domain: str | None = Query(
+        None,
+        description="Одиночный домен или URL (например, 'uniconf.ru' или 'https://uniconf.ru').",
+    ),
+    parse_domains: list[str] | None = Query(
+        None,
+        description="Список доменов/URL для парсинга. Переданные значения дополняются доменами из БД.",
+    ),
+    parse_emails: list[str] | None = Query(
+        None,
+        description="Список email-адресов. Домены из них будут использованы как кандидаты для парсинга.",
+    ),
+    company_name: str | None = Query(
+        None,
+        description="Название компании; если не задано — подтянем из своей БД (DaDataResult)",
+    ),
+    client_domain_1: str | None = Query(
+        None,
+        description="clients_requests.domain_1; если не задано — 'www.{первый_домен}'",
+    ),
+    pars_site_domain_1: str | None = Query(
+        None,
+        description="pars_site.domain_1; если не задано — домен без 'www.'",
+    ),
+    url_override: str | None = Query(
+        None,
+        description="pars_site.url; если не задано — главная страница",
+    ),
+    save_client_request: bool = Query(
+        True,
+        description="Создавать запись в clients_requests (по умолчанию — да)",
+    ),
     session: AsyncSession = Depends(get_bitrix_session),
 ):
     log.info("parse-site GET: получен запрос по ИНН %s", inn)
-    payload = ParseSiteRequest(inn=inn)
+    payload = ParseSiteRequest(
+        inn=inn,
+        parse_domain=parse_domain,
+        parse_domains=parse_domains or None,
+        parse_emails=parse_emails or None,
+        company_name=company_name,
+        client_domain_1=client_domain_1,
+        pars_site_domain_1=pars_site_domain_1,
+        url_override=url_override,
+        save_client_request=save_client_request,
+    )
+    log.info("parse-site GET: подготовлен payload %s", payload.model_dump())
     response = await _parse_site_impl(payload, session)
     log.info("parse-site GET: завершено для ИНН %s → %s", inn, response.model_dump())
     return response
