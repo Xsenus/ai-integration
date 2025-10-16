@@ -207,21 +207,30 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         goods_embeddings_generated = len(goods_embed_targets)
         for row, vector in zip(goods_embed_targets, goods_vectors):
             row.vector = vector
+    else:
+        log.info("ib-match: goods embeddings already exist — skipping regeneration")
     if equipment_embed_targets:
         log.info("ib-match: generating %s equipment embeddings", len(equipment_embed_targets))
         equipment_vectors = await _embed_and_update_rows(equipment_embed_targets)
         equipment_embeddings_generated = len(equipment_embed_targets)
         for row, vector in zip(equipment_embed_targets, equipment_vectors):
             row.vector = vector
+    else:
+        log.info("ib-match: equipment embeddings already exist — skipping regeneration")
 
     goods_matches, goods_updates = _match_rows(goods_rows, ib_goods)
-    equipment_matches, equipment_updates = _match_rows(equipment_rows, ib_equipment)
+    equipment_matches, equipment_updates = _match_rows(
+        equipment_rows, ib_equipment
+    )
     log.info(
         "ib-match: prepared %s goods updates and %s equipment updates for client_id=%s",
         len(goods_updates),
         len(equipment_updates),
         client_id,
     )
+
+    goods_vectors_persisted = 0
+    equipment_vectors_persisted = 0
 
     async with engine.begin() as conn:
         if goods_embed_targets:
@@ -235,11 +244,16 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             for row in goods_embed_targets:
                 literal = _vector_to_literal(row.vector)
                 if literal is None:
+                    log.warning(
+                        "ib-match: skipping goods vector update for id=%s — empty vector",
+                        row.ai_id,
+                    )
                     continue
                 await conn.execute(
                     update_vec_goods_sql,
                     {"id": row.ai_id, "vec": literal},
                 )
+                goods_vectors_persisted += 1
         if equipment_embed_targets:
             update_vec_equipment_sql = text(
                 """
@@ -251,11 +265,16 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             for row in equipment_embed_targets:
                 literal = _vector_to_literal(row.vector)
                 if literal is None:
+                    log.warning(
+                        "ib-match: skipping equipment vector update for id=%s — empty vector",
+                        row.ai_id,
+                    )
                     continue
                 await conn.execute(
                     update_vec_equipment_sql,
                     {"id": row.ai_id, "vec": literal},
                 )
+                equipment_vectors_persisted += 1
         if goods_updates:
             update_goods_sql = text(
                 """
@@ -279,11 +298,19 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             for payload in equipment_updates:
                 await conn.execute(update_equipment_sql, payload)
     log.info(
-        "ib-match: database updates applied for client_id=%s", client_id
+        "ib-match: database updates applied for client_id=%s (goods_vectors=%s, equipment_vectors=%s, goods_matches=%s, equipment_matches=%s)",
+        client_id,
+        goods_vectors_persisted,
+        equipment_vectors_persisted,
+        len(goods_updates),
+        len(equipment_updates),
     )
 
     goods_updated = len(goods_updates)
     equipment_updated = len(equipment_updates)
+
+    _log_match_details("goods", goods_matches)
+    _log_match_details("equipment", equipment_matches)
 
     report_text = _build_report(
         client_id=client_id,
@@ -503,6 +530,7 @@ def _match_rows(
             )
             continue
         rounded_score = round(best_score, 4)
+        rounded_score_db = round(best_score, 2)
         matches.append(
             MatchResult(
                 ai_id=row.ai_id,
@@ -517,10 +545,33 @@ def _match_rows(
             {
                 "id": row.ai_id,
                 "match_id": best_id,
-                "score": round(best_score, 4),
+                "score": rounded_score_db,
             }
         )
     return matches, updates
+
+
+def _log_match_details(entity: str, matches: Sequence[MatchResult]) -> None:
+    for match in matches:
+        if match.match_ib_id is not None and match.score is not None:
+            log.info(
+                "ib-match: %s id=%s '%s' → ib_id=%s '%s' score=%.4f",
+                entity,
+                match.ai_id,
+                _clip(match.text),
+                match.match_ib_id,
+                _clip(match.match_ib_name or ""),
+                match.score,
+            )
+        else:
+            reason = match.note or "нет соответствия"
+            log.info(
+                "ib-match: %s id=%s '%s' → — (%s)",
+                entity,
+                match.ai_id,
+                _clip(match.text),
+                reason,
+            )
 
 
 def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
@@ -563,6 +614,15 @@ def _parse_pgvector(value: Any) -> Optional[List[float]]:
         return [float(part) for part in text.split(",") if part.strip()]
     except ValueError:
         return None
+
+
+def _clip(value: Optional[str], *, limit: int = 80) -> str:
+    if not value:
+        return ""
+    value = value.replace("\n", " ")
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
 
 
 def _vector_to_literal(vector: Optional[Sequence[float]]) -> Optional[str]:
@@ -618,14 +678,16 @@ def _build_report(
         f"[INFO] В справочнике ib_equipment: {len(ib_equipment)} позиций с валидными векторами."
     )
     lines.append("")
-    if goods_embeddings_generated:
-        lines.append(f"[EMBED] Генерируем эмбеддинги для goods_types: {goods_embeddings_generated}")
-    else:
-        lines.append("[EMBED] Эмбеддинги для goods_types не требуются (все присутствуют).")
-    if equipment_embeddings_generated:
-        lines.append(f"[EMBED] Генерируем эмбеддинги для equipment: {equipment_embeddings_generated}")
-    else:
-        lines.append("[EMBED] Эмбеддинги для equipment не требуются (все присутствуют).")
+    lines.append(
+        _format_embedding_line(
+            "goods_types", goods_embeddings_generated, len(goods_rows)
+        )
+    )
+    lines.append(
+        _format_embedding_line(
+            "equipment", equipment_embeddings_generated, len(equipment_rows)
+        )
+    )
 
     lines.append("")
     lines.append("=" * _BORDER_WIDTH)
@@ -643,11 +705,11 @@ def _build_report(
             rows=[
                 [
                     match.ai_id,
-                    match.text,
-                    match.match_ib_id if match.match_ib_id is not None else "",
-                    match.match_ib_name or "",
-                    f"{match.score:.4f}" if match.score is not None else "",
-                    match.note,
+                    match.text.replace("\n", " "),
+                    match.match_ib_id if match.match_ib_id is not None else "—",
+                    match.match_ib_name or "—",
+                    f"{match.score:.4f}" if match.score is not None else "—",
+                    match.note or "",
                 ]
                 for match in goods_matches
             ],
@@ -671,11 +733,11 @@ def _build_report(
             rows=[
                 [
                     match.ai_id,
-                    match.text,
-                    match.match_ib_id if match.match_ib_id is not None else "",
-                    match.match_ib_name or "",
-                    f"{match.score:.4f}" if match.score is not None else "",
-                    match.note,
+                    match.text.replace("\n", " "),
+                    match.match_ib_id if match.match_ib_id is not None else "—",
+                    match.match_ib_name or "—",
+                    f"{match.score:.4f}" if match.score is not None else "—",
+                    match.note or "",
                 ]
                 for match in equipment_matches
             ],
@@ -701,6 +763,11 @@ def _build_report(
                 lines.append(
                     f"  ai_site_goods_types(id={match.ai_id}): '{match.text}' → ib_goods_types '{match.match_ib_name}' (score={match.score:.4f})"
                 )
+            else:
+                reason = match.note or "нет соответствия"
+                lines.append(
+                    f"  ai_site_goods_types(id={match.ai_id}): '{match.text}' → — ({reason})"
+                )
     if equipment_matches:
         lines.append("")
         lines.append("[ПОДБОР EQUIPMENT] Наиболее релевантные соответствия:")
@@ -709,8 +776,20 @@ def _build_report(
                 lines.append(
                     f"  ai_site_equipment(id={match.ai_id}): '{match.text}' → ib_equipment '{match.match_ib_name}' (score={match.score:.4f})"
                 )
+            else:
+                reason = match.note or "нет соответствия"
+                lines.append(
+                    f"  ai_site_equipment(id={match.ai_id}): '{match.text}' → — ({reason})"
+                )
 
     return "\n".join(lines)
+
+
+def _format_embedding_line(kind: str, generated: int, total: int) -> str:
+    base = f"[EMBED] Генерируем эмбеддинги для {kind}: {generated} из {total}"
+    if generated:
+        return base
+    return base + " (эмбеддинги не требуются)"
 
 
 def _format_table(*, headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> List[str]:
