@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import httpx
 from fastapi import APIRouter, HTTPException, status
@@ -35,7 +37,12 @@ router = APIRouter(prefix="/v1", tags=["analyze-json"])
 _http_client: httpx.AsyncClient | None = None
 _http_client_lock = asyncio.Lock()
 
+_TABLE_COLUMNS_CACHE: dict[str, set[str]] = {}
+
 _TEXT_PREVIEW_LIMIT = 400
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
+_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _LARGE_VECTOR_KEYS = {
     "description_vector",
     "text_vector",
@@ -60,6 +67,29 @@ _LARGE_TEXT_KEYS = {
 _DOMAIN_SPLIT_RE = re.compile(r"[\s,;]+")
 
 
+def _extract_llm_answer(payload: Any) -> Optional[str]:
+    """Достаёт исходный ответ модели из различных блоков ответа сервиса."""
+
+    if isinstance(payload, Mapping):
+        answer = payload.get("answer_raw")
+        if isinstance(answer, str) and answer.strip():
+            return answer.strip()
+
+        parsed = payload.get("parsed")
+        if isinstance(parsed, Mapping):
+            candidate = parsed.get("LLM_ANSWER") or parsed.get("answer")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        db_payload = payload.get("db_payload")
+        if isinstance(db_payload, Mapping):
+            candidate = db_payload.get("llm_answer")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+    return None
+
+
 def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Готовит компактное представление тела запроса для логов."""
 
@@ -81,6 +111,33 @@ def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         else:
             summary[key] = value
     return summary
+
+
+async def _get_table_columns(
+    conn: AsyncConnection,
+    table_name: str,
+    schema: str = "public",
+) -> set[str]:
+    """Возвращает набор колонок таблицы, кэшируя результат между вызовами."""
+
+    cache_key = f"{schema}.{table_name}"
+    cached = _TABLE_COLUMNS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = await conn.execute(
+        text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = :table
+            """
+        ),
+        {"schema": schema, "table": table_name},
+    )
+    columns = {row[0] for row in result}
+    _TABLE_COLUMNS_CACHE[cache_key] = columns
+    return columns
 
 
 def _sanitize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -280,40 +337,99 @@ def _normalize_catalog_vector(value: Any) -> Any:
     return value
 
 
-def _format_catalog_vector(value: Any) -> Optional[Any]:
-    """Подготавливает представление вектора каталога для внешнего API."""
+def _vector_values_to_literal(values: Sequence[float]) -> str:
+    """Возвращает строковое представление вектора в формате pgvector."""
+
+    return json.dumps(list(values), ensure_ascii=False, separators=(",", ":"))
+
+
+def _build_catalog_vector_payload(value: Any) -> Optional[dict[str, Any]]:
+    """Формирует структуру CatalogVector c literal и values, если возможно."""
 
     if value is None:
         return None
 
-    if isinstance(value, (list, tuple)):
-        formatted_values: list[float] = []
+    literal: Optional[str] = None
+    values: list[float] | None = None
+
+    if isinstance(value, Mapping):
+        raw_literal = value.get("literal") or value.get("vec") or value.get("text")
+        if isinstance(raw_literal, str):
+            candidate = raw_literal.strip()
+            literal = candidate or None
+        raw_values = value.get("values") or value.get("data") or value.get("vector")
+        if isinstance(raw_values, (list, tuple)):
+            values = []
+            for part in raw_values:
+                try:
+                    values.append(float(part))
+                except Exception:  # noqa: BLE001
+                    continue
+            if not values:
+                values = None
+    elif isinstance(value, (list, tuple)):
+        values = []
         for part in value:
             try:
-                formatted_values.append(float(part))
+                values.append(float(part))
             except Exception:  # noqa: BLE001
                 continue
-        return formatted_values or None
-
-    if isinstance(value, str):
-        literal = value.strip()
-        return literal or None
-
-    try:
-        numeric = float(value)
-    except Exception:  # noqa: BLE001
+        if not values:
+            values = None
+    elif isinstance(value, str):
+        literal_candidate = value.strip()
+        literal = literal_candidate or None
         try:
-            literal = str(value).strip()
+            parsed = json.loads(value)
         except Exception:  # noqa: BLE001
-            return None
-        return literal or None
-    return [numeric]
+            parsed = None
+        if isinstance(parsed, list):
+            values = []
+            for part in parsed:
+                try:
+                    values.append(float(part))
+                except Exception:  # noqa: BLE001
+                    continue
+            if not values:
+                values = None
+    else:
+        try:
+            numeric = float(value)
+        except Exception:  # noqa: BLE001
+            try:
+                literal_candidate = str(value).strip()
+            except Exception:  # noqa: BLE001
+                literal_candidate = ""
+            literal = literal_candidate or None
+        else:
+            values = [numeric]
+
+    if values:
+        literal = literal or _vector_values_to_literal(values)
+    if literal:
+        payload: dict[str, Any] = {"literal": literal}
+        if values:
+            payload["values"] = values
+        return payload
+    if values:
+        return {"values": values}
+    return None
+
+
+def _prepare_text_for_external(text: str) -> str:
+    """Удаляет управляющие символы и лишние пробелы перед отправкой во внешний сервис."""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _CONTROL_CHAR_RE.sub(" ", normalized)
+    normalized = _MULTI_SPACE_RE.sub(" ", normalized)
+    normalized = _MULTI_NEWLINE_RE.sub("\n\n", normalized)
+    return normalized.strip()
 
 
 def _prepare_catalog_payload(
     catalog: Iterable[Mapping[str, Any]]
-) -> Optional[list[dict[str, Any]]]:
-    """Формирует структуру каталога в формате, ожидаемом внешним API."""
+) -> Optional[dict[str, Any]]:
+    """Формирует структуру каталога в формате CatalogItemsPayload."""
 
     items: list[dict[str, Any]] = []
     for item in catalog:
@@ -331,7 +447,7 @@ def _prepare_catalog_payload(
             except Exception:  # noqa: BLE001
                 prepared["id"] = item_id
 
-        vec_payload = _format_catalog_vector(item.get("vec"))
+        vec_payload = _build_catalog_vector_payload(item.get("vec"))
         if vec_payload is not None:
             prepared["vec"] = vec_payload
 
@@ -340,7 +456,7 @@ def _prepare_catalog_payload(
     if not items:
         return None
 
-    return items
+    return {"items": items}
 
 
 async def _load_catalog(
@@ -889,6 +1005,7 @@ def _sanitize_catalog_items(
     name_keys: Iterable[str],
     id_keys: Iterable[str],
     score_keys: Iterable[str],
+    text_keys: Iterable[str] = ("text",),
 ) -> list[dict[str, Any]]:
     """Сокращает описание элементов каталога, убирая векторы и служебные поля."""
 
@@ -900,20 +1017,34 @@ def _sanitize_catalog_items(
         if isinstance(raw_item, str):
             candidate = raw_item.strip()
             if candidate:
-                sanitized_items.append({"name": candidate})
+                sanitized_items.append({"name": candidate, "text": candidate})
             continue
         if not isinstance(raw_item, Mapping):
             continue
         name_value: Optional[str] = None
+        text_value: Optional[str] = None
+        for key in text_keys:
+            candidate = raw_item.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                text_value = candidate.strip()
+                break
         for key in name_keys:
             candidate = raw_item.get(key)
             if isinstance(candidate, str) and candidate.strip():
                 name_value = candidate.strip()
                 break
         if not name_value:
+            name_value = text_value
+        if not name_value:
             continue
 
         item_payload: dict[str, Any] = {"name": name_value}
+        if text_value:
+            item_payload["text"] = text_value
+        elif isinstance(raw_item.get("text"), str):
+            stripped = raw_item["text"].strip()
+            if stripped:
+                item_payload["text"] = stripped
 
         for key in id_keys:
             candidate_id = raw_item.get(key)
@@ -951,6 +1082,7 @@ def _sanitize_db_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 name_keys=("name", "goods_type"),
                 id_keys=("match_id", "id", "goods_type_id", "goods_type_ID"),
                 score_keys=("score", "goods_types_score", "match_score"),
+                text_keys=("text", "goods_type"),
             )
             continue
         if key in {"equipment", "equipment_site"}:
@@ -959,6 +1091,7 @@ def _sanitize_db_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 name_keys=("name", "equipment"),
                 id_keys=("match_id", "id", "equipment_id", "equipment_ID"),
                 score_keys=("score", "equipment_score", "match_score"),
+                text_keys=("text", "equipment"),
             )
             continue
         if key == "prodclass" and isinstance(value, Mapping):
@@ -1038,6 +1171,26 @@ async def _apply_db_payload(
     vector_literal = _vector_to_literal(payload.get("description_vector")) if vector_present else None
 
     async with engine.begin() as conn:
+        prodclass_row: Optional[dict[str, Any]] = None
+        prodclass_stale_ids: list[int] = []
+        prodclass_columns = await _get_table_columns(conn, "ai_site_prodclass")
+        prodclass_has_created_at = "created_at" in prodclass_columns
+        result = await conn.execute(
+            text(
+                """
+                SELECT id, prodclass, prodclass_score
+                FROM public.ai_site_prodclass
+                WHERE text_pars_id = :pid
+                ORDER BY id ASC
+                """
+            ),
+            {"pid": snapshot.pars_id},
+        )
+        prodclass_rows = [dict(row) for row in result.mappings().all()]
+        prodclass_stale_ids = [row.get("id") for row in prodclass_rows[:-1] if row.get("id") is not None]
+        if prodclass_rows:
+            prodclass_row = prodclass_rows[-1]
+
         if description_present and "description" in cols:
             update_sql = "UPDATE public.pars_site SET description = :description WHERE id = :id"
             log.info(
@@ -1067,13 +1220,6 @@ async def _apply_db_payload(
             await conn.execute(statement, {"vec": vector_literal, "id": snapshot.pars_id})
 
         if "prodclass" in payload:
-            delete_prodclass_sql = "DELETE FROM public.ai_site_prodclass WHERE text_pars_id = :pid"
-            log.info(
-                "analyze-json: clearing public.ai_site_prodclass for pars_id=%s using SQL: %s",
-                snapshot.pars_id,
-                delete_prodclass_sql,
-            )
-            await conn.execute(text(delete_prodclass_sql), {"pid": snapshot.pars_id})
             raw_prod = payload.get("prodclass")
             if isinstance(raw_prod, dict):
                 candidate_prodclass_id = _safe_int(
@@ -1084,47 +1230,237 @@ async def _apply_db_payload(
                 candidate_prodclass_score = _normalize_score(
                     raw_prod.get("score") or raw_prod.get("prodclass_score")
                 )
-                if candidate_prodclass_id is not None:
-                    if await _prodclass_exists(conn, candidate_prodclass_id):
+                if candidate_prodclass_id is None:
+                    log.info(
+                        "analyze-json: prodclass payload missing ID — keeping existing value (pars_id=%s)",
+                        snapshot.pars_id,
+                    )
+                elif not await _prodclass_exists(conn, candidate_prodclass_id):
+                    log.warning(
+                        "analyze-json: skipping prodclass update due to missing ib_prodclass entry (pars_id=%s, prodclass=%s)",
+                        snapshot.pars_id,
+                        candidate_prodclass_id,
+                    )
+                else:
+                    score_to_use = candidate_prodclass_score
+                    if prodclass_row is not None and score_to_use is None:
+                        score_to_use = _normalize_score(prodclass_row.get("prodclass_score"))
+
+                    if prodclass_row is None:
                         insert_prodclass_sql = (
                             "INSERT INTO public.ai_site_prodclass "
                             "(text_pars_id, prodclass, prodclass_score) "
-                            "VALUES (:pid, :prodclass, :score)"
+                            "VALUES (:pid, :prodclass, :score) RETURNING id"
                         )
                         log.info(
                             "analyze-json: inserting prodclass (pars_id=%s, prodclass=%s, score=%s) using SQL: %s",
                             snapshot.pars_id,
                             candidate_prodclass_id,
-                            candidate_prodclass_score,
+                            score_to_use,
                             insert_prodclass_sql,
                         )
-                        await conn.execute(
+                        insert_result = await conn.execute(
                             text(insert_prodclass_sql),
                             {
                                 "pid": snapshot.pars_id,
                                 "prodclass": candidate_prodclass_id,
-                                "score": candidate_prodclass_score,
+                                "score": score_to_use,
                             },
                         )
-                        prodclass_id = candidate_prodclass_id
-                        prodclass_score = candidate_prodclass_score
+                        prodclass_row = {
+                            "id": insert_result.scalar_one(),
+                            "prodclass": candidate_prodclass_id,
+                            "prodclass_score": score_to_use,
+                        }
                     else:
-                        log.warning(
-                            "analyze-json: skipping prodclass insert due to missing ib_prodclass entry (pars_id=%s, prodclass=%s)",
+                        update_prodclass_sql = (
+                            "UPDATE public.ai_site_prodclass "
+                            "SET prodclass = :prodclass, prodclass_score = :score"
+                        )
+                        if prodclass_has_created_at:
+                            update_prodclass_sql += ", created_at = TIMEZONE('UTC', now())"
+                        update_prodclass_sql += " WHERE id = :row_id"
+                        log.info(
+                            "analyze-json: updating prodclass (pars_id=%s, prodclass=%s, score=%s) using SQL: %s",
                             snapshot.pars_id,
                             candidate_prodclass_id,
+                            score_to_use,
+                            update_prodclass_sql,
                         )
+                        await conn.execute(
+                            text(update_prodclass_sql),
+                            {
+                                "row_id": prodclass_row.get("id"),
+                                "prodclass": candidate_prodclass_id,
+                                "score": score_to_use,
+                            },
+                        )
+                        prodclass_row = {
+                            "id": prodclass_row.get("id"),
+                            "prodclass": candidate_prodclass_id,
+                            "prodclass_score": score_to_use,
+                        }
+            else:
+                log.warning(
+                    "analyze-json: unexpected prodclass payload type (%s) — keeping existing value (pars_id=%s)",
+                    type(raw_prod),
+                    snapshot.pars_id,
+                )
+
+        if prodclass_row is not None:
+            prodclass_id = _safe_int(prodclass_row.get("prodclass"))
+            prodclass_score = _normalize_score(prodclass_row.get("prodclass_score"))
+
+        if prodclass_stale_ids:
+            delete_sql = "DELETE FROM public.ai_site_prodclass WHERE id = :row_id"
+            for stale_id in prodclass_stale_ids:
+                log.info(
+                    "analyze-json: deleting stale prodclass row (pars_id=%s, row_id=%s) using SQL: %s",
+                    snapshot.pars_id,
+                    stale_id,
+                    delete_sql,
+                )
+                await conn.execute(text(delete_sql), {"row_id": stale_id})
 
         if "goods_types" in payload:
-            delete_goods_sql = "DELETE FROM public.ai_site_goods_types WHERE text_par_id = :pid"
-            log.info(
-                "analyze-json: clearing public.ai_site_goods_types for pars_id=%s using SQL: %s",
-                snapshot.pars_id,
-                delete_goods_sql,
-            )
-            await conn.execute(text(delete_goods_sql), {"pid": snapshot.pars_id})
             goods_items = payload.get("goods_types")
+            normalized_goods: list[dict[str, Any]] = []
             if isinstance(goods_items, list):
+                for item in goods_items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = (
+                        item.get("name")
+                        or item.get("goods_type")
+                        or item.get("text")
+                        or ""
+                    ).strip()
+                    if not name:
+                        continue
+                    match_id = _safe_int(
+                        item.get("match_id") or item.get("id") or item.get("goods_type_ID")
+                    )
+                    score = _normalize_score(item.get("match_score") or item.get("score"))
+                    vec_literal = _vector_to_literal(item.get("vector") or item.get("text_vector"))
+                    normalized_goods.append(
+                        {
+                            "name": name,
+                            "match_id": match_id,
+                            "score": score,
+                            "vec": vec_literal,
+                        }
+                    )
+
+            if not normalized_goods:
+                log.info(
+                    "analyze-json: goods payload empty — existing rows remain untouched (pars_id=%s)",
+                    snapshot.pars_id,
+                )
+            else:
+                result = await conn.execute(
+                    text(
+                        """
+                        SELECT id, goods_type, goods_type_ID AS goods_type_id, goods_types_score
+                        FROM public.ai_site_goods_types
+                        WHERE text_par_id = :pid
+                        ORDER BY id
+                        """
+                    ),
+                    {"pid": snapshot.pars_id},
+                )
+                existing_goods = [dict(row) for row in result.mappings().all()]
+                rows_by_pk: dict[int, dict[str, Any]] = {
+                    row["id"]: row for row in existing_goods if row.get("id") is not None
+                }
+                existing_ids = set(rows_by_pk)
+
+                goods_by_id: dict[int, list[int]] = defaultdict(list)
+                goods_by_name: dict[str, list[int]] = defaultdict(list)
+                for row in existing_goods:
+                    row_id = row.get("id")
+                    if row_id is None:
+                        continue
+                    match_id = row.get("goods_type_id")
+                    if match_id is not None:
+                        goods_by_id[match_id].append(row_id)
+                    name_key = (row.get("goods_type") or "").strip().lower()
+                    if name_key:
+                        goods_by_name[name_key].append(row_id)
+
+                def consume_goods_row(row_id: int) -> Optional[dict[str, Any]]:
+                    row = rows_by_pk.get(row_id)
+                    if row is None:
+                        return None
+
+                    match_id_val = row.get("goods_type_id")
+                    if match_id_val is not None:
+                        id_candidates = goods_by_id.get(match_id_val)
+                        if id_candidates:
+                            try:
+                                id_candidates.remove(row_id)
+                            except ValueError:
+                                pass
+                            if not id_candidates:
+                                goods_by_id.pop(match_id_val, None)
+
+                    name_key_val = (row.get("goods_type") or "").strip().lower()
+                    if name_key_val:
+                        name_candidates = goods_by_name.get(name_key_val)
+                        if name_candidates:
+                            try:
+                                name_candidates.remove(row_id)
+                            except ValueError:
+                                pass
+                            if not name_candidates:
+                                goods_by_name.pop(name_key_val, None)
+
+                    return row
+
+                def pop_goods_by_id(match_id_val: int, normalized_name: str) -> Optional[dict[str, Any]]:
+                    candidates = goods_by_id.get(match_id_val)
+                    if not candidates:
+                        return None
+
+                    selected_row_id: Optional[int] = None
+                    if normalized_name:
+                        for idx, candidate_row_id in enumerate(list(candidates)):
+                            candidate_row = rows_by_pk.get(candidate_row_id)
+                            if candidate_row is None:
+                                continue
+                            candidate_name = (candidate_row.get("goods_type") or "").strip().lower()
+                            if candidate_name == normalized_name:
+                                selected_row_id = candidates.pop(idx)
+                                break
+
+                    if selected_row_id is None:
+                        selected_row_id = candidates.pop(0)
+
+                    if not candidates:
+                        goods_by_id.pop(match_id_val, None)
+
+                    return consume_goods_row(selected_row_id)
+
+                def pop_goods_by_name(normalized_name: str) -> Optional[dict[str, Any]]:
+                    if not normalized_name:
+                        return None
+
+                    candidates = goods_by_name.get(normalized_name)
+                    if not candidates:
+                        return None
+
+                    row_id = candidates.pop(0)
+                    if not candidates:
+                        goods_by_name.pop(normalized_name, None)
+
+                    return consume_goods_row(row_id)
+
+                log.info(
+                    "analyze-json: syncing goods payload (pars_id=%s, incoming=%s, existing=%s)",
+                    snapshot.pars_id,
+                    len(normalized_goods),
+                    len(existing_goods),
+                )
+
                 insert_sql = text(
                     """
                     INSERT INTO public.ai_site_goods_types
@@ -1133,45 +1469,235 @@ async def _apply_db_payload(
                         (:pid, :name, :score, :match_id,
                          CASE WHEN :vec IS NULL THEN NULL ELSE CAST(:vec AS vector) END)
                     """
+                ).bindparams(bindparam("vec", type_=Text()))
+                update_sql_with_vec = text(
+                    """
+                    UPDATE public.ai_site_goods_types
+                    SET goods_type = :name,
+                        goods_types_score = :score,
+                        goods_type_ID = :match_id,
+                        text_vector = CASE WHEN :vec IS NULL THEN NULL ELSE CAST(:vec AS vector) END
+                    WHERE id = :row_id
+                    """
+                ).bindparams(bindparam("vec", type_=Text()))
+                update_sql_no_vec = text(
+                    """
+                    UPDATE public.ai_site_goods_types
+                    SET goods_type = :name,
+                        goods_types_score = :score,
+                        goods_type_ID = :match_id
+                    WHERE id = :row_id
+                    """
                 )
-                for item in goods_items:
-                    if not isinstance(item, dict):
-                        continue
-                    name = (item.get("name") or item.get("goods_type") or "").strip()
-                    if not name:
-                        continue
-                    match_id = _safe_int(item.get("match_id") or item.get("id") or item.get("goods_type_ID"))
-                    score = _normalize_score(item.get("match_score") or item.get("score"))
-                    vec_literal = _vector_to_literal(item.get("vector") or item.get("text_vector"))
-                    log.info(
-                        "analyze-json: inserting goods_type (pars_id=%s, name=%s, match_id=%s, score=%s)",
-                        snapshot.pars_id,
-                        name,
-                        match_id,
-                        score,
-                    )
-                    await conn.execute(
-                        insert_sql,
-                        {
-                            "pid": snapshot.pars_id,
+
+                processed_ids: set[int] = set()
+                for item in normalized_goods:
+                    name = item["name"]
+                    name_key = name.lower()
+                    match_id = item["match_id"]
+                    score = item["score"]
+                    vec_literal = item["vec"]
+
+                    existing_row: Optional[dict[str, Any]] = None
+                    if match_id is not None:
+                        existing_row = pop_goods_by_id(match_id, name_key)
+                    if existing_row is None:
+                        existing_row = pop_goods_by_name(name_key)
+
+                    score_to_use = score
+                    if existing_row is not None:
+                        processed_ids.add(existing_row["id"])
+                        if score_to_use is None:
+                            score_to_use = _normalize_score(existing_row.get("goods_types_score"))
+                        statement = update_sql_with_vec if vec_literal is not None else update_sql_no_vec
+                        params = {
+                            "row_id": existing_row["id"],
                             "name": name,
-                            "score": score,
+                            "score": score_to_use,
                             "match_id": match_id,
-                            "vec": vec_literal,
-                        },
-                    )
+                        }
+                        if vec_literal is not None:
+                            params["vec"] = vec_literal
+                        log.info(
+                            "analyze-json: updating goods_type (pars_id=%s, row_id=%s, name=%s, match_id=%s, score=%s)",
+                            snapshot.pars_id,
+                            existing_row["id"],
+                            name,
+                            match_id,
+                            score_to_use,
+                        )
+                        await conn.execute(statement, params)
+                    else:
+                        log.info(
+                            "analyze-json: inserting goods_type (pars_id=%s, name=%s, match_id=%s, score=%s)",
+                            snapshot.pars_id,
+                            name,
+                            match_id,
+                            score,
+                        )
+                        await conn.execute(
+                            insert_sql,
+                            {
+                                "pid": snapshot.pars_id,
+                                "name": name,
+                                "score": score,
+                                "match_id": match_id,
+                                "vec": vec_literal,
+                            },
+                        )
                     goods_saved += 1
 
+                leftover_ids = existing_ids - processed_ids
+                for row_id in leftover_ids:
+                    log.info(
+                        "analyze-json: deleting stale goods_type row (pars_id=%s, row_id=%s)",
+                        snapshot.pars_id,
+                        row_id,
+                    )
+                    await conn.execute(
+                        text("DELETE FROM public.ai_site_goods_types WHERE id = :row_id"),
+                        {"row_id": row_id},
+                    )
+
         if "equipment" in payload:
-            delete_equipment_sql = "DELETE FROM public.ai_site_equipment WHERE text_pars_id = :pid"
-            log.info(
-                "analyze-json: clearing public.ai_site_equipment for pars_id=%s using SQL: %s",
-                snapshot.pars_id,
-                delete_equipment_sql,
-            )
-            await conn.execute(text(delete_equipment_sql), {"pid": snapshot.pars_id})
             equipment_items = payload.get("equipment")
+            normalized_equipment: list[dict[str, Any]] = []
             if isinstance(equipment_items, list):
+                for item in equipment_items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = (
+                        item.get("name")
+                        or item.get("equipment")
+                        or item.get("text")
+                        or ""
+                    ).strip()
+                    if not name:
+                        continue
+                    match_id = _safe_int(
+                        item.get("match_id") or item.get("id") or item.get("equipment_ID")
+                    )
+                    score = _normalize_score(item.get("match_score") or item.get("score"))
+                    vec_literal = _vector_to_literal(item.get("vector") or item.get("text_vector"))
+                    normalized_equipment.append(
+                        {
+                            "name": name,
+                            "match_id": match_id,
+                            "score": score,
+                            "vec": vec_literal,
+                        }
+                    )
+
+            if not normalized_equipment:
+                log.info(
+                    "analyze-json: equipment payload empty — existing rows remain untouched (pars_id=%s)",
+                    snapshot.pars_id,
+                )
+            else:
+                result = await conn.execute(
+                    text(
+                        """
+                        SELECT id, equipment, equipment_ID AS equipment_id, equipment_score
+                        FROM public.ai_site_equipment
+                        WHERE text_pars_id = :pid
+                        ORDER BY id
+                        """
+                    ),
+                    {"pid": snapshot.pars_id},
+                )
+                existing_equipment = [dict(row) for row in result.mappings().all()]
+                equipment_rows_by_pk: dict[int, dict[str, Any]] = {
+                    row["id"]: row for row in existing_equipment if row.get("id") is not None
+                }
+                existing_ids = set(equipment_rows_by_pk)
+
+                equipment_by_id: dict[int, list[int]] = defaultdict(list)
+                equipment_by_name: dict[str, list[int]] = defaultdict(list)
+                for row in existing_equipment:
+                    row_id = row.get("id")
+                    if row_id is None:
+                        continue
+                    match_id = row.get("equipment_id")
+                    if match_id is not None:
+                        equipment_by_id[match_id].append(row_id)
+                    name_key = (row.get("equipment") or "").strip().lower()
+                    if name_key:
+                        equipment_by_name[name_key].append(row_id)
+
+                def consume_equipment_row(row_id: int) -> Optional[dict[str, Any]]:
+                    row = equipment_rows_by_pk.get(row_id)
+                    if row is None:
+                        return None
+
+                    match_id_val = row.get("equipment_id")
+                    if match_id_val is not None:
+                        id_candidates = equipment_by_id.get(match_id_val)
+                        if id_candidates:
+                            try:
+                                id_candidates.remove(row_id)
+                            except ValueError:
+                                pass
+                            if not id_candidates:
+                                equipment_by_id.pop(match_id_val, None)
+
+                    name_key_val = (row.get("equipment") or "").strip().lower()
+                    if name_key_val:
+                        name_candidates = equipment_by_name.get(name_key_val)
+                        if name_candidates:
+                            try:
+                                name_candidates.remove(row_id)
+                            except ValueError:
+                                pass
+                            if not name_candidates:
+                                equipment_by_name.pop(name_key_val, None)
+
+                    return row
+
+                def pop_equipment_by_id(match_id_val: int, normalized_name: str) -> Optional[dict[str, Any]]:
+                    candidates = equipment_by_id.get(match_id_val)
+                    if not candidates:
+                        return None
+
+                    selected_row_id: Optional[int] = None
+                    if normalized_name:
+                        for idx, candidate_row_id in enumerate(list(candidates)):
+                            candidate_row = equipment_rows_by_pk.get(candidate_row_id)
+                            if candidate_row is None:
+                                continue
+                            candidate_name = (candidate_row.get("equipment") or "").strip().lower()
+                            if candidate_name == normalized_name:
+                                selected_row_id = candidates.pop(idx)
+                                break
+
+                    if selected_row_id is None:
+                        selected_row_id = candidates.pop(0)
+
+                    if not candidates:
+                        equipment_by_id.pop(match_id_val, None)
+
+                    return consume_equipment_row(selected_row_id)
+
+                def pop_equipment_by_name(normalized_name: str) -> Optional[dict[str, Any]]:
+                    if not normalized_name:
+                        return None
+
+                    candidates = equipment_by_name.get(normalized_name)
+                    if not candidates:
+                        return None
+
+                    row_id = candidates.pop(0)
+                    if not candidates:
+                        equipment_by_name.pop(normalized_name, None)
+
+                    return consume_equipment_row(row_id)
+
+                log.info(
+                    "analyze-json: syncing equipment payload (pars_id=%s, incoming=%s, existing=%s)",
+                    snapshot.pars_id,
+                    len(normalized_equipment),
+                    len(existing_equipment),
+                )
+
                 insert_sql = text(
                     """
                     INSERT INTO public.ai_site_equipment
@@ -1180,34 +1706,95 @@ async def _apply_db_payload(
                         (:pid, :name, :score, :match_id,
                          CASE WHEN :vec IS NULL THEN NULL ELSE CAST(:vec AS vector) END)
                     """
+                ).bindparams(bindparam("vec", type_=Text()))
+                update_sql_with_vec = text(
+                    """
+                    UPDATE public.ai_site_equipment
+                    SET equipment = :name,
+                        equipment_score = :score,
+                        equipment_ID = :match_id,
+                        text_vector = CASE WHEN :vec IS NULL THEN NULL ELSE CAST(:vec AS vector) END
+                    WHERE id = :row_id
+                    """
+                ).bindparams(bindparam("vec", type_=Text()))
+                update_sql_no_vec = text(
+                    """
+                    UPDATE public.ai_site_equipment
+                    SET equipment = :name,
+                        equipment_score = :score,
+                        equipment_ID = :match_id
+                    WHERE id = :row_id
+                    """
                 )
-                for item in equipment_items:
-                    if not isinstance(item, dict):
-                        continue
-                    name = (item.get("name") or item.get("equipment") or "").strip()
-                    if not name:
-                        continue
-                    match_id = _safe_int(item.get("match_id") or item.get("id") or item.get("equipment_ID"))
-                    score = _normalize_score(item.get("match_score") or item.get("score"))
-                    vec_literal = _vector_to_literal(item.get("vector") or item.get("text_vector"))
+
+                processed_ids: set[int] = set()
+                for item in normalized_equipment:
+                    name = item["name"]
+                    name_key = name.lower()
+                    match_id = item["match_id"]
+                    score = item["score"]
+                    vec_literal = item["vec"]
+
+                    existing_row: Optional[dict[str, Any]] = None
+                    if match_id is not None:
+                        existing_row = pop_equipment_by_id(match_id, name_key)
+                    if existing_row is None:
+                        existing_row = pop_equipment_by_name(name_key)
+
+                    score_to_use = score
+                    if existing_row is not None:
+                        processed_ids.add(existing_row["id"])
+                        if score_to_use is None:
+                            score_to_use = _normalize_score(existing_row.get("equipment_score"))
+                        statement = update_sql_with_vec if vec_literal is not None else update_sql_no_vec
+                        params = {
+                            "row_id": existing_row["id"],
+                            "name": name,
+                            "score": score_to_use,
+                            "match_id": match_id,
+                        }
+                        if vec_literal is not None:
+                            params["vec"] = vec_literal
+                        log.info(
+                            "analyze-json: updating equipment (pars_id=%s, row_id=%s, name=%s, match_id=%s, score=%s)",
+                            snapshot.pars_id,
+                            existing_row["id"],
+                            name,
+                            match_id,
+                            score_to_use,
+                        )
+                        await conn.execute(statement, params)
+                    else:
+                        log.info(
+                            "analyze-json: inserting equipment (pars_id=%s, name=%s, match_id=%s, score=%s)",
+                            snapshot.pars_id,
+                            name,
+                            match_id,
+                            score,
+                        )
+                        await conn.execute(
+                            insert_sql,
+                            {
+                                "pid": snapshot.pars_id,
+                                "name": name,
+                                "score": score,
+                                "match_id": match_id,
+                                "vec": vec_literal,
+                            },
+                        )
+                    equipment_saved += 1
+
+                leftover_ids = existing_ids - processed_ids
+                for row_id in leftover_ids:
                     log.info(
-                        "analyze-json: inserting equipment (pars_id=%s, name=%s, match_id=%s, score=%s)",
+                        "analyze-json: deleting stale equipment row (pars_id=%s, row_id=%s)",
                         snapshot.pars_id,
-                        name,
-                        match_id,
-                        score,
+                        row_id,
                     )
                     await conn.execute(
-                        insert_sql,
-                        {
-                            "pid": snapshot.pars_id,
-                            "name": name,
-                            "score": score,
-                            "match_id": match_id,
-                            "vec": vec_literal,
-                        },
+                        text("DELETE FROM public.ai_site_equipment WHERE id = :row_id"),
+                        {"row_id": row_id},
                     )
-                    equipment_saved += 1
 
     log.info(
         "analyze-json: db_payload applied (pars_id=%s, goods_saved=%s, equipment_saved=%s, prodclass=%s, prodclass_score=%s)",
@@ -1338,7 +1925,27 @@ async def _run_analyze(
         domain_label = snapshot.domain or ""
         domain_source = snapshot.domain_source or ("domain_1" if domain_label else "auto")
         domains_processed.append(domain_label or "(unknown)")
-        text_length = len(snapshot.text)
+
+        prepared_text = _prepare_text_for_external(snapshot.text)
+        if not prepared_text:
+            _log_and_raise(
+                status.HTTP_502_BAD_GATEWAY,
+                inn=inn,
+                detail="Текст pars_site пустой после нормализации",
+                request_context=payload_data,
+                extra={
+                    "snapshot": {
+                        "pars_id": snapshot.pars_id,
+                        "company_id": snapshot.company_id,
+                        "domain": domain_label or None,
+                        "domain_source": domain_source,
+                        "chunks": len(snapshot.chunk_ids),
+                    }
+                },
+            )
+
+        raw_text_length = len(snapshot.text)
+        text_length = len(prepared_text)
         snapshot_context = {
             "pars_id": snapshot.pars_id,
             "company_id": snapshot.company_id,
@@ -1346,6 +1953,7 @@ async def _run_analyze(
             "domain_source": domain_source,
             "chunks": len(snapshot.chunk_ids),
             "text_length": text_length,
+            "text_length_raw": raw_text_length,
         }
         log.info(
             "analyze-json: preparing request #%s (inn=%s, snapshot=%s)",
@@ -1356,9 +1964,10 @@ async def _run_analyze(
 
         request_payload: dict[str, Any] = {
             "pars_id": snapshot.pars_id,
-            "company_id": snapshot.company_id,
-            "text_par": snapshot.text,
+            "text_par": prepared_text,
         }
+        if snapshot.company_id is not None:
+            request_payload["company_id"] = snapshot.company_id
         if payload.chat_model:
             request_payload["chat_model"] = payload.chat_model
         elif settings.CHAT_MODEL:
@@ -1447,6 +2056,33 @@ async def _run_analyze(
                 },
             )
 
+        sanitized_external_response = _sanitize_external_response(response_json)
+
+        log.info(
+            "analyze-json: external response summary #%s (inn=%s, domain=%s) → %s",
+            idx,
+            inn,
+            domain_label,
+            sanitized_external_response,
+        )
+        llm_answer = _extract_llm_answer(response_json)
+        if llm_answer:
+            log.info(
+                "analyze-json: external LLM answer #%s (inn=%s, domain=%s, length=%s, preview=%s)",
+                idx,
+                inn,
+                domain_label,
+                len(llm_answer),
+                llm_answer[:_TEXT_PREVIEW_LIMIT],
+            )
+        log.debug(
+            "analyze-json: external raw response #%s (inn=%s, domain=%s) %s",
+            idx,
+            inn,
+            domain_label,
+            response_json,
+        )
+
         db_payload = response_json.get("db_payload") if isinstance(response_json, dict) else None
         if not isinstance(db_payload, dict):
             _log_and_raise(
@@ -1499,7 +2135,8 @@ async def _run_analyze(
             prodclass_score=prodclass_score,
             external_request=sanitized_request_payload,
             external_status=response.status_code,
-            external_response=_sanitize_external_response(response_json),
+            external_response=sanitized_external_response,
+            external_response_raw=response_json,
         )
         runs.append(run)
 
@@ -1527,6 +2164,7 @@ async def _run_analyze(
         external_request=first_run.external_request if first_run else None,
         external_status=first_run.external_status if first_run else 0,
         external_response=first_run.external_response,
+        external_response_raw=first_run.external_response_raw if first_run else None,
         total_text_length=total_text_length,
         total_saved_goods=total_saved_goods,
         total_saved_equipment=total_saved_equipment,
