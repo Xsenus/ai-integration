@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from app.config import settings
 
@@ -61,22 +62,26 @@ def _extract_html_redirect_target(html: str, base_url: str) -> str | None:
     snippet = html[:4096]
     soup = BeautifulSoup(snippet, "html.parser")
 
-    meta = soup.find(
+    meta_candidate = soup.find(
         "meta",
         attrs={"http-equiv": lambda value: isinstance(value, str) and value.lower() == "refresh"},
     )
-    if meta and meta.get("content"):
-        parts = [part.strip() for part in meta["content"].split(";") if part.strip()]
-        for part in parts:
-            if part.lower().startswith("url="):
-                target = part.split("=", 1)[1].strip(" \"'")
-                if target:
-                    return urljoin(base_url, target)
+    if isinstance(meta_candidate, Tag):
+        content_attr = meta_candidate.get("content")
+        if isinstance(content_attr, str):
+            parts = [part.strip() for part in content_attr.split(";") if part.strip()]
+            for part in parts:
+                if part.lower().startswith("url="):
+                    target = part.split("=", 1)[1].strip(" \"'")
+                    if target:
+                        return urljoin(base_url, target)
 
     if _looks_like_redirect_placeholder(html):
-        anchor = soup.find("a", href=True)
-        if anchor and anchor["href"]:
-            return urljoin(base_url, anchor["href"])
+        anchor_candidate = soup.find("a", href=True)
+        if isinstance(anchor_candidate, Tag):
+            href_attr = anchor_candidate.get("href")
+            if isinstance(href_attr, str) and href_attr:
+                return urljoin(base_url, href_attr)
 
     return None
 
@@ -122,7 +127,7 @@ async def fetch_home_via_scraperapi(
     if redirect_limit < 0:
         redirect_limit = 0
 
-    client_kwargs: dict[str, object] = {"timeout": 60, "follow_redirects": False}
+    client_kwargs: dict[str, Any] = {"timeout": 60, "follow_redirects": False}
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         while True:
