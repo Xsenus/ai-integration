@@ -37,6 +37,8 @@ router = APIRouter(prefix="/v1", tags=["analyze-json"])
 _http_client: httpx.AsyncClient | None = None
 _http_client_lock = asyncio.Lock()
 
+_TABLE_COLUMNS_CACHE: dict[str, set[str]] = {}
+
 _TEXT_PREVIEW_LIMIT = 400
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
@@ -109,6 +111,33 @@ def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         else:
             summary[key] = value
     return summary
+
+
+async def _get_table_columns(
+    conn: AsyncConnection,
+    table_name: str,
+    schema: str = "public",
+) -> set[str]:
+    """Возвращает набор колонок таблицы, кэшируя результат между вызовами."""
+
+    cache_key = f"{schema}.{table_name}"
+    cached = _TABLE_COLUMNS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = await conn.execute(
+        text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = :table
+            """
+        ),
+        {"schema": schema, "table": table_name},
+    )
+    columns = {row[0] for row in result}
+    _TABLE_COLUMNS_CACHE[cache_key] = columns
+    return columns
 
 
 def _sanitize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1143,21 +1172,24 @@ async def _apply_db_payload(
 
     async with engine.begin() as conn:
         prodclass_row: Optional[dict[str, Any]] = None
+        prodclass_stale_ids: list[int] = []
+        prodclass_columns = await _get_table_columns(conn, "ai_site_prodclass")
+        prodclass_has_created_at = "created_at" in prodclass_columns
         result = await conn.execute(
             text(
                 """
                 SELECT id, prodclass, prodclass_score
                 FROM public.ai_site_prodclass
                 WHERE text_pars_id = :pid
-                ORDER BY id DESC
-                LIMIT 1
+                ORDER BY id ASC
                 """
             ),
             {"pid": snapshot.pars_id},
         )
-        raw_prodclass_row = result.mappings().first()
-        if raw_prodclass_row is not None:
-            prodclass_row = dict(raw_prodclass_row)
+        prodclass_rows = [dict(row) for row in result.mappings().all()]
+        prodclass_stale_ids = [row.get("id") for row in prodclass_rows[:-1] if row.get("id") is not None]
+        if prodclass_rows:
+            prodclass_row = prodclass_rows[-1]
 
         if description_present and "description" in cols:
             update_sql = "UPDATE public.pars_site SET description = :description WHERE id = :id"
@@ -1218,7 +1250,7 @@ async def _apply_db_payload(
                         insert_prodclass_sql = (
                             "INSERT INTO public.ai_site_prodclass "
                             "(text_pars_id, prodclass, prodclass_score) "
-                            "VALUES (:pid, :prodclass, :score)"
+                            "VALUES (:pid, :prodclass, :score) RETURNING id"
                         )
                         log.info(
                             "analyze-json: inserting prodclass (pars_id=%s, prodclass=%s, score=%s) using SQL: %s",
@@ -1227,7 +1259,7 @@ async def _apply_db_payload(
                             score_to_use,
                             insert_prodclass_sql,
                         )
-                        await conn.execute(
+                        insert_result = await conn.execute(
                             text(insert_prodclass_sql),
                             {
                                 "pid": snapshot.pars_id,
@@ -1236,16 +1268,18 @@ async def _apply_db_payload(
                             },
                         )
                         prodclass_row = {
-                            "id": None,
+                            "id": insert_result.scalar_one(),
                             "prodclass": candidate_prodclass_id,
                             "prodclass_score": score_to_use,
                         }
                     else:
                         update_prodclass_sql = (
                             "UPDATE public.ai_site_prodclass "
-                            "SET prodclass = :prodclass, prodclass_score = :score "
-                            "WHERE id = :row_id"
+                            "SET prodclass = :prodclass, prodclass_score = :score"
                         )
+                        if prodclass_has_created_at:
+                            update_prodclass_sql += ", created_at = TIMEZONE('UTC', now())"
+                        update_prodclass_sql += " WHERE id = :row_id"
                         log.info(
                             "analyze-json: updating prodclass (pars_id=%s, prodclass=%s, score=%s) using SQL: %s",
                             snapshot.pars_id,
@@ -1276,6 +1310,17 @@ async def _apply_db_payload(
         if prodclass_row is not None:
             prodclass_id = _safe_int(prodclass_row.get("prodclass"))
             prodclass_score = _normalize_score(prodclass_row.get("prodclass_score"))
+
+        if prodclass_stale_ids:
+            delete_sql = "DELETE FROM public.ai_site_prodclass WHERE id = :row_id"
+            for stale_id in prodclass_stale_ids:
+                log.info(
+                    "analyze-json: deleting stale prodclass row (pars_id=%s, row_id=%s) using SQL: %s",
+                    snapshot.pars_id,
+                    stale_id,
+                    delete_sql,
+                )
+                await conn.execute(text(delete_sql), {"row_id": stale_id})
 
         if "goods_types" in payload:
             goods_items = payload.get("goods_types")
