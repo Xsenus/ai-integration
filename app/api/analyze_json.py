@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -1323,17 +1324,90 @@ async def _apply_db_payload(
                     {"pid": snapshot.pars_id},
                 )
                 existing_goods = [dict(row) for row in result.mappings().all()]
-                existing_ids = {row["id"] for row in existing_goods}
-                goods_by_id = {
-                    row.get("goods_type_id"): row
-                    for row in existing_goods
-                    if row.get("goods_type_id") is not None
+                rows_by_pk: dict[int, dict[str, Any]] = {
+                    row["id"]: row for row in existing_goods if row.get("id") is not None
                 }
-                goods_by_name: dict[str, list[dict[str, Any]]] = {}
+                existing_ids = set(rows_by_pk)
+
+                goods_by_id: dict[int, list[int]] = defaultdict(list)
+                goods_by_name: dict[str, list[int]] = defaultdict(list)
                 for row in existing_goods:
+                    row_id = row.get("id")
+                    if row_id is None:
+                        continue
+                    match_id = row.get("goods_type_id")
+                    if match_id is not None:
+                        goods_by_id[match_id].append(row_id)
                     name_key = (row.get("goods_type") or "").strip().lower()
                     if name_key:
-                        goods_by_name.setdefault(name_key, []).append(row)
+                        goods_by_name[name_key].append(row_id)
+
+                def consume_goods_row(row_id: int) -> Optional[dict[str, Any]]:
+                    row = rows_by_pk.get(row_id)
+                    if row is None:
+                        return None
+
+                    match_id_val = row.get("goods_type_id")
+                    if match_id_val is not None:
+                        id_candidates = goods_by_id.get(match_id_val)
+                        if id_candidates:
+                            try:
+                                id_candidates.remove(row_id)
+                            except ValueError:
+                                pass
+                            if not id_candidates:
+                                goods_by_id.pop(match_id_val, None)
+
+                    name_key_val = (row.get("goods_type") or "").strip().lower()
+                    if name_key_val:
+                        name_candidates = goods_by_name.get(name_key_val)
+                        if name_candidates:
+                            try:
+                                name_candidates.remove(row_id)
+                            except ValueError:
+                                pass
+                            if not name_candidates:
+                                goods_by_name.pop(name_key_val, None)
+
+                    return row
+
+                def pop_goods_by_id(match_id_val: int, normalized_name: str) -> Optional[dict[str, Any]]:
+                    candidates = goods_by_id.get(match_id_val)
+                    if not candidates:
+                        return None
+
+                    selected_row_id: Optional[int] = None
+                    if normalized_name:
+                        for idx, candidate_row_id in enumerate(list(candidates)):
+                            candidate_row = rows_by_pk.get(candidate_row_id)
+                            if candidate_row is None:
+                                continue
+                            candidate_name = (candidate_row.get("goods_type") or "").strip().lower()
+                            if candidate_name == normalized_name:
+                                selected_row_id = candidates.pop(idx)
+                                break
+
+                    if selected_row_id is None:
+                        selected_row_id = candidates.pop(0)
+
+                    if not candidates:
+                        goods_by_id.pop(match_id_val, None)
+
+                    return consume_goods_row(selected_row_id)
+
+                def pop_goods_by_name(normalized_name: str) -> Optional[dict[str, Any]]:
+                    if not normalized_name:
+                        return None
+
+                    candidates = goods_by_name.get(normalized_name)
+                    if not candidates:
+                        return None
+
+                    row_id = candidates.pop(0)
+                    if not candidates:
+                        goods_by_name.pop(normalized_name, None)
+
+                    return consume_goods_row(row_id)
 
                 log.info(
                     "analyze-json: syncing goods payload (pars_id=%s, incoming=%s, existing=%s)",
@@ -1374,18 +1448,16 @@ async def _apply_db_payload(
                 processed_ids: set[int] = set()
                 for item in normalized_goods:
                     name = item["name"]
+                    name_key = name.lower()
                     match_id = item["match_id"]
                     score = item["score"]
                     vec_literal = item["vec"]
 
                     existing_row: Optional[dict[str, Any]] = None
-                    if match_id is not None and match_id in goods_by_id:
-                        existing_row = goods_by_id.pop(match_id)
-                    else:
-                        name_key = name.lower()
-                        candidates = goods_by_name.get(name_key) or []
-                        if candidates:
-                            existing_row = candidates.pop(0)
+                    if match_id is not None:
+                        existing_row = pop_goods_by_id(match_id, name_key)
+                    if existing_row is None:
+                        existing_row = pop_goods_by_name(name_key)
 
                     score_to_use = score
                     if existing_row is not None:
@@ -1489,17 +1561,90 @@ async def _apply_db_payload(
                     {"pid": snapshot.pars_id},
                 )
                 existing_equipment = [dict(row) for row in result.mappings().all()]
-                existing_ids = {row["id"] for row in existing_equipment}
-                equipment_by_id = {
-                    row.get("equipment_id"): row
-                    for row in existing_equipment
-                    if row.get("equipment_id") is not None
+                equipment_rows_by_pk: dict[int, dict[str, Any]] = {
+                    row["id"]: row for row in existing_equipment if row.get("id") is not None
                 }
-                equipment_by_name: dict[str, list[dict[str, Any]]] = {}
+                existing_ids = set(equipment_rows_by_pk)
+
+                equipment_by_id: dict[int, list[int]] = defaultdict(list)
+                equipment_by_name: dict[str, list[int]] = defaultdict(list)
                 for row in existing_equipment:
+                    row_id = row.get("id")
+                    if row_id is None:
+                        continue
+                    match_id = row.get("equipment_id")
+                    if match_id is not None:
+                        equipment_by_id[match_id].append(row_id)
                     name_key = (row.get("equipment") or "").strip().lower()
                     if name_key:
-                        equipment_by_name.setdefault(name_key, []).append(row)
+                        equipment_by_name[name_key].append(row_id)
+
+                def consume_equipment_row(row_id: int) -> Optional[dict[str, Any]]:
+                    row = equipment_rows_by_pk.get(row_id)
+                    if row is None:
+                        return None
+
+                    match_id_val = row.get("equipment_id")
+                    if match_id_val is not None:
+                        id_candidates = equipment_by_id.get(match_id_val)
+                        if id_candidates:
+                            try:
+                                id_candidates.remove(row_id)
+                            except ValueError:
+                                pass
+                            if not id_candidates:
+                                equipment_by_id.pop(match_id_val, None)
+
+                    name_key_val = (row.get("equipment") or "").strip().lower()
+                    if name_key_val:
+                        name_candidates = equipment_by_name.get(name_key_val)
+                        if name_candidates:
+                            try:
+                                name_candidates.remove(row_id)
+                            except ValueError:
+                                pass
+                            if not name_candidates:
+                                equipment_by_name.pop(name_key_val, None)
+
+                    return row
+
+                def pop_equipment_by_id(match_id_val: int, normalized_name: str) -> Optional[dict[str, Any]]:
+                    candidates = equipment_by_id.get(match_id_val)
+                    if not candidates:
+                        return None
+
+                    selected_row_id: Optional[int] = None
+                    if normalized_name:
+                        for idx, candidate_row_id in enumerate(list(candidates)):
+                            candidate_row = equipment_rows_by_pk.get(candidate_row_id)
+                            if candidate_row is None:
+                                continue
+                            candidate_name = (candidate_row.get("equipment") or "").strip().lower()
+                            if candidate_name == normalized_name:
+                                selected_row_id = candidates.pop(idx)
+                                break
+
+                    if selected_row_id is None:
+                        selected_row_id = candidates.pop(0)
+
+                    if not candidates:
+                        equipment_by_id.pop(match_id_val, None)
+
+                    return consume_equipment_row(selected_row_id)
+
+                def pop_equipment_by_name(normalized_name: str) -> Optional[dict[str, Any]]:
+                    if not normalized_name:
+                        return None
+
+                    candidates = equipment_by_name.get(normalized_name)
+                    if not candidates:
+                        return None
+
+                    row_id = candidates.pop(0)
+                    if not candidates:
+                        equipment_by_name.pop(normalized_name, None)
+
+                    return consume_equipment_row(row_id)
 
                 log.info(
                     "analyze-json: syncing equipment payload (pars_id=%s, incoming=%s, existing=%s)",
@@ -1540,18 +1685,16 @@ async def _apply_db_payload(
                 processed_ids: set[int] = set()
                 for item in normalized_equipment:
                     name = item["name"]
+                    name_key = name.lower()
                     match_id = item["match_id"]
                     score = item["score"]
                     vec_literal = item["vec"]
 
                     existing_row: Optional[dict[str, Any]] = None
-                    if match_id is not None and match_id in equipment_by_id:
-                        existing_row = equipment_by_id.pop(match_id)
-                    else:
-                        name_key = name.lower()
-                        candidates = equipment_by_name.get(name_key) or []
-                        if candidates:
-                            existing_row = candidates.pop(0)
+                    if match_id is not None:
+                        existing_row = pop_equipment_by_id(match_id, name_key)
+                    if existing_row is None:
+                        existing_row = pop_equipment_by_name(name_key)
 
                     score_to_use = score
                     if existing_row is not None:
