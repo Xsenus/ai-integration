@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import re
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -275,64 +275,117 @@ def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> Option
     return dot / denom
 
 
-def _resolve_okved_text(main_okved: Optional[str], okveds: Any) -> Optional[str]:
-    code = (main_okved or "").strip()
+def _okved_item_code(obj: Any) -> str:
+    if isinstance(obj, dict):
+        return str(
+            obj.get("code")
+            or obj.get("value")
+            or obj.get("okved")
+            or obj.get("main")
+            or ""
+        ).strip()
+    if isinstance(obj, str):
+        return obj.strip().split(" ", 1)[0]
+    return ""
+
+
+def _okved_item_name(obj: Any) -> Optional[str]:
+    if isinstance(obj, dict):
+        for key in ("name", "text", "label"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    if isinstance(obj, str):
+        parts = obj.strip().split(" ", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+    return None
+
+
+def _format_okved_text(code: str, name: Optional[str]) -> str:
+    code = code.strip()
+    clean_name = (name or "").strip()
     if not code:
-        return None
+        return clean_name
+    if clean_name and code not in clean_name:
+        return f"{code} — {clean_name}"
+    return clean_name or code
 
-    if " " in code and code[0].isdigit():
-        return code
 
-    items: list[Any] = []
+def _collect_okved_entries(
+    main_okved: Optional[str], okveds: Any
+) -> list[tuple[str, str]]:
+    entries: dict[str, str] = {}
+    order: list[str] = []
+
+    def _register(code: str, name: Optional[str]) -> None:
+        norm_code = code.strip()
+        if not norm_code:
+            return
+        formatted = _format_okved_text(norm_code, name)
+        if norm_code not in entries:
+            order.append(norm_code)
+            entries[norm_code] = formatted
+        else:
+            if entries[norm_code] == norm_code and formatted != norm_code:
+                entries[norm_code] = formatted
+
+    def _walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            if isinstance(obj.get("items"), list):
+                code = _okved_item_code(obj)
+                name = _okved_item_name(obj)
+                if code:
+                    _register(code, name)
+                for nested in obj.get("items") or []:
+                    _walk(nested)
+                return
+            code = _okved_item_code(obj)
+            name = _okved_item_name(obj)
+            if code:
+                _register(code, name)
+            return
+        if isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                _walk(item)
+            return
+        if isinstance(obj, str):
+            code = _okved_item_code(obj)
+            name = _okved_item_name(obj)
+            if code:
+                _register(code, name)
+
     if isinstance(okveds, dict):
         if isinstance(okveds.get("items"), list):
-            items = list(okveds.get("items") or [])
+            _walk(okveds.get("items"))
         else:
-            items = [
-                {"code": k, "name": v}
-                for k, v in okveds.items()
-                if k != "main"
-            ]
-    elif isinstance(okveds, list):
-        items = list(okveds)
+            for key, value in okveds.items():
+                if key == "main":
+                    continue
+                _walk({"code": key, "name": value})
+    elif okveds is not None:
+        _walk(okveds)
 
-    def _item_code(obj: Any) -> str:
-        if isinstance(obj, dict):
-            return str(
-                obj.get("code")
-                or obj.get("value")
-                or obj.get("okved")
-                or ""
-            ).strip()
-        if isinstance(obj, str):
-            return obj.strip().split(" ", 1)[0]
-        return ""
+    code = (main_okved or "").strip()
+    if code:
+        formatted = entries.get(code) or _format_okved_text(code, None)
+        entries[code] = formatted
+        if code in order:
+            order.remove(code)
+        order.insert(0, code)
 
-    def _item_name(obj: Any) -> Optional[str]:
-        if isinstance(obj, dict):
-            for key in ("name", "text", "label"):
-                val = obj.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-        if isinstance(obj, str):
-            parts = obj.strip().split(" ", 1)
-            if len(parts) == 2:
-                return parts[1].strip()
-        return None
+    return [(c, entries[c]) for c in order]
+def _sort_domains_by_score(
+    scores: Mapping[str, Optional[float]],
+    order_index: Mapping[str, int],
+) -> list[str]:
+    def _key(item: tuple[str, Optional[float]]) -> tuple[int, float, int]:
+        domain, score = item
+        if score is None:
+            return (1, 0.0, order_index.get(domain, 0))
+        return (0, -float(score), order_index.get(domain, 0))
 
-    for item in items:
-        if isinstance(item, dict) and isinstance(item.get("items"), list):
-            for nested in item.get("items") or []:
-                if _item_code(nested) == code:
-                    name = _item_name(nested)
-                    if name:
-                        return f"{code} — {name}" if code not in name else name
-        if _item_code(item) == code:
-            name = _item_name(item)
-            if name:
-                return f"{code} — {name}" if code not in name else name
-
-    return code
+    return [domain for domain, _ in sorted(scores.items(), key=_key)]
 
 
 def _format_score(value: float) -> float:
@@ -550,7 +603,11 @@ def _normalize_and_split_domain(domain_or_url: str) -> tuple[str, str]:
     """
 
     home_url = to_home_url(domain_or_url)
-    normalized_domain = _urlparse(home_url).netloc.replace("www.", "")
+    parsed = _urlparse(home_url)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    normalized_domain = host
     return home_url, normalized_domain
 
 
@@ -767,15 +824,19 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
     if not okved_main_code:
         okved_main_code = await get_okved_main_pg(inn)
 
-    okved_text = _resolve_okved_text(okved_main_code, okveds_source)
+    okved_entries = _collect_okved_entries(okved_main_code, okveds_source)
+    okved_text = okved_entries[0][1] if okved_entries else None
     if okved_text:
         log.info("parse-site: основной ОКВЭД для сравнения → %s", okved_text)
+        if len(okved_entries) > 1:
+            log.info(
+                "parse-site: всего ОКВЭДов для сравнения → %s",
+                len(okved_entries),
+            )
     else:
         log.info("parse-site: основной ОКВЭД не определён")
 
-    okved_vector: Optional[list[float]] = None
-    if okved_text:
-        okved_vector = await _embed_text(okved_text, label=f"okved:{inn}")
+    okved_vectors_cache: dict[str, list[float]] = {}
 
 
     company_id_pd: Optional[int] = None
@@ -793,9 +854,11 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         )
 
     clients_request_synced = False
+    synced_client_domain_1: Optional[str] = None
     synced_client_domain_2: Optional[str] = None
     client_domain_lookup: Optional[str] = None
-    client_domains_success: list[str] = []
+    client_domain_scores: dict[str, Optional[float]] = {}
+    domain_order_index: dict[str, int] = {}
 
     planned_domains = list(domains_to_process)
 
@@ -844,11 +907,6 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         )
         url_for_pars = override_url if override_url and len(domains_to_process) == 1 else home_url
 
-        if domain_candidate not in client_domains_success:
-            client_domains_success.append(domain_candidate)
-        current_client_domain_1 = client_domains_success[0]
-        current_client_domain_2 = client_domains_success[1] if len(client_domains_success) > 1 else None
-
         full_text = "\n\n".join(chunks or [])
         description: Optional[str] = None
         description_vector: Optional[list[float]] = None
@@ -862,20 +920,65 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         vector_literal = _vector_to_literal(description_vector)
 
         okved_score: Optional[float] = None
-        if description_vector and okved_vector:
-            raw_score = _cosine_similarity(description_vector, okved_vector)
-            if raw_score is not None:
-                okved_score = _format_score(raw_score)
-                log.info(
-                    "parse-site: okved score для %s → %s",
-                    domain_for_pars,
-                    okved_score,
-                )
-                if okved_score < _OKVED_ALERT_THRESHOLD:
-                    alert_domain = domain_for_pars or normalized_domain
-                    okved_alerts.append(
-                        OkvedAlert(domain=alert_domain, score=okved_score)
+        okved_scores_raw: list[float] = []
+        if description_vector and okved_entries:
+            if not okved_vectors_cache and okved_entries:
+                for code, text_value in okved_entries:
+                    vector = await _embed_text(
+                        text_value,
+                        label=f"okved:{inn}:{code}",
                     )
+                    if vector:
+                        okved_vectors_cache[code] = vector
+            if okved_vectors_cache:
+                for code, vector in okved_vectors_cache.items():
+                    raw_score = _cosine_similarity(description_vector, vector)
+                    if raw_score is None:
+                        continue
+                    okved_scores_raw.append(raw_score)
+                    log.info(
+                        "parse-site: okved score для %s (%s) → %s",
+                        domain_for_pars,
+                        code,
+                        _format_score(raw_score),
+                    )
+            else:
+                log.info(
+                    "parse-site: okved embeddings не получены — сравнение пропущено (%s)",
+                    domain_for_pars,
+                )
+
+        if okved_scores_raw:
+            avg_raw = sum(okved_scores_raw) / len(okved_scores_raw)
+            okved_score = _format_score(avg_raw)
+            log.info(
+                "parse-site: усреднённый okved score для %s → %s (ОКВЭДов=%s)",
+                domain_for_pars,
+                okved_score,
+                len(okved_scores_raw),
+            )
+            if okved_score < _OKVED_ALERT_THRESHOLD:
+                alert_domain = domain_for_pars or normalized_domain
+                okved_alerts.append(OkvedAlert(domain=alert_domain, score=okved_score))
+        elif description_vector and okved_entries:
+            log.info(
+                "parse-site: okved score не вычислен для %s — отсутствуют валидные векторы",
+                domain_for_pars,
+            )
+
+        if domain_candidate not in domain_order_index:
+            domain_order_index[domain_candidate] = len(domain_order_index)
+        client_domain_scores[domain_candidate] = okved_score
+        ordered_domains = _sort_domains_by_score(
+            client_domain_scores,
+            domain_order_index,
+        )
+        current_client_domain_1 = ordered_domains[0] if ordered_domains else None
+        current_client_domain_2 = ordered_domains[1] if len(ordered_domains) > 1 else None
+        log.info(
+            "parse-site: текущий порядок доменов по score → %s",
+            ordered_domains,
+        )
 
         chunks_payload = [
             {"start": i, "end": i, "text": text}
@@ -889,103 +992,142 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         )
 
         written_chunks = len(chunks_payload)
-        if chunks_payload:
-            if payload.save_client_request:
-                summary_for_client = dict(summary_for_client_base)
-                if not clients_request_synced:
-                    log.info(
-                        "parse-site: выполняем upsert clients_requests (POSTGRES/parsing_data) для ИНН %s",
-                        inn,
+
+        summary_for_client: Optional[dict[str, Any]] = None
+        if payload.save_client_request:
+            summary_for_client = dict(summary_for_client_base)
+
+            if not clients_request_synced and chunks_payload:
+                log.info(
+                    "parse-site: выполняем upsert clients_requests (POSTGRES/parsing_data) для ИНН %s",
+                    inn,
+                )
+                try:
+                    await push_clients_request_pg(
+                        summary_for_client,
+                        domain=current_client_domain_1,
+                        domain_secondary=current_client_domain_2,
                     )
+                except Exception as e:  # noqa: BLE001
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"PG upsert clients_requests failed: {e}",
+                    ) from e
+
+                synced_client_domain_1 = current_client_domain_1
+                synced_client_domain_2 = current_client_domain_2
+                client_domain_lookup = (
+                    f"www.{synced_client_domain_1}" if synced_client_domain_1 else None
+                )
+                company_id_pg = await get_clients_request_id_pg(inn, client_domain_lookup)
+                if company_id_pg is None:
+                    company_id_pg = await get_clients_request_id_pg(inn)
+
+                try:
+                    await push_clients_request_pd(
+                        summary_for_client,
+                        domain=current_client_domain_1,
+                        domain_secondary=current_client_domain_2,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    if not mirror_failed_logged:
+                        log.warning("mirror parsing_data failed for INN=%s: %s", inn, e)
+                        mirror_failed_logged = True
+                    company_id_pd = await get_clients_request_id_pd(inn, client_domain_lookup)
+                else:
+                    company_id_pd = await get_clients_request_id_pd(inn, client_domain_lookup)
+                    if company_id_pd is None:
+                        company_id_pd = await get_clients_request_id_pd(inn)
+                    log.info(
+                        "parse-site: upsert clients_requests в parsing_data завершен, company_id=%s",
+                        company_id_pd,
+                    )
+
+                clients_request_synced = True
+                log.info(
+                    "parse-site: синхронизация clients_requests выполнена (domain_1=%s, domain_2=%s)",
+                    f"www.{synced_client_domain_1}" if synced_client_domain_1 else None,
+                    f"www.{synced_client_domain_2}" if synced_client_domain_2 else None,
+                )
+            elif clients_request_synced:
+                domain_1_changed = current_client_domain_1 != synced_client_domain_1
+                domain_2_changed = current_client_domain_2 != synced_client_domain_2
+
+                if domain_1_changed or domain_2_changed:
+                    new_domain_1_for_log = (
+                        f"www.{current_client_domain_1}" if current_client_domain_1 else None
+                    )
+                    new_domain_2_for_log = (
+                        f"www.{current_client_domain_2}" if current_client_domain_2 else None
+                    )
+                    log.info(
+                        "parse-site: обновляем clients_requests домены → domain_1=%s, domain_2=%s",
+                        new_domain_1_for_log,
+                        new_domain_2_for_log,
+                    )
+
+                    pg_domain = current_client_domain_1 if domain_1_changed else None
+                    pg_domain_secondary = (
+                        current_client_domain_2 if domain_2_changed else synced_client_domain_2
+                    )
+
                     try:
                         await push_clients_request_pg(
                             summary_for_client,
-                            domain=current_client_domain_1,
-                            domain_secondary=current_client_domain_2,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"PG upsert clients_requests failed: {e}",
-                        ) from e
-
-                    client_domain_lookup = f"www.{current_client_domain_1}" if current_client_domain_1 else None
-                    company_id_pg = await get_clients_request_id_pg(inn, client_domain_lookup)
-                    if company_id_pg is None:
-                        company_id_pg = await get_clients_request_id_pg(inn)
-
-                    try:
-                        await push_clients_request_pd(
-                            summary_for_client,
-                            domain=current_client_domain_1,
-                            domain_secondary=current_client_domain_2,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        if not mirror_failed_logged:
-                            log.warning("mirror parsing_data failed for INN=%s: %s", inn, e)
-                            mirror_failed_logged = True
-                        company_id_pd = await get_clients_request_id_pd(inn, client_domain_lookup)
-                    else:
-                        company_id_pd = await get_clients_request_id_pd(inn, client_domain_lookup)
-                        if company_id_pd is None:
-                            company_id_pd = await get_clients_request_id_pd(inn)
-                        log.info(
-                            "parse-site: upsert clients_requests в parsing_data завершен, company_id=%s",
-                            company_id_pd,
-                        )
-
-                    clients_request_synced = True
-                    synced_client_domain_2 = current_client_domain_2
-                    log.info(
-                        "parse-site: синхронизация clients_requests выполнена (domain_1=%s, domain_2=%s)",
-                        f"www.{current_client_domain_1}" if current_client_domain_1 else None,
-                        f"www.{current_client_domain_2}" if current_client_domain_2 else None,
-                    )
-                elif current_client_domain_2 and current_client_domain_2 != synced_client_domain_2:
-                    log.info(
-                        "parse-site: обновляем domain_2 для clients_requests → %s",
-                        f"www.{current_client_domain_2}",
-                    )
-                    try:
-                        await push_clients_request_pg(
-                            summary_for_client,
-                            domain=None,
-                            domain_secondary=current_client_domain_2,
+                            domain=pg_domain,
+                            domain_secondary=pg_domain_secondary,
                         )
                     except Exception as e:  # noqa: BLE001
                         log.warning(
-                            "parse-site: обновление POSTGRES.clients_requests domain_2 не удалось для ИНН %s: %s",
+                            "parse-site: обновление POSTGRES.clients_requests доменов не удалось для ИНН %s: %s",
                             inn,
                             e,
                         )
                     else:
-                        synced_client_domain_2 = current_client_domain_2
+                        if domain_1_changed:
+                            synced_client_domain_1 = current_client_domain_1
+                            client_domain_lookup = (
+                                f"www.{synced_client_domain_1}"
+                                if synced_client_domain_1
+                                else None
+                            )
+                        if domain_2_changed:
+                            synced_client_domain_2 = current_client_domain_2
                         log.info(
-                            "parse-site: domain_2 обновлён в POSTGRES.clients_requests → %s",
-                            f"www.{current_client_domain_2}",
+                            "parse-site: clients_requests обновлены в POSTGRES → domain_1=%s, domain_2=%s",
+                            f"www.{synced_client_domain_1}" if synced_client_domain_1 else None,
+                            f"www.{synced_client_domain_2}" if synced_client_domain_2 else None,
                         )
 
                     if company_id_pd:
+                        pd_domain = current_client_domain_1 if domain_1_changed else None
+                        pd_domain_secondary = (
+                            current_client_domain_2
+                            if domain_2_changed
+                            else synced_client_domain_2
+                        )
                         try:
                             await push_clients_request_pd(
                                 summary_for_client,
-                                domain=None,
-                                domain_secondary=current_client_domain_2,
+                                domain=pd_domain,
+                                domain_secondary=pd_domain_secondary,
                             )
                         except Exception as e:  # noqa: BLE001
                             if not mirror_failed_logged:
                                 log.warning(
-                                    "mirror parsing_data failed для обновления domain_2 (ИНН %s): %s",
+                                    "mirror parsing_data failed для обновления доменов (ИНН %s): %s",
                                     inn,
                                     e,
                                 )
                                 mirror_failed_logged = True
                         else:
                             log.info(
-                                "parse-site: domain_2 обновлён в parsing_data.clients_requests → %s",
-                                f"www.{current_client_domain_2}",
+                                "parse-site: clients_requests обновлены в parsing_data → domain_1=%s, domain_2=%s",
+                                f"www.{synced_client_domain_1}" if synced_client_domain_1 else None,
+                                f"www.{synced_client_domain_2}" if synced_client_domain_2 else None,
                             )
 
+        if chunks_payload:
             if company_id_pg is None:
                 raise HTTPException(
                     status_code=500,
@@ -1076,8 +1218,12 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         log.warning("parse-site: все домены завершились ошибкой для ИНН %s → %s", inn, errors)
         raise HTTPException(status_code=502, detail=errors)
 
-    final_domain_1 = client_domains_success[0] if client_domains_success else None
-    final_domain_2 = client_domains_success[1] if len(client_domains_success) > 1 else None
+    final_ordered_domains = _sort_domains_by_score(
+        client_domain_scores,
+        domain_order_index,
+    )
+    final_domain_1 = final_ordered_domains[0] if final_ordered_domains else None
+    final_domain_2 = final_ordered_domains[1] if len(final_ordered_domains) > 1 else None
 
     log.info(
         "parse-site: финальные домены для clients_requests → domain_1=%s, domain_2=%s",
