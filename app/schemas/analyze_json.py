@@ -68,6 +68,10 @@ class AnalyzeFromInnRun(BaseModel):
         None,
         description="Полный ответ внешнего сервиса (для отладки)",
     )
+    external_response_raw: Optional[Any] = Field(
+        None,
+        description="Непреобразованный ответ внешнего сервиса (включая исходный текст LLM)",
+    )
 
 
 class AnalyzeFromInnResponse(BaseModel):
@@ -112,6 +116,10 @@ class AnalyzeFromInnResponse(BaseModel):
     external_response: Optional[dict[str, Any]] = Field(
         None,
         description="Полный ответ внешнего сервиса по первому домену (для отладки)",
+    )
+    external_response_raw: Optional[Any] = Field(
+        None,
+        description="Непреобразованный ответ внешнего сервиса по первому домену",
     )
     total_text_length: int = Field(
         ..., description="Суммарная длина текстов, отправленных по всем доменам"

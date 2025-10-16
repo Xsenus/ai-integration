@@ -64,6 +64,29 @@ _LARGE_TEXT_KEYS = {
 _DOMAIN_SPLIT_RE = re.compile(r"[\s,;]+")
 
 
+def _extract_llm_answer(payload: Any) -> Optional[str]:
+    """Достаёт исходный ответ модели из различных блоков ответа сервиса."""
+
+    if isinstance(payload, Mapping):
+        answer = payload.get("answer_raw")
+        if isinstance(answer, str) and answer.strip():
+            return answer.strip()
+
+        parsed = payload.get("parsed")
+        if isinstance(parsed, Mapping):
+            candidate = parsed.get("LLM_ANSWER") or parsed.get("answer")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        db_payload = payload.get("db_payload")
+        if isinstance(db_payload, Mapping):
+            candidate = db_payload.get("llm_answer")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+    return None
+
+
 def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Готовит компактное представление тела запроса для логов."""
 
@@ -952,6 +975,7 @@ def _sanitize_catalog_items(
     name_keys: Iterable[str],
     id_keys: Iterable[str],
     score_keys: Iterable[str],
+    text_keys: Iterable[str] = ("text",),
 ) -> list[dict[str, Any]]:
     """Сокращает описание элементов каталога, убирая векторы и служебные поля."""
 
@@ -963,20 +987,34 @@ def _sanitize_catalog_items(
         if isinstance(raw_item, str):
             candidate = raw_item.strip()
             if candidate:
-                sanitized_items.append({"name": candidate})
+                sanitized_items.append({"name": candidate, "text": candidate})
             continue
         if not isinstance(raw_item, Mapping):
             continue
         name_value: Optional[str] = None
+        text_value: Optional[str] = None
+        for key in text_keys:
+            candidate = raw_item.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                text_value = candidate.strip()
+                break
         for key in name_keys:
             candidate = raw_item.get(key)
             if isinstance(candidate, str) and candidate.strip():
                 name_value = candidate.strip()
                 break
         if not name_value:
+            name_value = text_value
+        if not name_value:
             continue
 
         item_payload: dict[str, Any] = {"name": name_value}
+        if text_value:
+            item_payload["text"] = text_value
+        elif isinstance(raw_item.get("text"), str):
+            stripped = raw_item["text"].strip()
+            if stripped:
+                item_payload["text"] = stripped
 
         for key in id_keys:
             candidate_id = raw_item.get(key)
@@ -1014,6 +1052,7 @@ def _sanitize_db_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 name_keys=("name", "goods_type"),
                 id_keys=("match_id", "id", "goods_type_id", "goods_type_ID"),
                 score_keys=("score", "goods_types_score", "match_score"),
+                text_keys=("text", "goods_type"),
             )
             continue
         if key in {"equipment", "equipment_site"}:
@@ -1022,6 +1061,7 @@ def _sanitize_db_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 name_keys=("name", "equipment"),
                 id_keys=("match_id", "id", "equipment_id", "equipment_ID"),
                 score_keys=("score", "equipment_score", "match_score"),
+                text_keys=("text", "equipment"),
             )
             continue
         if key == "prodclass" and isinstance(value, Mapping):
@@ -1200,7 +1240,12 @@ async def _apply_db_payload(
                 for item in goods_items:
                     if not isinstance(item, dict):
                         continue
-                    name = (item.get("name") or item.get("goods_type") or "").strip()
+                    name = (
+                        item.get("name")
+                        or item.get("goods_type")
+                        or item.get("text")
+                        or ""
+                    ).strip()
                     if not name:
                         continue
                     match_id = _safe_int(item.get("match_id") or item.get("id") or item.get("goods_type_ID"))
@@ -1247,7 +1292,12 @@ async def _apply_db_payload(
                 for item in equipment_items:
                     if not isinstance(item, dict):
                         continue
-                    name = (item.get("name") or item.get("equipment") or "").strip()
+                    name = (
+                        item.get("name")
+                        or item.get("equipment")
+                        or item.get("text")
+                        or ""
+                    ).strip()
                     if not name:
                         continue
                     match_id = _safe_int(item.get("match_id") or item.get("id") or item.get("equipment_ID"))
@@ -1532,6 +1582,33 @@ async def _run_analyze(
                 },
             )
 
+        sanitized_external_response = _sanitize_external_response(response_json)
+
+        log.info(
+            "analyze-json: external response summary #%s (inn=%s, domain=%s) → %s",
+            idx,
+            inn,
+            domain_label,
+            sanitized_external_response,
+        )
+        llm_answer = _extract_llm_answer(response_json)
+        if llm_answer:
+            log.info(
+                "analyze-json: external LLM answer #%s (inn=%s, domain=%s, length=%s, preview=%s)",
+                idx,
+                inn,
+                domain_label,
+                len(llm_answer),
+                llm_answer[:_TEXT_PREVIEW_LIMIT],
+            )
+        log.debug(
+            "analyze-json: external raw response #%s (inn=%s, domain=%s) %s",
+            idx,
+            inn,
+            domain_label,
+            response_json,
+        )
+
         db_payload = response_json.get("db_payload") if isinstance(response_json, dict) else None
         if not isinstance(db_payload, dict):
             _log_and_raise(
@@ -1584,7 +1661,8 @@ async def _run_analyze(
             prodclass_score=prodclass_score,
             external_request=sanitized_request_payload,
             external_status=response.status_code,
-            external_response=_sanitize_external_response(response_json),
+            external_response=sanitized_external_response,
+            external_response_raw=response_json,
         )
         runs.append(run)
 
@@ -1612,6 +1690,7 @@ async def _run_analyze(
         external_request=first_run.external_request if first_run else None,
         external_status=first_run.external_status if first_run else 0,
         external_response=first_run.external_response,
+        external_response_raw=first_run.external_response_raw if first_run else None,
         total_text_length=total_text_length,
         total_saved_goods=total_saved_goods,
         total_saved_equipment=total_saved_equipment,
