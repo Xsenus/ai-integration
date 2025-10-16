@@ -1236,7 +1236,7 @@ async def _apply_db_payload(
                         (:pid, :name, :score, :match_id,
                          CASE WHEN :vec IS NULL THEN NULL ELSE CAST(:vec AS vector) END)
                     """
-                )
+                ).bindparams(bindparam("vec", type_=Text()))
                 for item in goods_items:
                     if not isinstance(item, dict):
                         continue
@@ -1288,7 +1288,7 @@ async def _apply_db_payload(
                         (:pid, :name, :score, :match_id,
                          CASE WHEN :vec IS NULL THEN NULL ELSE CAST(:vec AS vector) END)
                     """
-                )
+                ).bindparams(bindparam("vec", type_=Text()))
                 for item in equipment_items:
                     if not isinstance(item, dict):
                         continue
