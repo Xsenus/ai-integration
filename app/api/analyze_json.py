@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import httpx
 from fastapi import APIRouter, HTTPException, status
@@ -36,6 +37,9 @@ _http_client: httpx.AsyncClient | None = None
 _http_client_lock = asyncio.Lock()
 
 _TEXT_PREVIEW_LIMIT = 400
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
+_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _LARGE_VECTOR_KEYS = {
     "description_vector",
     "text_vector",
@@ -280,40 +284,99 @@ def _normalize_catalog_vector(value: Any) -> Any:
     return value
 
 
-def _format_catalog_vector(value: Any) -> Optional[Any]:
-    """Подготавливает представление вектора каталога для внешнего API."""
+def _vector_values_to_literal(values: Sequence[float]) -> str:
+    """Возвращает строковое представление вектора в формате pgvector."""
+
+    return json.dumps(list(values), ensure_ascii=False, separators=(",", ":"))
+
+
+def _build_catalog_vector_payload(value: Any) -> Optional[dict[str, Any]]:
+    """Формирует структуру CatalogVector c literal и values, если возможно."""
 
     if value is None:
         return None
 
-    if isinstance(value, (list, tuple)):
-        formatted_values: list[float] = []
+    literal: Optional[str] = None
+    values: list[float] | None = None
+
+    if isinstance(value, Mapping):
+        raw_literal = value.get("literal") or value.get("vec") or value.get("text")
+        if isinstance(raw_literal, str):
+            candidate = raw_literal.strip()
+            literal = candidate or None
+        raw_values = value.get("values") or value.get("data") or value.get("vector")
+        if isinstance(raw_values, (list, tuple)):
+            values = []
+            for part in raw_values:
+                try:
+                    values.append(float(part))
+                except Exception:  # noqa: BLE001
+                    continue
+            if not values:
+                values = None
+    elif isinstance(value, (list, tuple)):
+        values = []
         for part in value:
             try:
-                formatted_values.append(float(part))
+                values.append(float(part))
             except Exception:  # noqa: BLE001
                 continue
-        return formatted_values or None
-
-    if isinstance(value, str):
-        literal = value.strip()
-        return literal or None
-
-    try:
-        numeric = float(value)
-    except Exception:  # noqa: BLE001
+        if not values:
+            values = None
+    elif isinstance(value, str):
+        literal_candidate = value.strip()
+        literal = literal_candidate or None
         try:
-            literal = str(value).strip()
+            parsed = json.loads(value)
         except Exception:  # noqa: BLE001
-            return None
-        return literal or None
-    return [numeric]
+            parsed = None
+        if isinstance(parsed, list):
+            values = []
+            for part in parsed:
+                try:
+                    values.append(float(part))
+                except Exception:  # noqa: BLE001
+                    continue
+            if not values:
+                values = None
+    else:
+        try:
+            numeric = float(value)
+        except Exception:  # noqa: BLE001
+            try:
+                literal_candidate = str(value).strip()
+            except Exception:  # noqa: BLE001
+                literal_candidate = ""
+            literal = literal_candidate or None
+        else:
+            values = [numeric]
+
+    if values:
+        literal = literal or _vector_values_to_literal(values)
+    if literal:
+        payload: dict[str, Any] = {"literal": literal}
+        if values:
+            payload["values"] = values
+        return payload
+    if values:
+        return {"values": values}
+    return None
+
+
+def _prepare_text_for_external(text: str) -> str:
+    """Удаляет управляющие символы и лишние пробелы перед отправкой во внешний сервис."""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _CONTROL_CHAR_RE.sub(" ", normalized)
+    normalized = _MULTI_SPACE_RE.sub(" ", normalized)
+    normalized = _MULTI_NEWLINE_RE.sub("\n\n", normalized)
+    return normalized.strip()
 
 
 def _prepare_catalog_payload(
     catalog: Iterable[Mapping[str, Any]]
-) -> Optional[list[dict[str, Any]]]:
-    """Формирует структуру каталога в формате, ожидаемом внешним API."""
+) -> Optional[dict[str, Any]]:
+    """Формирует структуру каталога в формате CatalogItemsPayload."""
 
     items: list[dict[str, Any]] = []
     for item in catalog:
@@ -331,7 +394,7 @@ def _prepare_catalog_payload(
             except Exception:  # noqa: BLE001
                 prepared["id"] = item_id
 
-        vec_payload = _format_catalog_vector(item.get("vec"))
+        vec_payload = _build_catalog_vector_payload(item.get("vec"))
         if vec_payload is not None:
             prepared["vec"] = vec_payload
 
@@ -340,7 +403,7 @@ def _prepare_catalog_payload(
     if not items:
         return None
 
-    return items
+    return {"items": items}
 
 
 async def _load_catalog(
@@ -1338,7 +1401,27 @@ async def _run_analyze(
         domain_label = snapshot.domain or ""
         domain_source = snapshot.domain_source or ("domain_1" if domain_label else "auto")
         domains_processed.append(domain_label or "(unknown)")
-        text_length = len(snapshot.text)
+
+        prepared_text = _prepare_text_for_external(snapshot.text)
+        if not prepared_text:
+            _log_and_raise(
+                status.HTTP_502_BAD_GATEWAY,
+                inn=inn,
+                detail="Текст pars_site пустой после нормализации",
+                request_context=payload_data,
+                extra={
+                    "snapshot": {
+                        "pars_id": snapshot.pars_id,
+                        "company_id": snapshot.company_id,
+                        "domain": domain_label or None,
+                        "domain_source": domain_source,
+                        "chunks": len(snapshot.chunk_ids),
+                    }
+                },
+            )
+
+        raw_text_length = len(snapshot.text)
+        text_length = len(prepared_text)
         snapshot_context = {
             "pars_id": snapshot.pars_id,
             "company_id": snapshot.company_id,
@@ -1346,6 +1429,7 @@ async def _run_analyze(
             "domain_source": domain_source,
             "chunks": len(snapshot.chunk_ids),
             "text_length": text_length,
+            "text_length_raw": raw_text_length,
         }
         log.info(
             "analyze-json: preparing request #%s (inn=%s, snapshot=%s)",
@@ -1356,9 +1440,10 @@ async def _run_analyze(
 
         request_payload: dict[str, Any] = {
             "pars_id": snapshot.pars_id,
-            "company_id": snapshot.company_id,
-            "text_par": snapshot.text,
+            "text_par": prepared_text,
         }
+        if snapshot.company_id is not None:
+            request_payload["company_id"] = snapshot.company_id
         if payload.chat_model:
             request_payload["chat_model"] = payload.chat_model
         elif settings.CHAT_MODEL:

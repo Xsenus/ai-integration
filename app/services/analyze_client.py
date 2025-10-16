@@ -11,7 +11,6 @@ from app.config import settings
 
 log = logging.getLogger("services.analyze_client")
 
-_DEFAULT_ANALYZE_BASE = "http://37.221.125.221:8123"
 _MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 0.5
 
@@ -141,99 +140,88 @@ async def fetch_site_description(
     if chat_model:
         payload["chat_model"] = chat_model
 
-    bases: list[str] = []
-    primary = _normalize_base(settings.analyze_base)
-    fallback = _normalize_base(_DEFAULT_ANALYZE_BASE)
-    if primary:
-        bases.append(primary)
-    if fallback and fallback not in bases:
-        bases.append(fallback)
+    base_url = _normalize_base(settings.analyze_base)
+    if not base_url:
+        log.warning("analyze-client: ANALYZE_BASE не настроен (%s)", label)
+        return None, None
 
-    for base in bases:
-        response = await _post_with_retries(base, "/v1/site-profile", payload, label=label)
-        if response is None:
-            continue
-        if response.status_code >= 400:
-            log.warning(
-                "analyze-client: внешний сервис вернул %s (%s @ %s)",
-                response.status_code,
-                label,
-                base,
-            )
-            continue
-        try:
-            data = response.json()
-        except ValueError:  # noqa: BLE001
-            log.warning("analyze-client: не-JSON ответ (%s @ %s)", label, base)
-            continue
-        description_raw = data.get("description")
-        description = (
-            str(description_raw).strip()
-            if isinstance(description_raw, str) and description_raw.strip()
-            else None
+    response = await _post_with_retries(base_url, "/v1/site-profile", payload, label=label)
+    if response is None:
+        return None, None
+    if response.status_code >= 400:
+        log.warning(
+            "analyze-client: внешний сервис вернул %s (%s @ %s)",
+            response.status_code,
+            label,
+            base_url,
         )
-        vector = _coerce_vector(data.get("description_vector"))
+        return None, None
+    try:
+        data = response.json()
+    except ValueError:  # noqa: BLE001
+        log.warning("analyze-client: не-JSON ответ (%s @ %s)", label, base_url)
+        return None, None
+    description_raw = data.get("description")
+    description = (
+        str(description_raw).strip()
+        if isinstance(description_raw, str) and description_raw.strip()
+        else None
+    )
+    vector = _coerce_vector(data.get("description_vector"))
 
-        if vector is None:
-            literal = data.get("description_vector_literal") or data.get("vector_literal")
-            if isinstance(literal, str):
-                vector = _coerce_vector(literal)
-        if description:
-            log.info(
-                "analyze-client: описание получено (%s, base=%s, vector=%s)",
-                label,
-                base,
-                bool(vector),
-            )
-        else:
-            log.info("analyze-client: описание отсутствует (%s, base=%s)", label, base)
-        return description, vector
-
-    return None, None
+    if vector is None:
+        literal = data.get("description_vector_literal") or data.get("vector_literal")
+        if isinstance(literal, str):
+            vector = _coerce_vector(literal)
+    if description:
+        log.info(
+            "analyze-client: описание получено (%s, base=%s, vector=%s)",
+            label,
+            base_url,
+            bool(vector),
+        )
+    else:
+        log.info("analyze-client: описание отсутствует (%s, base=%s)", label, base_url)
+    return description, vector
 
 
 async def fetch_embedding(text: str, *, label: str) -> Optional[list[float]]:
     payload = {"q": text}
-    bases: list[str] = []
-    primary = _normalize_base(settings.analyze_base)
-    fallback = _normalize_base(_DEFAULT_ANALYZE_BASE)
-    if primary:
-        bases.append(primary)
-    if fallback and fallback not in bases:
-        bases.append(fallback)
+    base_url = _normalize_base(settings.analyze_base)
+    if not base_url:
+        log.warning("analyze-client: ANALYZE_BASE не настроен (%s)", label)
+        return None
 
-    for base in bases:
-        response = await _post_with_retries(base, "/ai-search", payload, label=label)
-        if response is None:
-            continue
-        if response.status_code >= 400:
-            log.warning(
-                "analyze-client: embedding сервис вернул %s (%s @ %s)",
-                response.status_code,
-                label,
-                base,
-            )
-            continue
-        try:
-            data = response.json()
-        except ValueError:  # noqa: BLE001
-            log.warning("analyze-client: embedding ответ не-JSON (%s @ %s)", label, base)
-            continue
-        vector = _coerce_vector(
-            data.get("embedding")
-            or data.get("vector")
-            or data.get("description_vector")
+    response = await _post_with_retries(base_url, "/ai-search", payload, label=label)
+    if response is None:
+        return None
+    if response.status_code >= 400:
+        log.warning(
+            "analyze-client: embedding сервис вернул %s (%s @ %s)",
+            response.status_code,
+            label,
+            base_url,
         )
-        if vector:
-            log.info(
-                "analyze-client: embedding получен (%s, base=%s, size=%s)",
-                label,
-                base,
-                len(vector),
-            )
-            return vector
-        log.info("analyze-client: embedding пустой (%s, base=%s)", label, base)
-
+        return None
+    try:
+        data = response.json()
+    except ValueError:  # noqa: BLE001
+        log.warning("analyze-client: embedding ответ не-JSON (%s @ %s)", label, base_url)
+        return None
+    vector = _coerce_vector(
+        data.get("embedding")
+        or data.get("vector")
+        or data.get("description_vector")
+    )
+    if vector:
+        log.info(
+            "analyze-client: embedding получен (%s, base=%s, size=%s)",
+            label,
+            base_url,
+            len(vector),
+        )
+        return vector
+    log.info("analyze-client: embedding пустой (%s, base=%s)", label, base_url)
     return None
 
 
