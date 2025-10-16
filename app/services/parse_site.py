@@ -603,7 +603,11 @@ def _normalize_and_split_domain(domain_or_url: str) -> tuple[str, str]:
     """
 
     home_url = to_home_url(domain_or_url)
-    normalized_domain = _urlparse(home_url).netloc.replace("www.", "")
+    parsed = _urlparse(home_url)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    normalized_domain = host
     return home_url, normalized_domain
 
 

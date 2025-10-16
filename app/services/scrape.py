@@ -48,7 +48,9 @@ def to_home_url(domain_or_url: str) -> str:
     if "://" not in d:
         d = "https://" + d
     parsed = urlparse(d)
-    host = parsed.netloc.replace("www.", "")
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
     return f"https://{host}/"
 
 
