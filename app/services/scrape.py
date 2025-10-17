@@ -112,7 +112,7 @@ def _resolve_effective_url(requested_url: str, response: httpx.Response) -> str:
 async def fetch_home_via_scraperapi(
     domain_or_url: str,
     *,
-    retries: int = 3,
+    retries: int = 2,
     max_redirects: int | None = None,
 ) -> tuple[str, str]:
     if not settings.SCRAPERAPI_KEY:
@@ -127,7 +127,16 @@ async def fetch_home_via_scraperapi(
     if redirect_limit < 0:
         redirect_limit = 0
 
-    client_kwargs: dict[str, Any] = {"timeout": 60, "follow_redirects": False}
+    timeout_s = max(1, int(settings.PARSE_HTTP_TIMEOUT))
+    client_kwargs: dict[str, Any] = {
+        "timeout": httpx.Timeout(
+            timeout_s,
+            connect=min(float(timeout_s), 5.0),
+            read=float(timeout_s),
+            write=min(float(timeout_s), 5.0),
+        ),
+        "follow_redirects": False,
+    }
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         while True:

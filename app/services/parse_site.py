@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from fastapi import HTTPException
@@ -146,6 +147,15 @@ class ParseSiteResponse(BaseModel):
     results: list[ParsedSiteResult]
     okved_text: str | None = None
     okved_alerts: list[OkvedAlert] = Field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _DomainFetchResult:
+    requested_domain: str
+    home_url: str | None = None
+    chunks: list[str] | None = None
+    normalized_domain: str | None = None
+    error: str | None = None
 
 
 def _normalize_domain_candidate(domain: str) -> Optional[str]:
@@ -404,11 +414,16 @@ async def _generate_site_description(
     if not text.strip():
         return None, None
 
-    description, vector = await fetch_site_description(
-        text,
-        embed_model=settings.embed_model,
-        label=f"site:{inn}:{domain}",
-    )
+    label = f"site:{inn}:{domain}"
+    try:
+        description, vector = await fetch_site_description(
+            text,
+            embed_model=settings.embed_model,
+            label=label,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("parse-site: не удалось получить описание (%s): %s", label, exc)
+        return None, None
     if description and not vector:
         vector = await _embed_text(description, label=f"site-desc:{inn}:{domain}")
     return description, vector
@@ -418,7 +433,11 @@ async def _embed_text(text: str, *, label: str) -> Optional[list[float]]:
     if not text.strip():
         return None
 
-    vector = await fetch_embedding(text, label=label)
+    try:
+        vector = await fetch_embedding(text, label=label)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("parse-site: не удалось получить embedding (%s): %s", label, exc)
+        return None
     if vector:
         log.info("parse-site: embedding получен (%s, size=%s)", label, len(vector))
     else:
@@ -862,18 +881,17 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
 
     planned_domains = list(domains_to_process)
 
-    results: list[ParsedSiteResult] = []
-    successes: list[ParsedSiteResult] = []
-    total_inserted = 0
-    successful_used_domains: list[str] = []
-    okved_alerts: list[OkvedAlert] = []
+    total_domains_to_fetch = len(domains_to_process)
 
-    for idx, domain_candidate in enumerate(domains_to_process, start=1):
+    async def _fetch_domain_parallel(
+        domain_candidate: str,
+        position: int,
+    ) -> _DomainFetchResult:
         log.info(
             "parse-site: начинаем обработку домена %s (%s/%s)",
             domain_candidate,
-            idx,
-            len(domains_to_process),
+            position,
+            total_domains_to_fetch,
         )
         try:
             home_url, chunks, normalized_domain = await fetch_and_chunk(domain_candidate)
@@ -884,11 +902,55 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                 home_url,
                 normalized_domain,
             )
+            return _DomainFetchResult(
+                requested_domain=domain_candidate,
+                home_url=home_url,
+                chunks=chunks,
+                normalized_domain=normalized_domain,
+            )
         except FetchError as e:
             log.warning(
                 "parse-site: ошибка парсинга домена %s → %s",
                 domain_candidate,
                 e,
+            )
+            return _DomainFetchResult(requested_domain=domain_candidate, error=str(e))
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "parse-site: непредвиденная ошибка при обработке домена %s",
+                domain_candidate,
+            )
+            message = str(e) or e.__class__.__name__
+            return _DomainFetchResult(requested_domain=domain_candidate, error=message)
+
+    fetch_tasks = [
+        asyncio.create_task(_fetch_domain_parallel(domain_candidate, idx))
+        for idx, domain_candidate in enumerate(domains_to_process, start=1)
+    ]
+    fetch_results_pool: dict[str, list[_DomainFetchResult]] = {}
+    if fetch_tasks:
+        fetched_results = await asyncio.gather(*fetch_tasks)
+        for fetch_result in fetched_results:
+            fetch_results_pool.setdefault(fetch_result.requested_domain, []).append(fetch_result)
+
+    results: list[ParsedSiteResult] = []
+    successes: list[ParsedSiteResult] = []
+    total_inserted = 0
+    successful_used_domains: list[str] = []
+    okved_alerts: list[OkvedAlert] = []
+
+    for idx, domain_candidate in enumerate(domains_to_process, start=1):
+        domain_results = fetch_results_pool.get(domain_candidate, [])
+        fetch_result = domain_results.pop(0) if domain_results else None
+        if domain_results:
+            fetch_results_pool[domain_candidate] = domain_results
+        elif domain_candidate in fetch_results_pool and not domain_results:
+            fetch_results_pool.pop(domain_candidate, None)
+
+        if fetch_result is None:
+            log.warning(
+                "parse-site: результат загрузки отсутствует для домена %s",
+                domain_candidate,
             )
             results.append(
                 ParsedSiteResult(
@@ -897,7 +959,37 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                     url=None,
                     chunks_inserted=0,
                     success=False,
-                    error=str(e),
+                    error="Результат загрузки отсутствует",
+                )
+            )
+            continue
+
+        if fetch_result.error:
+            results.append(
+                ParsedSiteResult(
+                    requested_domain=domain_candidate,
+                    used_domain=None,
+                    url=None,
+                    chunks_inserted=0,
+                    success=False,
+                    error=fetch_result.error,
+                )
+            )
+            continue
+
+        home_url = fetch_result.home_url
+        normalized_domain = fetch_result.normalized_domain
+        chunks = list(fetch_result.chunks or [])
+
+        if not home_url or not normalized_domain:
+            results.append(
+                ParsedSiteResult(
+                    requested_domain=domain_candidate,
+                    used_domain=None,
+                    url=None,
+                    chunks_inserted=0,
+                    success=False,
+                    error=fetch_result.error or "Не удалось получить главную страницу",
                 )
             )
             continue
