@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,10 +14,18 @@ from app.db.parsing_mirror import push_clients_request_pg
 from app.db.pp719 import pp719_has_inn
 from app.models.bitrix import DaDataResult
 from app.repo.bitrix_repo import get_last_raw, replace_dadata_raw, upsert_company_summary
+from app.schemas.ai_analyzer import (
+    AiAnalyzerResponse,
+    AiBlock,
+    AiEquipment,
+    AiProduct,
+    CompanyBlock,
+)
 from app.schemas.org import CompanyCard, CompanySummaryOut, OrgExtendedResponse
 from app.services.dadata_client import find_party_by_inn
 from app.services.mapping import map_summary_from_dadata
 from app.services.parse_site import schedule_parse_site_background
+from app.services.ai_analyzer import analyze_company_by_inn
 
 log = logging.getLogger("api.lookup")
 router = APIRouter(prefix="/v1/lookup", tags=["lookup"])
@@ -205,6 +213,50 @@ def _card_from_summary_dict(d: dict) -> CompanyCard:
     return card
 
 
+def _ai_analyzer_response_from_payload(
+    inn: str,
+    payload: Mapping[str, Any] | None,
+) -> AiAnalyzerResponse:
+    data = dict(payload or {})
+
+    company = CompanyBlock(
+        domain1=
+        data.get("domain1")
+        or data.get("domain1_description"),
+        domain2=
+        data.get("domain2")
+        or data.get("domain2_description"),
+    )
+
+    products = [
+        AiProduct.model_validate(item)
+        for item in (data.get("products") or [])
+        if item is not None
+    ]
+    equipment = [
+        AiEquipment.model_validate(item)
+        for item in (data.get("equipment") or [])
+        if item is not None
+    ]
+
+    ai_block = AiBlock(
+        industry=data.get("industry") or data.get("industry_label"),
+        sites=list(data.get("sites") or []),
+        products=products,
+        equipment=equipment,
+        utp=data.get("utp"),
+        letter=data.get("letter"),
+    )
+
+    return AiAnalyzerResponse(
+        ok=True,
+        inn=inn,
+        company=company,
+        ai=ai_block,
+        note=data.get("note"),
+    )
+
+
 async def _load_local_summary(
     session: AsyncSession, inn: str
 ) -> tuple[DaDataResult | None, CompanySummaryOut | None, dict | None, dict | None]:
@@ -353,3 +405,35 @@ async def lookup_card_get(
         schedule_parse=False,
         parse_reason="lookup/card-get",
     )
+
+
+@router.get(
+    "/{inn}/ai-analyzer",
+    response_model=AiAnalyzerResponse,
+    summary="AI-анализ компании по ИНН (GET)",
+)
+async def lookup_ai_analyzer(
+    inn: str = Path(
+        ...,
+        min_length=10,
+        max_length=12,
+        pattern=r"^\d{10}(\d{2})?$",
+        description="ИНН компании (10 или 12 цифр)",
+    ),
+) -> AiAnalyzerResponse:
+    log.info("lookup: ai-analyzer requested (inn=%s)", inn)
+    try:
+        payload = await analyze_company_by_inn(inn)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("lookup: ai-analyzer failed (inn=%s)", inn)
+        raise HTTPException(status_code=500, detail="Не удалось выполнить AI-анализ") from exc
+
+    response = _ai_analyzer_response_from_payload(inn, payload)
+    log.info(
+        "lookup: ai-analyzer succeeded (inn=%s, sites=%s, products=%s, equipment=%s)",
+        inn,
+        len(response.ai.sites),
+        len(response.ai.products),
+        len(response.ai.equipment),
+    )
+    return response

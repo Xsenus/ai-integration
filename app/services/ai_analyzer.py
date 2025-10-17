@@ -33,6 +33,17 @@ _GROUP_NAME_COLUMNS = (
     "class_name",
 )
 
+_ADDITIONAL_LOOKUP_COLUMNS = (
+    "goods_type_name",
+    "goods_type_code",
+    "equipment_name",
+    "equipment_code",
+    "prodclass",
+    "prodclass_name",
+    "prodclass_title",
+    "prodclass_text",
+)
+
 _MAX_PRODUCTS = 100
 _MAX_EQUIPMENT = 100
 
@@ -123,7 +134,7 @@ async def _load_lookup_table(
         if not id_col:
             continue
         select_cols: list[str] = [id_col]
-        for col in (*_PREFERRED_NAME_COLUMNS, *_GROUP_NAME_COLUMNS, "code"):
+        for col in (*_PREFERRED_NAME_COLUMNS, *_GROUP_NAME_COLUMNS, "code", *_ADDITIONAL_LOOKUP_COLUMNS):
             if col in cols and col not in select_cols:
                 select_cols.append(col)
         try:
@@ -161,6 +172,36 @@ def _score_sort_key(row: Mapping[str, Any], score_key: str) -> tuple[float, int]
     primary = -score if score is not None else 1.0
     identifier = _safe_int(row.get("id")) or 0
     return primary, identifier
+
+
+def _lookup_value(info: Mapping[str, Any] | None, keys: Iterable[str]) -> Optional[str]:
+    if not info:
+        return None
+    for key in keys:
+        value = info.get(key)
+        if value:
+            return str(value).strip()
+    return None
+
+
+def _format_with_id(name: Optional[str], identifier: Any) -> Optional[str]:
+    clean_name = str(name).strip() if name else None
+    if identifier is None or identifier == "":
+        return clean_name
+    ident_str = str(identifier).strip()
+    if not ident_str:
+        return clean_name
+    bracketed = f"[{ident_str}]"
+    return f"{bracketed} {clean_name}".strip() if clean_name else bracketed
+
+
+def _format_with_code(name: Optional[str], code: Any) -> Optional[str]:
+    clean_name = str(name).strip() if name else None
+    code_str = str(code).strip() if code is not None else ""
+    if code_str:
+        bracketed = f"[{code_str}]"
+        return f"{bracketed} {clean_name}".strip() if clean_name else bracketed
+    return clean_name
 
 
 def _domain_from_value(value: Optional[str]) -> Optional[str]:
@@ -229,15 +270,30 @@ def _resolve_goods_group(
     lookup: Mapping[Any, Mapping[str, Any]] | None,
 ) -> Optional[str]:
     goods_id = row.get("goods_type_id")
-    label = _resolve_from_lookup(lookup, goods_id, prefer_group=True)
+    info = lookup.get(goods_id) if lookup else None
+    label = _lookup_value(
+        info,
+        (
+            "goods_type_name",
+            "name",
+            "title",
+            "full_name",
+            "short_name",
+            "label",
+            "group_name",
+            "section_name",
+            "category_name",
+            "class_name",
+        ),
+    )
     if not label:
         label = str(row.get("goods_type") or "").strip() or None
-    if label and goods_id is not None and str(goods_id) not in label:
-        return f"{label} (ID {goods_id})"
-    if label:
-        return label
+    code = _lookup_value(info, ("goods_type_code", "code"))
+    formatted = _format_with_code(label, code)
+    if formatted:
+        return formatted
     if goods_id is not None:
-        return f"ID {goods_id}"
+        return f"[{goods_id}]"
     return None
 
 
@@ -256,6 +312,39 @@ def _resolve_prodclass_name(
     if identifier is None:
         return None, True
     return f"Prodclass {identifier}", True
+
+
+def _resolve_industry_from_prodclass(
+    prod_rows: Iterable[Mapping[str, Any]],
+    lookup: Mapping[Any, Mapping[str, Any]] | None,
+) -> Optional[str]:
+    for row in sorted(prod_rows, key=lambda r: _score_sort_key(r, "prodclass_score")):
+        identifier = row.get("prodclass")
+        if identifier is None:
+            identifier = row.get("prodclass_id")
+        info = lookup.get(identifier) if lookup else None
+        label = _lookup_value(
+            info,
+            (
+                "prodclass",
+                "prodclass_name",
+                "name",
+                "title",
+                "full_name",
+                "short_name",
+                "label",
+            ),
+        )
+        if not label:
+            for key in ("prodclass_name", "prodclass_title", "prodclass_text"):
+                value = row.get(key)
+                if value:
+                    label = str(value).strip()
+                    break
+        formatted = _format_with_id(label, identifier)
+        if formatted:
+            return formatted
+    return None
 
 
 def _compose_products(
@@ -282,6 +371,7 @@ def _compose_products(
         text_id = _safe_int(row.get("text_pars_id"))
         goods_entry = None
         goods_group = None
+        goods_label = None
         if text_id is not None:
             for candidate in goods_by_text.get(text_id, []):
                 candidate_id = candidate.get("id")
@@ -290,22 +380,30 @@ def _compose_products(
                 goods_entry = candidate
                 goods_group = _resolve_goods_group(candidate, goods_lookup)
                 used_goods_ids.add(candidate_id)
+                goods_label = _format_with_id(
+                    candidate.get("goods_type"),
+                    candidate.get("goods_type_id"),
+                )
                 break
-        if is_placeholder and goods_entry:
-            alt = str(goods_entry.get("goods_type") or "").strip()
-            if alt:
-                name = alt
-                is_placeholder = False
-        if not name:
+        if not goods_label and goods_entry:
+            goods_label = _format_with_id(
+                goods_entry.get("goods_type"),
+                goods_entry.get("goods_type_id"),
+            )
+        if is_placeholder and goods_label:
+            name = goods_label
+            is_placeholder = False
+        final_name = goods_label if goods_label else _format_with_id(name, row.get("prodclass"))
+        if not final_name:
             continue
         domain = _extract_domain(row) or (goods_entry and _extract_domain(goods_entry))
         url = _extract_url(row) or (goods_entry and _extract_url(goods_entry))
-        key = (name, url or domain)
+        key = (final_name, url or domain)
         if key in seen:
             continue
         results.append(
             {
-                "name": name,
+                "name": final_name,
                 "goods_group": goods_group,
                 "domain": domain,
                 "url": url,
@@ -319,16 +417,17 @@ def _compose_products(
             if row.get("id") in used_goods_ids:
                 continue
             name = str(row.get("goods_type") or "").strip()
-            if not name:
+            label = _format_with_id(name, row.get("goods_type_id"))
+            if not label:
                 continue
             domain = _extract_domain(row)
             url = _extract_url(row)
-            key = (name, url or domain)
+            key = (label, url or domain)
             if key in seen:
                 continue
             results.append(
                 {
-                    "name": name,
+                    "name": label,
                     "goods_group": _resolve_goods_group(row, goods_lookup),
                     "domain": domain,
                     "url": url,
@@ -343,20 +442,26 @@ def _resolve_equipment_name(
     row: Mapping[str, Any],
     lookup: Mapping[Any, Mapping[str, Any]] | None,
 ) -> Optional[str]:
-    for key in ("equipment_name", "equipment_title"):
-        value = row.get(key)
-        if value:
-            return str(value).strip()
     identifier = row.get("equipment_id")
-    label = _resolve_from_lookup(lookup, identifier)
-    if label:
-        return label
-    value = row.get("equipment")
-    if value:
-        return str(value).strip()
-    if identifier is not None:
-        return f"Equipment {identifier}"
-    return None
+    info = lookup.get(identifier) if lookup else None
+    label = _lookup_value(
+        info,
+        (
+            "equipment_name",
+            "name",
+            "title",
+            "full_name",
+            "short_name",
+            "label",
+        ),
+    )
+    if not label:
+        value = row.get("equipment")
+        if value:
+            label = str(value).strip()
+    if not label and identifier is not None:
+        label = f"Equipment {identifier}"
+    return _format_with_id(label, identifier)
 
 
 def _resolve_equipment_group(
@@ -364,11 +469,28 @@ def _resolve_equipment_group(
     lookup: Mapping[Any, Mapping[str, Any]] | None,
 ) -> Optional[str]:
     identifier = row.get("equipment_id")
-    label = _resolve_from_lookup(lookup, identifier, prefer_group=True)
-    if label:
-        return label
+    info = lookup.get(identifier) if lookup else None
+    label = _lookup_value(
+        info,
+        (
+            "equipment_name",
+            "group_name",
+            "section_name",
+            "category_name",
+            "class_name",
+            "name",
+            "title",
+            "full_name",
+            "short_name",
+            "label",
+        ),
+    )
+    code = _lookup_value(info, ("equipment_code", "code"))
+    formatted = _format_with_code(label, code)
+    if formatted:
+        return formatted
     if identifier is not None:
-        return f"ID {identifier}"
+        return f"[{identifier}]"
     return None
 
 
@@ -448,7 +570,7 @@ async def analyze_company_by_inn(inn: str) -> dict:
             if await _table_exists(conn, "public", "pars_site"):
                 sql_pars = text(
                     """
-                    SELECT id, domain_1, url, created_at
+                    SELECT id, domain_1, url, created_at, description
                     FROM public.pars_site
                     WHERE company_id = :company_id
                     ORDER BY created_at DESC NULLS LAST, id DESC
@@ -523,6 +645,43 @@ async def analyze_company_by_inn(inn: str) -> dict:
             u = _normalize_site(str(raw)) if raw else None
             if u and u not in urls:
                 urls.append(u)
+    domain_descriptions: list[str] = []
+    seen_desc_keys: set[str] = set()
+    for row in pars_rows:
+        raw_desc = row.get("description")
+        if not raw_desc:
+            continue
+        desc = str(raw_desc).strip()
+        if not desc:
+            continue
+        key_raw = row.get("domain_1") or row.get("url") or row.get("id")
+        if isinstance(key_raw, str):
+            key = key_raw.strip().lower()
+        elif key_raw is not None:
+            key = str(key_raw)
+        else:
+            key = str(row.get("id") or "")
+        if not key:
+            key = str(row.get("id") or "")
+        if key in seen_desc_keys:
+            continue
+        seen_desc_keys.add(key)
+        domain_descriptions.append(desc)
+        if len(domain_descriptions) >= 2:
+            break
+    if len(domain_descriptions) < 2 and cr:
+        for fallback in (cr.get("site_1_description"), cr.get("site_2_description")):
+            if not fallback:
+                continue
+            desc = str(fallback).strip()
+            if not desc or desc in domain_descriptions:
+                continue
+            domain_descriptions.append(desc)
+            if len(domain_descriptions) >= 2:
+                break
+    domain1_description = domain_descriptions[0] if domain_descriptions else None
+    domain2_description = domain_descriptions[1] if len(domain_descriptions) > 1 else None
+
     domain1 = urls[0] if len(urls) >= 1 else None
     domain2 = urls[1] if len(urls) >= 2 else None
 
@@ -567,11 +726,13 @@ async def analyze_company_by_inn(inn: str) -> dict:
                 if row_pg and row_pg.get("main_okved"):
                     okved_fallback = row_pg.get("main_okved")
 
-    # --- индустрия: CR.okved_main > fallback(main_okved) ---
-    okved_src = (cr or {}).get("okved_main") if cr else None
-    if not okved_src:
-        okved_src = okved_fallback
-    industry = _okved_to_industry(okved_src)
+    # --- индустрия: сначала prodclass → fallback(main_okved) ---
+    industry = _resolve_industry_from_prodclass(prod_rows, prod_lookup)
+    if not industry:
+        okved_src = (cr or {}).get("okved_main") if cr else None
+        if not okved_src:
+            okved_src = okved_fallback
+        industry = _okved_to_industry(okved_src)
 
     utp = (cr or {}).get("utp") if cr else None
     letter = (cr or {}).get("pismo") if cr else None
@@ -595,8 +756,10 @@ async def analyze_company_by_inn(inn: str) -> dict:
 
     return {
         "inn": inn,
-        "domain1": domain1,
-        "domain2": domain2,
+        "domain1": domain1_description,
+        "domain2": domain2_description,
+        "domain1_site": domain1,
+        "domain2_site": domain2,
         "industry": industry,
         "sites": [u for u in urls if u],
         "products": products,
