@@ -694,8 +694,9 @@ async def _fetch_equipment_by_workshops(
 
 async def _fetch_industry(conn: AsyncConnection, prodclass_id: int) -> Optional[int]:
     stmt = text("SELECT industry_id FROM ib_prodclass WHERE id = :pid")
-    row = (await conn.execute(stmt, {"pid": prodclass_id})).first()
-    if row is None or row["industry_id"] is None:
+    result = await conn.execute(stmt, {"pid": prodclass_id})
+    row = result.mappings().first()
+    if row is None or row.get("industry_id") is None:
         return None
     return int(row["industry_id"])
 
@@ -951,6 +952,7 @@ async def _sync_equipment_table(
     )
     existing_ids = {int(row["id"]) for row in result.mappings()}
     new_ids = {row.id for row in rows}
+    new_records = len(new_ids - existing_ids)
 
     await conn.execute(
         text(
@@ -972,18 +974,11 @@ async def _sync_equipment_table(
         ],
     )
 
-    stale_ids = sorted(existing_ids - new_ids)
-    if stale_ids:
-        await conn.execute(
-            (
-                text(
-                    f'DELETE FROM "{table_name}" WHERE id IN :ids'
-                ).bindparams(bindparam("ids", expanding=True))
-            ),
-            {"ids": stale_ids},
-        )
     log_messages.append(
-        f"{table_name}: обновлено {len(rows)} записей, удалено устаревших {len(stale_ids)}."
+        (
+            f"{table_name}: обновлено {len(rows)} записей (новых {new_records}). "
+            "Удаление существующих записей не выполнялось."
+        )
     )
 
 
