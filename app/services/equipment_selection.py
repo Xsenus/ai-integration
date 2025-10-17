@@ -143,9 +143,18 @@ def _render_table_preview(title: str, columns: Sequence[str], raw_rows: Sequence
     return "\n".join(lines)
 
 
+def _log_event(
+    log_messages: List[str], message: str, *, level: int = logging.INFO
+) -> None:
+    """Сохраняет сообщение в отчёт и дублирует его в консольный логгер."""
+
+    log_messages.append(message)
+    log.log(level, "equipment-selection: %s", message)
+
+
 def _append_step_separator(log_messages: List[str], title: str) -> None:
     border = "=" * 18
-    log_messages.append(f"{border} {title} {border}")
+    _log_event(log_messages, f"{border} {title} {border}", level=logging.INFO)
 
 
 async def _table_has_column(
@@ -178,6 +187,13 @@ async def _table_has_column(
     )
     exists = result.scalar() is not None
     _COLUMN_EXISTS_CACHE[cache_key] = exists
+    log.debug(
+        "equipment-selection: проверка столбца %s.%s.%s → %s",
+        schema,
+        table_name,
+        column_name,
+        exists,
+    )
     return exists
 
 
@@ -190,9 +206,22 @@ async def _ensure_table_column(
     schema: str = "public",
 ) -> None:
     if await _table_has_column(conn, table_name, column_name, schema=schema):
+        log.debug(
+            "equipment-selection: столбец %s.%s.%s уже существует",
+            schema,
+            table_name,
+            column_name,
+        )
         return
 
     qualified = f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
+    log.info(
+        "equipment-selection: добавляем столбец %s.%s.%s (%s)",
+        schema,
+        table_name,
+        column_name,
+        definition,
+    )
     await conn.execute(
         text(f"ALTER TABLE {qualified} ADD COLUMN {column_name} {definition}"),
     )
@@ -520,8 +549,9 @@ async def build_equipment_tables(
     conn: AsyncConnection, client_request_id: int
 ) -> EquipmentStepReport:
     report = EquipmentStepReport()
-    report.log.append(
-        f"Старт расчёта оборудования для clients_requests.id={client_request_id}."
+    _log_event(
+        report.log,
+        f"Старт расчёта оборудования для clients_requests.id={client_request_id}.",
     )
 
     log.debug(
@@ -535,8 +565,9 @@ async def build_equipment_tables(
     first_row: Dict[str, Any] = {}
     if client_rows:
         first_row = _row_mapping(client_rows[0])
-        company_id = first_row.get("company_id")
-        report.company_id = None if company_id is None else int(company_id)
+    report.company_id = await _resolve_company_id(
+        conn, client_request_id, client_rows, report.log
+    )
     client_columns = ["id"]
     if "company_id" in first_row:
         client_columns.append("company_id")
@@ -552,12 +583,13 @@ async def build_equipment_tables(
         columns=client_columns,
         section_title="Шаг 0 — Клиент",
     )
-    report.log.append(
-        f"Шаг 0: загружена карточка клиента (строк: {len(client_rows)})."
+    _log_event(
+        report.log,
+        f"Шаг 0: загружена карточка клиента (строк: {len(client_rows)}).",
     )
 
     _append_step_separator(report.log, "Шаг 1 — Данные с сайта")
-    goods_types = await _load_goods_types(conn, client_request_id)
+    goods_types = await _load_goods_types(conn, report.company_id)
     report.goods_types = goods_types
     _add_table(
         report,
@@ -576,11 +608,12 @@ async def build_equipment_tables(
         ],
         section_title="Шаг 1 — Данные с сайта",
     )
-    report.log.append(
-        f"Шаг 1.a: найдено {len(goods_types)} записей ai_site_goods_types."
+    _log_event(
+        report.log,
+        f"Шаг 1.a: найдено {len(goods_types)} записей ai_site_goods_types.",
     )
 
-    site_equipment = await _load_site_equipment(conn, client_request_id)
+    site_equipment = await _load_site_equipment(conn, report.company_id)
     report.site_equipment = site_equipment
     _add_table(
         report,
@@ -598,12 +631,13 @@ async def build_equipment_tables(
             "created_at",
         ],
     )
-    report.log.append(
-        f"Шаг 1.b: найдено {len(site_equipment)} элементов оборудования с сайта."
+    _log_event(
+        report.log,
+        f"Шаг 1.b: найдено {len(site_equipment)} элементов оборудования с сайта.",
     )
 
     _append_step_separator(report.log, "Шаг 2 — SCORE_E1 через prodclass")
-    prodclass_rows = await _load_prodclass_rows(conn, client_request_id)
+    prodclass_rows = await _load_prodclass_rows(conn, report.company_id)
     report.prodclass_rows = prodclass_rows
     _add_table(
         report,
@@ -622,8 +656,9 @@ async def build_equipment_tables(
         ],
         section_title="Шаг 2 — SCORE_E1 через prodclass",
     )
-    report.log.append(
-        f"Шаг 2.a: загружено {len(prodclass_rows)} записей ai_site_prodclass."
+    _log_event(
+        report.log,
+        f"Шаг 2.a: загружено {len(prodclass_rows)} записей ai_site_prodclass.",
     )
 
     prodclass_agg = _aggregate_prodclass(prodclass_rows)
@@ -636,8 +671,9 @@ async def build_equipment_tables(
         rows=prodclass_agg,
         columns=["prodclass_id", "prodclass_name", "SCORE_1", "votes"],
     )
-    report.log.append(
-        f"Шаг 2.b: агрегировано {len(prodclass_agg)} prodclass со средним SCORE_1."
+    _log_event(
+        report.log,
+        f"Шаг 2.b: агрегировано {len(prodclass_agg)} prodclass со средним SCORE_1.",
     )
 
     (
@@ -836,8 +872,9 @@ async def build_equipment_tables(
     )
 
     _append_step_separator(report.log, "Итоговый отчёт")
-    report.log.append(
-        "Расчёт оборудования завершён. Обновлены таблицы EQUIPMENT_* в базе данных."
+    _log_event(
+        report.log,
+        "Расчёт оборудования завершён. Обновлены таблицы EQUIPMENT_* в базе данных.",
     )
     log.info(
         "equipment-selection: расчёт завершён для clients_requests.id=%s",
@@ -849,6 +886,9 @@ async def build_equipment_tables(
 async def _load_client(
     conn: AsyncConnection, client_request_id: int
 ) -> List[Dict[str, Any]]:
+    log.debug(
+        "equipment-selection: проверяем колонку company_id в public.clients_requests перед загрузкой клиента",
+    )
     await _ensure_table_column(
         conn,
         "clients_requests",
@@ -867,6 +907,10 @@ async def _load_client(
         WHERE id = :cid
         """
     )
+    log.debug(
+        "equipment-selection: выполняем запрос клиента → %s",
+        stmt.text,
+    )
     result = await conn.execute(stmt, {"cid": client_request_id})
     mappings = list(result.mappings())
     if not mappings:
@@ -877,11 +921,97 @@ async def _load_client(
     rows: List[Dict[str, Any]] = []
     rows = [dict(item) for item in mappings]
 
+    log.info(
+        "equipment-selection: загружена карточка клиента id=%s (строк=%s)",
+        client_request_id,
+        len(rows),
+    )
+
     return rows
 
 
+async def _resolve_company_id(
+    conn: AsyncConnection,
+    client_request_id: int,
+    client_rows: Sequence[Dict[str, Any]],
+    log_messages: List[str],
+) -> int:
+    resolved: Optional[int] = None
+    source = ""
+
+    if client_rows:
+        first_row = _row_mapping(client_rows[0])
+        raw_company = first_row.get("company_id")
+        if raw_company is not None:
+            try:
+                resolved = int(raw_company)
+                source = "clients_requests.company_id"
+                _log_event(
+                    log_messages,
+                    f"clients_requests: колонка company_id заполнена значением {resolved}.",
+                )
+            except (TypeError, ValueError):
+                _log_event(
+                    log_messages,
+                    "clients_requests: колонка company_id заполнена некорректным значением, используем fallback.",
+                    level=logging.WARNING,
+                )
+                resolved = None
+        else:
+            _log_event(
+                log_messages,
+                "clients_requests: колонка company_id отсутствует или пуста, пробуем определить по pars_site.",
+                level=logging.WARNING,
+            )
+
+    if resolved is None:
+        stmt = text(
+            """
+            SELECT company_id, COUNT(*) AS rows_count
+            FROM public.pars_site
+            WHERE company_id = :cid
+            GROUP BY company_id
+            """
+        )
+        log.debug(
+            "equipment-selection: ищем company_id через pars_site → %s",
+            stmt.text,
+        )
+        result = await conn.execute(stmt, {"cid": client_request_id})
+        row = result.mappings().first()
+        if row is not None:
+            resolved = int(row["company_id"])
+            rows_count = int(row.get("rows_count", 0))
+            source = "pars_site.company_id"
+            _log_event(
+                log_messages,
+                f"pars_site: найдено {rows_count} записей с company_id={resolved}.",
+            )
+        else:
+            _log_event(
+                log_messages,
+                "pars_site: записи с нужным company_id не найдены, используем clients_requests.id.",
+                level=logging.WARNING,
+            )
+
+    if resolved is None:
+        resolved = client_request_id
+        source = "fallback=clients_requests.id"
+
+    relation = "совпадает" if resolved == client_request_id else "отличается"
+    _log_event(
+        log_messages,
+        (
+            "Итоговое значение company_id для расчёта: "
+            f"{resolved} (источник: {source}, clients_requests.id={client_request_id}, {relation})."
+        ),
+    )
+    return resolved
+
+
 async def _load_goods_types(
-    conn: AsyncConnection, client_request_id: int
+    conn: AsyncConnection,
+    company_id: int,
 ) -> List[Dict[str, Any]]:
     stmt = text(
         """
@@ -899,12 +1029,23 @@ async def _load_goods_types(
         ORDER BY gst.created_at, gst.id
         """
     )
-    result = await conn.execute(stmt, {"cid": client_request_id})
-    return list(result.mappings())
+    log.debug(
+        "equipment-selection: загружаем goods_types → %s",
+        stmt.text,
+    )
+    result = await conn.execute(stmt, {"cid": company_id})
+    rows = list(result.mappings())
+    log.info(
+        "equipment-selection: получено %s строк goods_types для company_id=%s",
+        len(rows),
+        company_id,
+    )
+    return rows
 
 
 async def _load_site_equipment(
-    conn: AsyncConnection, client_request_id: int
+    conn: AsyncConnection,
+    company_id: int,
 ) -> List[Dict[str, Any]]:
     stmt = text(
         """
@@ -922,12 +1063,23 @@ async def _load_site_equipment(
         ORDER BY eq.created_at, eq.id
         """
     )
-    result = await conn.execute(stmt, {"cid": client_request_id})
-    return list(result.mappings())
+    log.debug(
+        "equipment-selection: загружаем site_equipment → %s",
+        stmt.text,
+    )
+    result = await conn.execute(stmt, {"cid": company_id})
+    rows = list(result.mappings())
+    log.info(
+        "equipment-selection: получено %s строк site_equipment для company_id=%s",
+        len(rows),
+        company_id,
+    )
+    return rows
 
 
 async def _load_prodclass_rows(
-    conn: AsyncConnection, client_request_id: int
+    conn: AsyncConnection,
+    company_id: int,
 ) -> List[Dict[str, Any]]:
     stmt = text(
         """
@@ -946,8 +1098,18 @@ async def _load_prodclass_rows(
         ORDER BY ap.created_at, ap.id
         """
     )
-    result = await conn.execute(stmt, {"cid": client_request_id})
-    return list(result.mappings())
+    log.debug(
+        "equipment-selection: загружаем prodclass_rows → %s",
+        stmt.text,
+    )
+    result = await conn.execute(stmt, {"cid": company_id})
+    rows = list(result.mappings())
+    log.info(
+        "equipment-selection: получено %s строк prodclass для company_id=%s",
+        len(rows),
+        company_id,
+    )
+    return rows
 
 
 def _aggregate_prodclass(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -996,6 +1158,10 @@ async def _compute_equipment_1way(
     List[Dict[str, Any]],
     List[Dict[str, Any]],
 ]:
+    log.info(
+        "equipment-selection: запускаем расчёт SCORE_E1 (prodclass_agg=%s)",
+        len(prodclass_agg),
+    )
     equipment_rows: Dict[int, EquipmentScore] = {}
     path_log: List[Dict[str, Any]] = []
     details: List[Dict[str, Any]] = []
@@ -1123,9 +1289,10 @@ async def _compute_equipment_1way(
         prodclass_details.append(detail_entry)
 
     rows_sorted = sorted(equipment_rows.values(), key=lambda item: item.id)
-    log_messages.append(
+    _log_event(
+        log_messages,
         "Шаг 2: SCORE_E1 рассчитан для "
-        f"{len(rows_sorted)} позиций (direct={direct_updates}, fallback={fallback_updates})."
+        f"{len(rows_sorted)} позиций (direct={direct_updates}, fallback={fallback_updates}).",
     )
     return rows_sorted, path_log, details, prodclass_details
 
@@ -1135,6 +1302,10 @@ async def _fetch_workshops(
 ) -> List[Dict[str, Any]]:
     if not prodclass_ids:
         return []
+    log.debug(
+        "equipment-selection: загружаем workshops для prodclass_ids=%s",
+        prodclass_ids,
+    )
     stmt = (
         text(
             """
@@ -1154,6 +1325,10 @@ async def _fetch_equipment_by_workshops(
 ) -> List[Dict[str, Any]]:
     if not workshop_ids:
         return []
+    log.debug(
+        "equipment-selection: загружаем оборудование для workshop_ids=%s",
+        workshop_ids,
+    )
     stmt = (
         text(
             """
@@ -1176,6 +1351,10 @@ async def _fetch_equipment_by_workshops(
 
 
 async def _fetch_industry(conn: AsyncConnection, prodclass_id: int) -> Optional[int]:
+    log.debug(
+        "equipment-selection: ищем industry для prodclass_id=%s",
+        prodclass_id,
+    )
     stmt = text("SELECT industry_id FROM ib_prodclass WHERE id = :pid")
     result = await conn.execute(stmt, {"pid": prodclass_id})
     row = result.mappings().first()
@@ -1187,6 +1366,10 @@ async def _fetch_industry(conn: AsyncConnection, prodclass_id: int) -> Optional[
 async def _fetch_prodclass_ids_by_industry(
     conn: AsyncConnection, industry_id: int
 ) -> List[int]:
+    log.debug(
+        "equipment-selection: ищем prodclass по industry_id=%s",
+        industry_id,
+    )
     stmt = text(
         """
         SELECT id
@@ -1243,6 +1426,10 @@ async def _compute_equipment_2way(
     goods_types: Sequence[Dict[str, Any]],
     log_messages: List[str],
 ) -> Tuple[List[EquipmentScore], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    log.info(
+        "equipment-selection: запускаем расчёт SCORE_E2 (goods_types=%s)",
+        len(goods_types),
+    )
     gt_scores: Dict[int, Decimal] = {}
     for row in goods_types:
         if row["goods_type_id"] is None or row["goods_types_score"] is None:
@@ -1259,7 +1446,11 @@ async def _compute_equipment_2way(
     ]
 
     if not gt_scores:
-        log_messages.append("Шаг 3: SCORE_E2 пропущен — нет goods_type с ненулевым SCORE.")
+        _log_event(
+            log_messages,
+            "Шаг 3: SCORE_E2 пропущен — нет goods_type с ненулевым SCORE.",
+            level=logging.WARNING,
+        )
         return [], goods_rows, []
 
     stmt = (
@@ -1277,7 +1468,12 @@ async def _compute_equipment_2way(
             """
         ).bindparams(bindparam("gt_list", expanding=True))
     )
-    result = await conn.execute(stmt, {"gt_list": list(gt_scores.keys())})
+    gt_list = list(gt_scores.keys())
+    log.debug(
+        "equipment-selection: запрашиваем SCORE_E2 для goods_type_ids=%s",
+        gt_list,
+    )
+    result = await conn.execute(stmt, {"gt_list": gt_list})
     equipment_rows = result.mappings().all()
 
     scores: Dict[int, EquipmentScore] = {}
@@ -1308,8 +1504,9 @@ async def _compute_equipment_2way(
             scores[eq_id] = EquipmentScore(eq_id, eq_name, existing.score, source="2way")
 
     rows_sorted = sorted(scores.values(), key=lambda item: item.id)
-    log_messages.append(
-        f"Шаг 3: SCORE_E2 рассчитан для {len(rows_sorted)} позиций."
+    _log_event(
+        log_messages,
+        f"Шаг 3: SCORE_E2 рассчитан для {len(rows_sorted)} позиций.",
     )
     return rows_sorted, goods_rows, details
 
@@ -1319,6 +1516,10 @@ async def _compute_equipment_3way(
     site_equipment: Sequence[Dict[str, Any]],
     log_messages: List[str],
 ) -> Tuple[List[EquipmentScore], List[Dict[str, Any]]]:
+    log.info(
+        "equipment-selection: запускаем расчёт SCORE_E3 (site_equipment=%s)",
+        len(site_equipment),
+    )
     score_by_equipment: Dict[int, Decimal] = {}
     for row in site_equipment:
         if row["equipment_id"] is None or row["equipment_score"] is None:
@@ -1339,8 +1540,10 @@ async def _compute_equipment_3way(
     ]
 
     if not score_by_equipment:
-        log_messages.append(
-            "Шаг 4: SCORE_E3 пропущен — в ai_site_equipment отсутствуют валидные записи."
+        _log_event(
+            log_messages,
+            "Шаг 4: SCORE_E3 пропущен — в ai_site_equipment отсутствуют валидные записи.",
+            level=logging.WARNING,
         )
         return [], details
 
@@ -1353,15 +1556,21 @@ async def _compute_equipment_3way(
             """
         ).bindparams(bindparam("eq_ids", expanding=True))
     )
-    result = await conn.execute(stmt, {"eq_ids": list(score_by_equipment.keys())})
+    eq_ids = list(score_by_equipment.keys())
+    log.debug(
+        "equipment-selection: загружаем названия оборудования для %s идентификаторов",
+        len(eq_ids),
+    )
+    result = await conn.execute(stmt, {"eq_ids": eq_ids})
     name_map = {int(row["id"]): row.get("equipment_name") for row in result.mappings()}
 
     rows = [
         EquipmentScore(eq_id, name_map.get(eq_id), score, source="3way")
         for eq_id, score in sorted(score_by_equipment.items())
     ]
-    log_messages.append(
-        f"Шаг 4: SCORE_E3 подготовлен для {len(rows)} элементов оборудования."
+    _log_event(
+        log_messages,
+        f"Шаг 4: SCORE_E3 подготовлен для {len(rows)} элементов оборудования.",
     )
     return rows, details
 
@@ -1372,6 +1581,12 @@ def _merge_equipment_tables(
     eq3: Sequence[EquipmentScore],
     log_messages: List[str],
 ) -> Tuple[List[EquipmentScore], List[Dict[str, Any]]]:
+    log.info(
+        "equipment-selection: объединяем таблицы (1way=%s, 2way=%s, 3way=%s)",
+        len(eq1),
+        len(eq2),
+        len(eq3),
+    )
     priority_map = {1: eq1, 2: eq2, 3: eq3}
     combined: Dict[int, Tuple[int, EquipmentScore]] = {}
     merged_rows: List[Dict[str, Any]] = []
@@ -1400,8 +1615,9 @@ def _merge_equipment_tables(
                 combined[row.id] = candidate
 
     final_rows = [item[1] for item in sorted(combined.values(), key=lambda x: x[1].id)]
-    log_messages.append(
-        f"Шаг 5: после объединения осталось {len(final_rows)} уникальных записей."
+    _log_event(
+        log_messages,
+        f"Шаг 5: после объединения осталось {len(final_rows)} уникальных записей.",
     )
     return final_rows, merged_rows
 
@@ -1414,6 +1630,13 @@ async def _sync_equipment_table(
     company_id: Optional[int],
     log_messages: List[str],
 ) -> None:
+    owner_id = company_id if company_id is not None else client_request_id
+    log.info(
+        "equipment-selection: начинаем синхронизацию таблицы %s (строк для записи=%s, owner_id=%s)",
+        table_name,
+        len(rows),
+        owner_id,
+    )
     await conn.execute(
         text(
             f"""
@@ -1436,8 +1659,9 @@ async def _sync_equipment_table(
     await _ensure_table_column(conn, table_name, "updated_at", "TIMESTAMPTZ")
 
     if not rows:
-        log_messages.append(
-            f"{table_name}: данных нет — существующие записи оставлены без изменений."
+        _log_event(
+            log_messages,
+            f"{table_name}: данных нет — существующие записи оставлены без изменений.",
         )
         return
 
@@ -1459,6 +1683,12 @@ async def _sync_equipment_table(
             "updated_at": record.get("updated_at"),
         }
 
+    log.debug(
+        "equipment-selection: в таблице %s уже %s записей",
+        table_name,
+        len(existing_map),
+    )
+
     unique_rows: Dict[int, EquipmentScore] = {}
     for item in rows:
         if item.id not in unique_rows:
@@ -1468,7 +1698,6 @@ async def _sync_equipment_table(
     now = datetime.now(timezone.utc)
     updates: List[Dict[str, Any]] = []
     inserts: List[Dict[str, Any]] = []
-    owner_id = company_id if company_id is not None else client_request_id
 
     for row in deduped_rows:
         new_score = _quantize(_to_decimal(row.score))
@@ -1506,6 +1735,11 @@ async def _sync_equipment_table(
             ),
             inserts,
         )
+        log.info(
+            "equipment-selection: в таблицу %s вставлено %s новых строк",
+            table_name,
+            len(inserts),
+        )
 
     if updates:
         await conn.execute(
@@ -1522,13 +1756,19 @@ async def _sync_equipment_table(
             ),
             updates,
         )
+        log.info(
+            "equipment-selection: в таблице %s обновлено %s строк",
+            table_name,
+            len(updates),
+        )
 
-    log_messages.append(
+    _log_event(
+        log_messages,
         (
             f"{table_name}: обработано {len(deduped_rows)} записей ("
             f"добавлено {len(inserts)}, обновлено {len(updates)}). "
             "Удаление существующих записей не выполнялось."
-        )
+        ),
     )
 
 
@@ -1550,18 +1790,26 @@ def _add_table(
         raw_rows.append(raw_row)
         formatted_rows.append([_jsonable(value) for value in raw_row])
     preview = _render_table_preview(title, columns, raw_rows)
-    report.tables.append(
-        TableData(
-            step=step,
-            table_id=table_id,
-            title=title,
-            columns=list(columns),
-            rows=formatted_rows,
-            raw_rows=raw_rows,
-            preview=preview,
-            section_title=section_title,
-        )
+    table = TableData(
+        step=step,
+        table_id=table_id,
+        title=title,
+        columns=list(columns),
+        rows=formatted_rows,
+        raw_rows=raw_rows,
+        preview=preview,
+        section_title=section_title,
     )
+    report.tables.append(table)
+    log.info(
+        "equipment-selection: собрана таблица %s (%s) — %s строк, колонки: %s",
+        table_id,
+        title,
+        len(rows),
+        ", ".join(columns),
+    )
+    for line in table.preview.splitlines():
+        log.debug("equipment-selection: %s preview | %s", table_id, line)
 
 
 __all__ = [
