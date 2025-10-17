@@ -77,7 +77,7 @@ class AnalyzeFromInnRun(BaseModel):
 class AnalyzeFromInnResponse(BaseModel):
     """Результат анализа и сохранения ответа внешнего сервиса."""
 
-    status: str = Field(..., description="Статус обработки (ok/error)")
+    status: str = Field(..., description="Статус обработки (ok/partial/error)")
     inn: str = Field(..., description="ИНН, по которому выполнялся анализ")
     pars_id: Optional[int] = Field(None, description="ID строки pars_site (первый обработанный домен)")
     company_id: Optional[int] = Field(
