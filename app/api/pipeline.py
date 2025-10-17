@@ -169,7 +169,7 @@ async def _collect_candidate_statuses(
 ) -> list[PipelineAutoCandidate]:
     stmt = (
         select(DaDataResult.inn)
-        .order_by(DaDataResult.updated_at.asc(), DaDataResult.inn.asc())
+        .order_by(DaDataResult.updated_at.desc(), DaDataResult.inn.asc())
         .limit(_AUTO_CANDIDATE_LIMIT)
     )
     result = await session.execute(stmt)
