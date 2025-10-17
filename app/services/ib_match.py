@@ -530,7 +530,7 @@ def _match_rows(
             )
             continue
         rounded_score = round(best_score, 4)
-        rounded_score_db = round(best_score, 2)
+        rounded_score_db = rounded_score
         matches.append(
             MatchResult(
                 ai_id=row.ai_id,
