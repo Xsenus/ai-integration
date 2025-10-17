@@ -274,7 +274,13 @@ def _extract_industry_label(info: Mapping[str, Any] | None) -> Optional[str]:
             continue
         text = _normalize_text_value(info.get(key))
         if text:
-            return text
+            normalized = text.strip()
+            if normalized:
+                if normalized.isdigit() or (
+                    normalized[0] in "+-" and normalized[1:].isdigit()
+                ):
+                    continue
+                return normalized
     return None
 
 
