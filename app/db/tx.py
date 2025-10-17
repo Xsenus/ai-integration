@@ -33,6 +33,6 @@ async def run_on_engine(
     disposed of once the coroutine completes.
     """
 
-    async with engine.connect() as conn:
+    async with engine.begin() as conn:
         return await action(conn)
 

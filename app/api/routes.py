@@ -668,7 +668,7 @@ async def get_equipment_selection(
     if engine is None:
         log.error("equipment-selection GET: postgres engine is not configured")
         raise HTTPException(status_code=503, detail="Postgres engine is not configured")
-    async with engine.connect() as conn:
+    async with engine.begin() as conn:
         try:
             result = await compute_equipment_selection(conn, client_request_id)
         except EquipmentSelectionNotFound as exc:  # pragma: no cover - network/db required
@@ -701,7 +701,7 @@ async def get_equipment_selection_by_inn(
     if engine is None:
         log.error("equipment-selection GET/by-inn: postgres engine is not configured")
         raise HTTPException(status_code=503, detail="Postgres engine is not configured")
-    async with engine.connect() as conn:
+    async with engine.begin() as conn:
         client_request_id = await resolve_client_request_id(conn, inn)
         if client_request_id is None:
             log.warning(
