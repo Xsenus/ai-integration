@@ -545,7 +545,8 @@ def _match_rows(
                 )
             )
             continue
-        rounded_score = round(best_score, 4)
+        clamped_score = min(max(best_score, 0.0), 1.0)
+        rounded_score = round(clamped_score, 4)
         rounded_score_db = rounded_score
         matches.append(
             MatchResult(

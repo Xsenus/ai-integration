@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from app.services.ib_match import CatalogEntry, SourceRow, _match_rows
 from app.services.vector_similarity import cosine_similarity
 
 
@@ -40,3 +41,13 @@ def test_cosine_similarity_supports_negative_scores() -> None:
 
     assert result is not None
     assert math.isclose(result, -1.0, rel_tol=1e-9)
+
+
+def test_match_rows_clamps_negative_scores_before_persisting() -> None:
+    rows = [SourceRow(ai_id=1, text="foo", vector=[1.0, 0.0])]
+    catalog = [CatalogEntry(ib_id=2, name="bar", vector=[-1.0, 0.0])]
+
+    matches, updates = _match_rows(rows, catalog)
+
+    assert matches[0].score == 0.0
+    assert updates[0]["score"] == 0.0
