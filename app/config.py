@@ -41,10 +41,11 @@ class Settings(BaseSettings):
     # Можно указать любой из этих ключей в .env; приоритет у AI_ANALYZE_BASE/AI_ANALYZE_TIMEOUT
     AI_ANALYZE_BASE: Optional[str] = None     # напр.: http://37.221.125.221:8123
     ANALYZE_BASE: Optional[str] = None        # альтернативное имя переменной окружения
-    AI_ANALYZE_TIMEOUT: int = 30              # таймаут по умолчанию, сек
+    AI_ANALYZE_TIMEOUT: int = 15              # таймаут по умолчанию, сек
     ANALYZE_TIMEOUT: Optional[int] = None     # альтернативное имя переменной окружения
 
     # === Scrape params (используются в services/scrape.py) ===
+    PARSE_HTTP_TIMEOUT: int = 15
     PARSE_MAX_CHUNK_SIZE: int = 100_000
     PARSE_MIN_HTML_LEN: int = 100
     PARSE_MAX_REDIRECTS: int = 3
@@ -108,7 +109,7 @@ class Settings(BaseSettings):
     @property
     def analyze_timeout(self) -> int:
         """Таймаут ожидания ответа внешнего сервиса, сек."""
-        return int(self.AI_ANALYZE_TIMEOUT or self.ANALYZE_TIMEOUT or 30)
+        return int(self.AI_ANALYZE_TIMEOUT or self.ANALYZE_TIMEOUT or 15)
 
     @property
     def embed_model(self) -> str:

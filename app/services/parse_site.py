@@ -414,11 +414,16 @@ async def _generate_site_description(
     if not text.strip():
         return None, None
 
-    description, vector = await fetch_site_description(
-        text,
-        embed_model=settings.embed_model,
-        label=f"site:{inn}:{domain}",
-    )
+    label = f"site:{inn}:{domain}"
+    try:
+        description, vector = await fetch_site_description(
+            text,
+            embed_model=settings.embed_model,
+            label=label,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("parse-site: не удалось получить описание (%s): %s", label, exc)
+        return None, None
     if description and not vector:
         vector = await _embed_text(description, label=f"site-desc:{inn}:{domain}")
     return description, vector
@@ -428,7 +433,11 @@ async def _embed_text(text: str, *, label: str) -> Optional[list[float]]:
     if not text.strip():
         return None
 
-    vector = await fetch_embedding(text, label=label)
+    try:
+        vector = await fetch_embedding(text, label=label)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("parse-site: не удалось получить embedding (%s): %s", label, exc)
+        return None
     if vector:
         log.info("parse-site: embedding получен (%s, size=%s)", label, len(vector))
     else:
