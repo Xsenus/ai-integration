@@ -211,7 +211,7 @@ async def _fetch_prodclass_name(
             return None
         stmt = text(
             """
-            SELECT name
+            SELECT *
             FROM public.ib_prodclass
             WHERE id = :pid
             LIMIT 1
@@ -221,11 +221,16 @@ async def _fetch_prodclass_name(
         row = result.mappings().first()
         if not row:
             return None
-        value = row.get("name")
-        if value is None:
-            return None
-        text_value = str(value).strip()
-        return text_value or None
+
+        preferred_keys = (
+            *_PREFERRED_NAME_COLUMNS,
+            *_GROUP_NAME_COLUMNS,
+            "prodclass",
+            "prodclass_name",
+            "prodclass_title",
+            "prodclass_text",
+        )
+        return _lookup_value(row, preferred_keys)
 
 
 def _as_float(value: Any) -> float | None:
