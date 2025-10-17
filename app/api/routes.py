@@ -54,6 +54,7 @@ from app.services.equipment_selection import (
 log = logging.getLogger("api.routes")
 router = APIRouter(prefix="/v1")
 ib_match_router = APIRouter(prefix="/ib-match", tags=["IB Matching"])
+parse_site_router = APIRouter(prefix="/parse-site", tags=["Parse Site"])
 
 
 # =========================
@@ -564,7 +565,11 @@ async def ib_match_by_inn_get(
 router.include_router(ib_match_router)
 
 
-@router.post("/parse-site", response_model=ParseSiteResponse, summary="Парсинг главной страницы домена и сохранение в pars_site")
+@parse_site_router.post(
+    "",
+    response_model=ParseSiteResponse,
+    summary="Парсинг главной страницы домена и сохранение в pars_site",
+)
 async def parse_site(
     payload: ParseSiteRequest = Body(...),
     session: AsyncSession = Depends(get_bitrix_session),
@@ -576,8 +581,8 @@ async def parse_site(
     return response
 
 
-@router.get(
-    "/parse-site/{inn}",
+@parse_site_router.get(
+    "/{inn}",
     response_model=ParseSiteResponse,
     summary="Парсинг главной страницы по ИНН с автоопределением домена",
 )
@@ -639,6 +644,9 @@ async def parse_site_by_inn(
     response = await run_parse_site(payload, session)
     log.info("parse-site GET: завершено для ИНН %s → %s", inn, response.model_dump())
     return response
+
+
+router.include_router(parse_site_router)
 
 
 @router.get(
