@@ -28,6 +28,12 @@ _PREFERRED_NAME_COLUMNS = (
     "full_name",
     "short_name",
     "label",
+    "text",
+    "description",
+    "name_ru",
+    "title_ru",
+    "full_name_ru",
+    "short_name_ru",
 )
 _GROUP_NAME_COLUMNS = (
     "group_name",
@@ -495,15 +501,37 @@ def _resolve_industry_from_prodclass(
             if formatted:
                 return formatted
         if fallback_label is None:
-            for key in ("prodclass_name", "prodclass_title", "prodclass_text"):
-                value = row.get(key)
-                if value:
-                    fallback_label = _format_with_id(str(value).strip(), identifier)
-                    if fallback_label:
-                        break
+            name, is_placeholder = _resolve_prodclass_name(row, lookup)
+            if name and not is_placeholder:
+                fallback_label = _format_with_id(name, identifier)
             if fallback_label is None:
                 fallback_label = _format_with_id(None, identifier)
     return fallback_label
+
+
+def _select_primary_prodclass(
+    prod_rows: Iterable[Mapping[str, Any]],
+    lookup: Mapping[Any, Mapping[str, Any]] | None,
+) -> Optional[dict[str, Any]]:
+    for row in sorted(prod_rows, key=lambda r: _score_sort_key(r, "prodclass_score")):
+        identifier = row.get("prodclass")
+        if identifier is None:
+            identifier = row.get("prodclass_id")
+        if identifier is None:
+            continue
+        prodclass_id = _safe_int(identifier)
+        name, is_placeholder = _resolve_prodclass_name(row, lookup)
+        if is_placeholder:
+            name = None
+        label = _format_with_id(name, prodclass_id if prodclass_id is not None else identifier)
+        score = _as_float(row.get("prodclass_score"))
+        return {
+            "id": prodclass_id,
+            "name": name,
+            "label": label,
+            "score": score,
+        }
+    return None
 
 
 def _compose_products(
@@ -853,6 +881,8 @@ async def analyze_company_by_inn(inn: str) -> dict:
     if len(equipment) > _MAX_EQUIPMENT:
         equipment = equipment[:_MAX_EQUIPMENT]
 
+    primary_prodclass = _select_primary_prodclass(prod_rows, prod_lookup)
+
     # ---- 2) main_okved fallback: сначала Bitrix.dadata_result ----
     okved_fallback = None
     bx_used = False
@@ -921,6 +951,7 @@ async def analyze_company_by_inn(inn: str) -> dict:
         "domain1_site": domain1,
         "domain2_site": domain2,
         "industry": industry,
+        "prodclass": primary_prodclass,
         "sites": [u for u in urls if u],
         "products": products,
         "equipment": equipment,

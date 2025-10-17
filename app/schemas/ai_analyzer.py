@@ -14,6 +14,21 @@ InnStr = Annotated[
 ]
 
 
+class AiProdclass(BaseModel):
+    """Информация о продклассе, найденном анализатором."""
+
+    id: Optional[int] = Field(None, description="Идентификатор продкласса")
+    name: Optional[str] = Field(None, description="Наименование продкласса")
+    label: Optional[str] = Field(
+        None,
+        description="Продкласс в формате `[id] Наименование`",
+    )
+    score: Optional[float] = Field(
+        None,
+        description="Скор продкласса из таблицы ai_site_prodclass",
+    )
+
+
 class AiProduct(BaseModel):
     """Описание продукции, найденной анализатором."""
 
@@ -42,6 +57,10 @@ class AiBlock(BaseModel):
     """AI-сводка по компании."""
 
     industry: Optional[str] = Field(None, description="Отрасль (человекочитаемо)")
+    prodclass: Optional[AiProdclass] = Field(
+        None,
+        description="Лучший продкласс, найденный анализатором",
+    )
     sites: List[str] = Field(default_factory=list, description="Список сайтов компании")
     products: List[AiProduct] = Field(
         default_factory=list,
@@ -76,6 +95,7 @@ class AiAnalyzerResponse(BaseModel):
     ai: AiBlock = Field(
         default_factory=lambda: AiBlock(
             industry=None,
+            prodclass=None,
             sites=[],
             products=[],
             equipment=[],
