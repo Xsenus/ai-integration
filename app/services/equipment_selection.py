@@ -181,6 +181,24 @@ async def _table_has_column(
     return exists
 
 
+async def _ensure_table_column(
+    conn: AsyncConnection,
+    table_name: str,
+    column_name: str,
+    definition: str,
+    *,
+    schema: str = "public",
+) -> None:
+    if await _table_has_column(conn, table_name, column_name, schema=schema):
+        return
+
+    qualified = f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
+    await conn.execute(
+        text(f"ALTER TABLE {qualified} ADD COLUMN {column_name} {definition}"),
+    )
+    _COLUMN_EXISTS_CACHE[(schema, table_name, column_name)] = True
+
+
 def _row_mapping(row: Any) -> Dict[str, Any]:
     if isinstance(row, dict):
         return row
@@ -831,11 +849,13 @@ async def build_equipment_tables(
 async def _load_client(
     conn: AsyncConnection, client_request_id: int
 ) -> List[Dict[str, Any]]:
-    has_company_id = await _table_has_column(conn, "clients_requests", "company_id")
-
-    select_columns: List[str] = ["id"]
-    if has_company_id:
-        select_columns.append("company_id")
+    await _ensure_table_column(
+        conn,
+        "clients_requests",
+        "company_id",
+        "BIGINT",
+    )
+    select_columns: List[str] = ["id", "company_id"]
     select_columns.extend(
         ["company_name", "inn", "domain_1", "started_at", "ended_at"]
     )
@@ -855,11 +875,7 @@ async def _load_client(
         )
 
     rows: List[Dict[str, Any]] = []
-    for item in mappings:
-        payload = dict(item)
-        if not has_company_id:
-            payload.setdefault("company_id", None)
-        rows.append(payload)
+    rows = [dict(item) for item in mappings]
 
     return rows
 
@@ -1413,25 +1429,11 @@ async def _sync_equipment_table(
         )
     )
 
-    await conn.execute(
-        text(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS company_id BIGINT')
-    )
-    await conn.execute(
-        text(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS equipment_name TEXT')
-    )
-    await conn.execute(
-        text(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS score NUMERIC(8,4)')
-    )
-    await conn.execute(
-        text(
-            f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ'
-        )
-    )
-    await conn.execute(
-        text(
-            f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ'
-        )
-    )
+    await _ensure_table_column(conn, table_name, "company_id", "BIGINT")
+    await _ensure_table_column(conn, table_name, "equipment_name", "TEXT")
+    await _ensure_table_column(conn, table_name, "score", "NUMERIC(8,4)")
+    await _ensure_table_column(conn, table_name, "created_at", "TIMESTAMPTZ")
+    await _ensure_table_column(conn, table_name, "updated_at", "TIMESTAMPTZ")
 
     if not rows:
         log_messages.append(
