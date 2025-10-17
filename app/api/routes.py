@@ -53,6 +53,7 @@ from app.services.equipment_selection import (
 
 log = logging.getLogger("api.routes")
 router = APIRouter(prefix="/v1")
+ib_match_router = APIRouter(prefix="/ib-match", tags=["IB Matching"])
 
 
 # =========================
@@ -464,90 +465,103 @@ async def lookup_card_get(
 # ==========================
 
 
-@router.post("/ib-match", response_model=IbMatchResponse)
-async def ib_match(payload: IbMatchRequest = Body(...)) -> IbMatchResponse:
-    """Присваивает соответствия товаров и оборудования из справочников IB."""
-
+async def _assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> IbMatchResponse:
     log.info(
         "ib-match: POST /ib-match requested (client_id=%s, reembed_if_exists=%s)",
-        payload.client_id,
-        payload.reembed_if_exists,
+        client_id,
+        reembed_if_exists,
     )
     try:
         result = await assign_ib_matches(
-            client_id=payload.client_id,
-            reembed_if_exists=payload.reembed_if_exists,
+            client_id=client_id,
+            reembed_if_exists=reembed_if_exists,
         )
     except IbMatchServiceError as exc:
         log.warning(
             "ib-match: POST /ib-match failed (client_id=%s): %s",
-            payload.client_id,
+            client_id,
             exc,
         )
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-    log.info(
-        "ib-match: POST /ib-match succeeded (client_id=%s)", payload.client_id
-    )
+    log.info("ib-match: POST /ib-match succeeded (client_id=%s)", client_id)
     return IbMatchResponse.model_validate(result)
 
 
-@router.post("/ib-match/by-inn", response_model=IbMatchResponse)
-async def ib_match_by_inn(payload: IbMatchInnRequest = Body(...)) -> IbMatchResponse:
-    """Присваивает соответствия, определяя клиента по ИНН."""
-
-    log.info(
-        "ib-match: POST /ib-match/by-inn requested (inn=%s, reembed_if_exists=%s)",
-        payload.inn,
-        payload.reembed_if_exists,
-    )
-    try:
-        result = await assign_ib_matches_by_inn(
-            inn=payload.inn,
-            reembed_if_exists=payload.reembed_if_exists,
-        )
-    except IbMatchServiceError as exc:
-        log.warning(
-            "ib-match: POST /ib-match/by-inn failed (inn=%s): %s",
-            payload.inn,
-            exc,
-        )
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-
-    log.info(
-        "ib-match: POST /ib-match/by-inn succeeded (inn=%s, client_id=%s)",
-        payload.inn,
-        result.get("client_id"),
-    )
-    return IbMatchResponse.model_validate(result)
-
-
-@router.get("/ib-match/by-inn", response_model=IbMatchResponse)
-async def ib_match_by_inn_get(
-    inn: str = Query(..., min_length=4, max_length=20, description="ИНН клиента"),
+async def _assign_ib_matches_by_inn(
+    *,
+    inn: str,
+    reembed_if_exists: bool,
+    request_label: str,
 ) -> IbMatchResponse:
-    """GET-вариант сопоставления по ИНН (только чтение параметра inn)."""
-
-    log.info("ib-match: GET /ib-match/by-inn requested (inn=%s)", inn)
+    log.info(
+        "ib-match: %s requested (inn=%s, reembed_if_exists=%s)",
+        request_label,
+        inn,
+        reembed_if_exists,
+    )
     try:
         result = await assign_ib_matches_by_inn(
             inn=inn,
-            reembed_if_exists=False,
+            reembed_if_exists=reembed_if_exists,
         )
     except IbMatchServiceError as exc:
         log.warning(
-            "ib-match: GET /ib-match/by-inn failed (inn=%s): %s",
+            "ib-match: %s failed (inn=%s): %s",
+            request_label,
             inn,
             exc,
         )
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     log.info(
-        "ib-match: GET /ib-match/by-inn succeeded (inn=%s, client_id=%s)",
+        "ib-match: %s succeeded (inn=%s, client_id=%s)",
+        request_label,
         inn,
         result.get("client_id"),
     )
     return IbMatchResponse.model_validate(result)
+
+
+@ib_match_router.post("", response_model=IbMatchResponse)
+async def ib_match(payload: IbMatchRequest = Body(...)) -> IbMatchResponse:
+    """Присваивает соответствия товаров и оборудования из справочников IB."""
+
+    return await _assign_ib_matches(
+        client_id=payload.client_id,
+        reembed_if_exists=payload.reembed_if_exists,
+    )
+
+
+@ib_match_router.post("/by-inn", response_model=IbMatchResponse)
+async def ib_match_by_inn(payload: IbMatchInnRequest = Body(...)) -> IbMatchResponse:
+    """Присваивает соответствия, определяя клиента по ИНН."""
+
+    return await _assign_ib_matches_by_inn(
+        inn=payload.inn,
+        reembed_if_exists=payload.reembed_if_exists,
+        request_label="POST /ib-match/by-inn",
+    )
+
+
+@ib_match_router.get("/by-inn", response_model=IbMatchResponse)
+async def ib_match_by_inn_get(
+    inn: str = Query(..., min_length=4, max_length=20, description="ИНН клиента"),
+    reembed_if_exists: bool = Query(
+        False,
+        description="Если true, заново генерирует эмбеддинги даже при наличии text_vector",
+    ),
+) -> IbMatchResponse:
+    """GET-вариант сопоставления по ИНН (только чтение параметра inn)."""
+
+    return await _assign_ib_matches_by_inn(
+        inn=inn,
+        reembed_if_exists=reembed_if_exists,
+        request_label="GET /ib-match/by-inn",
+    )
+
+
+router.include_router(ib_match_router)
 
 
 @router.post("/parse-site", response_model=ParseSiteResponse, summary="Парсинг главной страницы домена и сохранение в pars_site")
