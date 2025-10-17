@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -45,6 +45,8 @@ def _jsonable(value: Any) -> Any:
 def _row_mapping(row: Any) -> Dict[str, Any]:
     if isinstance(row, dict):
         return row
+    if is_dataclass(row):
+        return asdict(row)
     if hasattr(row, "_mapping"):
         return dict(row._mapping)  # type: ignore[attr-defined]
     if hasattr(row, "__dict__"):
