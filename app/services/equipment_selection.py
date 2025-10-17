@@ -36,6 +36,7 @@ class EquipmentSelectionNotFound(Exception):
 
 _FOUR_DECIMALS = Decimal("0.0001")
 _PREVIEW_ROW_LIMIT = 15
+_COLUMN_EXISTS_CACHE: Dict[Tuple[str, str, str], bool] = {}
 
 
 def _to_decimal(value: object, default: Decimal = Decimal(0)) -> Decimal:
@@ -145,6 +146,39 @@ def _render_table_preview(title: str, columns: Sequence[str], raw_rows: Sequence
 def _append_step_separator(log_messages: List[str], title: str) -> None:
     border = "=" * 18
     log_messages.append(f"{border} {title} {border}")
+
+
+async def _table_has_column(
+    conn: AsyncConnection,
+    table_name: str,
+    column_name: str,
+    *,
+    schema: str = "public",
+) -> bool:
+    """Проверяет наличие колонки в таблице с кешированием результата."""
+
+    cache_key = (schema, table_name, column_name)
+    cached = _COLUMN_EXISTS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    stmt = text(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = :schema
+          AND table_name = :table
+          AND column_name = :column
+        LIMIT 1
+        """
+    )
+    result = await conn.execute(
+        stmt,
+        {"schema": schema, "table": table_name, "column": column_name},
+    )
+    exists = result.scalar() is not None
+    _COLUMN_EXISTS_CACHE[cache_key] = exists
+    return exists
 
 
 def _row_mapping(row: Any) -> Dict[str, Any]:
@@ -480,24 +514,24 @@ async def build_equipment_tables(
     _append_step_separator(report.log, "Шаг 0 — Клиент")
     client_rows = await _load_client(conn, client_request_id)
     report.client_rows = client_rows
+    first_row: Dict[str, Any] = {}
     if client_rows:
         first_row = _row_mapping(client_rows[0])
         company_id = first_row.get("company_id")
         report.company_id = None if company_id is None else int(company_id)
+    client_columns = ["id"]
+    if "company_id" in first_row:
+        client_columns.append("company_id")
+    client_columns.extend(
+        ["company_name", "inn", "domain_1", "started_at", "ended_at"]
+    )
     _add_table(
         report,
         step="0",
         table_id="client",
         title=f"Клиент (clients_requests.id={client_request_id})",
         rows=client_rows,
-        columns=[
-            "id",
-            "company_name",
-            "inn",
-            "domain_1",
-            "started_at",
-            "ended_at",
-        ],
+        columns=client_columns,
         section_title="Шаг 0 — Клиент",
     )
     report.log.append(
@@ -797,19 +831,36 @@ async def build_equipment_tables(
 async def _load_client(
     conn: AsyncConnection, client_request_id: int
 ) -> List[Dict[str, Any]]:
+    has_company_id = await _table_has_column(conn, "clients_requests", "company_id")
+
+    select_columns: List[str] = ["id"]
+    if has_company_id:
+        select_columns.append("company_id")
+    select_columns.extend(
+        ["company_name", "inn", "domain_1", "started_at", "ended_at"]
+    )
+
     stmt = text(
-        """
-        SELECT id, company_id, company_name, inn, domain_1, started_at, ended_at
+        f"""
+        SELECT {', '.join(select_columns)}
         FROM public.clients_requests
         WHERE id = :cid
         """
     )
     result = await conn.execute(stmt, {"cid": client_request_id})
-    rows = list(result.mappings())
-    if not rows:
+    mappings = list(result.mappings())
+    if not mappings:
         raise EquipmentSelectionNotFound(
             f"clients_requests.id={client_request_id} не найден"
         )
+
+    rows: List[Dict[str, Any]] = []
+    for item in mappings:
+        payload = dict(item)
+        if not has_company_id:
+            payload.setdefault("company_id", None)
+        rows.append(payload)
+
     return rows
 
 
