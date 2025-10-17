@@ -63,6 +63,12 @@ _LARGE_TEXT_KEYS = {
     "chunks_raw",
 }
 
+_PARSER_ERROR_MARKERS = (
+    "Не удалось распарсить секцию",
+    "failed to parse section",
+    "unable to parse section",
+)
+
 
 _DOMAIN_SPLIT_RE = re.compile(r"[\s,;]+")
 
@@ -1144,6 +1150,54 @@ def _sanitize_external_response(payload: Any) -> Any:
     return payload
 
 
+def _iter_text_fragments(payload: Any) -> Iterable[str]:
+    if isinstance(payload, Mapping):
+        for value in payload.values():
+            yield from _iter_text_fragments(value)
+    elif isinstance(payload, (list, tuple, set)):
+        for item in payload:
+            yield from _iter_text_fragments(item)
+    elif isinstance(payload, str):
+        text = payload.strip()
+        if text:
+            yield text
+
+
+def _has_parser_section_error(response_json: Any, response_text: Optional[str]) -> bool:
+    for fragment in _iter_text_fragments(response_json):
+        lowered = fragment.lower()
+        if any(marker.lower() in lowered for marker in _PARSER_ERROR_MARKERS):
+            return True
+    if response_text:
+        lowered = response_text.lower()
+        if any(marker.lower() in lowered for marker in _PARSER_ERROR_MARKERS):
+            return True
+    return False
+
+
+def _build_error_response_payload(
+    response_json: Any,
+    response_text: Optional[str],
+    json_error: Optional[Exception],
+) -> dict[str, Any]:
+    if isinstance(response_json, Mapping):
+        sanitized = _sanitize_external_response(response_json)
+        payload: dict[str, Any] = sanitized if isinstance(sanitized, dict) else {}
+    else:
+        payload = {}
+
+    if not payload and response_text:
+        payload = {"error": response_text.strip()[:_TEXT_PREVIEW_LIMIT]}
+
+    if json_error is not None:
+        payload.setdefault("error", f"response.json() failed: {json_error}")
+
+    if not payload:
+        payload = {"error": "empty response"}
+
+    return payload
+
+
 async def _apply_db_payload(
     engine: AsyncEngine,
     snapshot: ParsSiteSnapshot,
@@ -1916,6 +1970,8 @@ async def _run_analyze(
     total_text_length = 0
     total_saved_goods = 0
     total_saved_equipment = 0
+    successful_runs = 0
+    failure_messages: list[str] = []
     domains_processed: list[str] = []
 
     goods_catalog_payload = _prepare_catalog_payload(goods_catalog_items)
@@ -2014,6 +2070,20 @@ async def _run_analyze(
                 },
             )
 
+        response_text = response.text
+        response_json: Any | None = None
+        json_error: Exception | None = None
+        try:
+            response_json = response.json()
+        except Exception as exc:  # noqa: BLE001
+            json_error = exc
+
+        sanitized_external_response = (
+            _sanitize_external_response(response_json)
+            if isinstance(response_json, Mapping)
+            else None
+        )
+
         log.info(
             "analyze-json: response received #%s (inn=%s, domain=%s, status=%s)",
             idx,
@@ -2021,6 +2091,52 @@ async def _run_analyze(
             domain_label,
             response.status_code,
         )
+
+        if response.status_code >= 500:
+            error_payload = _build_error_response_payload(response_json, response_text, json_error)
+            error_message = error_payload.get("error") or f"HTTP {response.status_code}"
+            failure_messages.append(error_message)
+            if _has_parser_section_error(response_json, response_text):
+                log.warning(
+                    "analyze-json: external parser failed for #%s (inn=%s, domain=%s): %s",
+                    idx,
+                    inn,
+                    domain_label,
+                    error_message,
+                )
+            else:
+                log.warning(
+                    "analyze-json: external service returned %s for #%s (inn=%s, domain=%s): %s",
+                    response.status_code,
+                    idx,
+                    inn,
+                    domain_label,
+                    error_message,
+                )
+
+            total_text_length += text_length
+
+            run = AnalyzeFromInnRun(
+                domain=domain_label or None,
+                domain_source=domain_source,
+                pars_id=snapshot.pars_id,
+                company_id=snapshot.company_id,
+                created_at=snapshot.created_at,
+                text_length=text_length,
+                chunk_count=len(snapshot.chunk_ids),
+                catalog_goods_size=len(goods_catalog_items),
+                catalog_equipment_size=len(equipment_catalog_items),
+                saved_goods=0,
+                saved_equipment=0,
+                prodclass_id=None,
+                prodclass_score=None,
+                external_request=sanitized_request_payload,
+                external_status=response.status_code,
+                external_response=error_payload,
+                external_response_raw=response_json if response_json is not None else response_text,
+            )
+            runs.append(run)
+            continue
 
         if response.status_code >= 400:
             detail = f"Внешний сервис вернул ошибку: HTTP {response.status_code}"
@@ -2034,14 +2150,12 @@ async def _run_analyze(
                     "snapshot": snapshot_context,
                     "payload": payload_summary,
                     "status": response.status_code,
-                    "body": response.text or "",
+                    "response": response_json if response_json is not None else response_text,
                 },
             )
 
-        try:
-            response_json = response.json()
-        except Exception as exc:  # noqa: BLE001
-            detail = f"Не удалось распарсить ответ внешнего сервиса: {exc}".strip()
+        if json_error is not None:
+            detail = f"Не удалось распарсить ответ внешнего сервиса: {json_error}".strip()
             _log_and_raise(
                 status.HTTP_502_BAD_GATEWAY,
                 inn=inn,
@@ -2052,11 +2166,28 @@ async def _run_analyze(
                     "snapshot": snapshot_context,
                     "payload": payload_summary,
                     "status": response.status_code,
-                    "body": response.text,
+                    "body": response_text,
                 },
             )
 
-        sanitized_external_response = _sanitize_external_response(response_json)
+        if not isinstance(response_json, Mapping):
+            detail = "Ответ внешнего сервиса имеет неожиданный формат"
+            _log_and_raise(
+                status.HTTP_502_BAD_GATEWAY,
+                inn=inn,
+                detail=detail,
+                request_context=payload_data,
+                extra={
+                    "url": run_url,
+                    "snapshot": snapshot_context,
+                    "payload": payload_summary,
+                    "status": response.status_code,
+                    "body": response_text,
+                },
+            )
+
+        if sanitized_external_response is None:
+            sanitized_external_response = _build_error_response_payload(response_json, response_text, None)
 
         log.info(
             "analyze-json: external response summary #%s (inn=%s, domain=%s) → %s",
@@ -2118,6 +2249,7 @@ async def _run_analyze(
         total_text_length += text_length
         total_saved_goods += goods_saved
         total_saved_equipment += equipment_saved
+        successful_runs += 1
 
         run = AnalyzeFromInnRun(
             domain=domain_label or None,
@@ -2140,17 +2272,47 @@ async def _run_analyze(
         )
         runs.append(run)
 
-    first_run = runs[0]
-    log.info(
-        "analyze-json: completed processing inn=%s → runs=%s, total_goods=%s, total_equipment=%s",
-        inn,
-        len(runs),
-        total_saved_goods,
-        total_saved_equipment,
-    )
+    if not runs:
+        _log_and_raise(
+            status.HTTP_502_BAD_GATEWAY,
+            inn=inn,
+            detail="Внешний сервис не вернул результатов",
+            request_context=payload_data,
+            extra={"domains": domains_processed},
+        )
+
+    first_success_run = next((run for run in runs if run.external_status < 400), None)
+    first_run = first_success_run or runs[0]
+
+    overall_status = "ok"
+    if successful_runs == 0:
+        overall_status = "error"
+        log.warning(
+            "analyze-json: all runs failed for inn=%s (domains=%s, reasons=%s)",
+            inn,
+            domains_processed,
+            failure_messages,
+        )
+    elif successful_runs < len(runs):
+        overall_status = "partial"
+        log.warning(
+            "analyze-json: partial success for inn=%s (success=%s/%s, failures=%s)",
+            inn,
+            successful_runs,
+            len(runs),
+            failure_messages,
+        )
+    else:
+        log.info(
+            "analyze-json: completed processing inn=%s → runs=%s, total_goods=%s, total_equipment=%s",
+            inn,
+            len(runs),
+            total_saved_goods,
+            total_saved_equipment,
+        )
 
     return AnalyzeFromInnResponse(
-        status="ok",
+        status=overall_status,
         inn=inn,
         pars_id=first_run.pars_id if first_run else None,
         company_id=first_run.company_id if first_run else None,
