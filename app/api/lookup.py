@@ -18,6 +18,7 @@ from app.schemas.ai_analyzer import (
     AiAnalyzerResponse,
     AiBlock,
     AiEquipment,
+    AiProdclass,
     AiProduct,
     CompanyBlock,
 )
@@ -239,8 +240,14 @@ def _ai_analyzer_response_from_payload(
         if item is not None
     ]
 
+    prodclass_payload = data.get("prodclass")
+    prodclass = None
+    if prodclass_payload:
+        prodclass = AiProdclass.model_validate(prodclass_payload)
+
     ai_block = AiBlock(
         industry=data.get("industry") or data.get("industry_label"),
+        prodclass=prodclass,
         sites=list(data.get("sites") or []),
         products=products,
         equipment=equipment,
