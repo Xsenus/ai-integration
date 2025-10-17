@@ -10,6 +10,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.services.ai_analyzer import (  # noqa: E402
+    _apply_prodclass_name_fallback,
     _resolve_industry_from_prodclass,
     _select_primary_prodclass,
 )
@@ -114,3 +115,34 @@ def test_resolve_industry_from_prodclass_accepts_string_identifier():
     label = _resolve_industry_from_prodclass(prod_rows, lookup)
 
     assert label == "[33] Обогащение руды"
+
+
+def test_apply_prodclass_name_fallback_updates_placeholder_label():
+    primary = {
+        "id": 17,
+        "name": None,
+        "label": "[17]",
+        "score": 0.95,
+    }
+
+    updated = _apply_prodclass_name_fallback(primary, "Добыча меди")
+
+    assert updated["name"] == "Добыча меди"
+    assert updated["label"] == "[17] Добыча меди"
+    # исходный словарь не должен мутироваться
+    assert primary["name"] is None
+    assert primary["label"] == "[17]"
+
+
+def test_apply_prodclass_name_fallback_preserves_custom_label():
+    primary = {
+        "id": 17,
+        "name": None,
+        "label": "[17] Кастом",
+        "score": 0.95,
+    }
+
+    updated = _apply_prodclass_name_fallback(primary, "Добыча меди")
+
+    assert updated["name"] == "Добыча меди"
+    assert updated["label"] == "[17] Кастом"
