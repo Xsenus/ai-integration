@@ -949,36 +949,73 @@ async def _sync_equipment_table(
         )
     )
 
-    result = await conn.execute(
-        text(f'SELECT id FROM "{table_name}"')
-    )
-    existing_ids = {int(row["id"]) for row in result.mappings()}
-    new_ids = {row.id for row in rows}
-    new_records = len(new_ids - existing_ids)
-
+    # На исторических базах таблицы могли быть без поля equipment_name или без первичного ключа.
     await conn.execute(
-        text(
-            f"""
-            INSERT INTO "{table_name}"(id, equipment_name, score)
-            VALUES (:id, :equipment_name, :score)
-            ON CONFLICT (id) DO UPDATE
-            SET equipment_name = EXCLUDED.equipment_name,
-                score = EXCLUDED.score
-            """
-        ),
-        [
-            {
-                "id": row.id,
-                "equipment_name": row.name,
-                "score": row.score,
-            }
-            for row in rows
-        ],
+        text(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS equipment_name TEXT')
     )
+    await conn.execute(
+        text(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS score NUMERIC(8,4)')
+    )
+
+    # Собираем текущие значения, чтобы обновлять только изменившиеся записи.
+    result = await conn.execute(
+        text(f'SELECT id, equipment_name, score FROM "{table_name}"')
+    )
+    existing_map = {
+        int(row["id"]): (row.get("equipment_name"), _quantize(_to_decimal(row.get("score"))))
+        for row in result.mappings()
+    }
+
+    # На всякий случай устраняем дубликаты по id, сохраняя порядок первых появлений.
+    unique_rows: Dict[int, EquipmentScore] = {}
+    for item in rows:
+        if item.id not in unique_rows:
+            unique_rows[item.id] = item
+    deduped_rows = list(unique_rows.values())
+
+    updates: List[Dict[str, Any]] = []
+    inserts: List[Dict[str, Any]] = []
+
+    for row in deduped_rows:
+        new_score = _quantize(_to_decimal(row.score))
+        payload = {"id": row.id, "equipment_name": row.name, "score": new_score}
+        current = existing_map.get(row.id)
+        if current is None:
+            inserts.append(payload)
+            continue
+
+        current_name, current_score = current
+        if current_name != row.name or current_score != new_score:
+            updates.append(payload)
+
+    if inserts:
+        await conn.execute(
+            text(
+                f"""
+                INSERT INTO "{table_name}"(id, equipment_name, score)
+                VALUES (:id, :equipment_name, :score)
+                """
+            ),
+            inserts,
+        )
+
+    if updates:
+        await conn.execute(
+            text(
+                f"""
+                UPDATE "{table_name}"
+                SET equipment_name = :equipment_name,
+                    score = :score
+                WHERE id = :id
+                """
+            ),
+            updates,
+        )
 
     log_messages.append(
         (
-            f"{table_name}: обновлено {len(rows)} записей (новых {new_records}). "
+            f"{table_name}: обработано {len(deduped_rows)} записей ("
+            f"добавлено {len(inserts)}, обновлено {len(updates)}). "
             "Удаление существующих записей не выполнялось."
         )
     )
