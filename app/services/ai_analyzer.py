@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from sqlalchemy import text
 from sqlalchemy.engine import Result
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.db.bitrix import get_bitrix_engine          # ← Bitrix сначала
 from app.db.postgres import get_postgres_engine
@@ -168,6 +169,63 @@ async def _load_lookup_table(
         if mapping:
             return mapping
     return {}
+
+
+def _apply_prodclass_name_fallback(
+    primary: Optional[dict[str, Any]],
+    fetched_name: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Заполняет название продкласса и обновляет label, если это необходимо."""
+
+    if not primary or not fetched_name:
+        return primary
+
+    updated = dict(primary)
+    updated["name"] = fetched_name
+
+    prodclass_id = updated.get("id")
+    desired_label = _format_with_id(fetched_name, prodclass_id)
+    if desired_label:
+        placeholder_label = _format_with_id(None, prodclass_id)
+        current_label = _normalize_text_value(updated.get("label"))
+        if (
+            not current_label
+            or current_label == placeholder_label
+            or (
+                prodclass_id is not None
+                and current_label == str(prodclass_id).strip()
+            )
+        ):
+            updated["label"] = desired_label
+
+    return updated
+
+
+async def _fetch_prodclass_name(
+    engine: AsyncEngine, prodclass_id: int
+) -> Optional[str]:
+    """Ищет название продкласса в public.ib_prodclass."""
+
+    async with engine.connect() as conn:
+        if not await _table_exists(conn, "public", "ib_prodclass"):
+            return None
+        stmt = text(
+            """
+            SELECT name
+            FROM public.ib_prodclass
+            WHERE id = :pid
+            LIMIT 1
+            """
+        )
+        result = await conn.execute(stmt, {"pid": prodclass_id})
+        row = result.mappings().first()
+        if not row:
+            return None
+        value = row.get("name")
+        if value is None:
+            return None
+        text_value = str(value).strip()
+        return text_value or None
 
 
 def _as_float(value: Any) -> float | None:
@@ -899,6 +957,18 @@ async def analyze_company_by_inn(inn: str) -> dict:
         equipment = equipment[:_MAX_EQUIPMENT]
 
     primary_prodclass = _select_primary_prodclass(prod_rows, prod_lookup)
+    if (
+        primary_prodclass
+        and eng_pg is not None
+        and primary_prodclass.get("id") is not None
+        and not _normalize_text_value(primary_prodclass.get("name"))
+    ):
+        fetched_name = await _fetch_prodclass_name(
+            eng_pg, int(primary_prodclass["id"])
+        )
+        primary_prodclass = _apply_prodclass_name_fallback(
+            primary_prodclass, fetched_name
+        )
 
     # ---- 2) main_okved fallback: сначала Bitrix.dadata_result ----
     okved_fallback = None
