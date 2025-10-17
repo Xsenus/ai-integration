@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Sequence
@@ -11,6 +10,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.db.postgres import get_postgres_engine
+from app.services.vector_similarity import cosine_similarity
 
 log = logging.getLogger("services.ib_match")
 
@@ -510,13 +510,29 @@ def _match_rows(
             continue
         best_id: Optional[int] = None
         best_name: Optional[str] = None
-        best_score = -1.0
+        best_score = float("-inf")
+        has_valid_score = False
         for entry in catalog:
-            score = _cosine_similarity(row.vector, entry.vector)
+            score = cosine_similarity(row.vector, entry.vector)
+            if score is None:
+                continue
+            has_valid_score = True
             if score > best_score:
                 best_id = entry.ib_id
                 best_name = entry.name
                 best_score = score
+        if not has_valid_score:
+            matches.append(
+                MatchResult(
+                    ai_id=row.ai_id,
+                    text=row.text,
+                    match_ib_id=None,
+                    match_ib_name=None,
+                    score=None,
+                    note="Нет валидных векторов для сравнения",
+                )
+            )
+            continue
         if best_id is None:
             matches.append(
                 MatchResult(
@@ -572,27 +588,6 @@ def _log_match_details(entity: str, matches: Sequence[MatchResult]) -> None:
                 _clip(match.text),
                 reason,
             )
-
-
-def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
-    if not a or not b:
-        return 0.0
-    if len(a) != len(b):
-        length = min(len(a), len(b))
-        a = a[:length]
-        b = b[:length]
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    denom = norm_a * norm_b
-    if denom == 0:
-        return 0.0
-    value = dot / denom
-    if value < 0:
-        return 0.0
-    if value > 1:
-        return 1.0
-    return value
 
 
 def _parse_pgvector(value: Any) -> Optional[List[float]]:
