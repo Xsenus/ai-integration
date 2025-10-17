@@ -1,125 +1,45 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Literal, Optional
+from pydantic import BaseModel, Field
 
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from app.schemas.analyze_json import AnalyzeFromInnResponse
+from app.schemas.equipment_selection import EquipmentSelectionResponse
+from app.schemas.ib_match import IbMatchResponse
+from app.schemas.org import OrgExtendedResponse
+from app.services.parse_site import ParseSiteResponse
 
 
-class PipelineRequest(BaseModel):
+class PipelineFullRequest(BaseModel):
     """Входные параметры для полного пайплайна."""
 
-    _has_identifiers: bool = PrivateAttr(default=False)
-
-    inn: str | None = Field(
-        None,
+    inn: str = Field(
+        ...,
         min_length=4,
         max_length=20,
-        description="ИНН клиента. Достаточно любого идентификатора, чтобы связать данные.",
+        regex=r"^\d+$",
+        description="ИНН клиента",
     )
-    site: str | None = Field(
+
+
+class PipelineStepError(BaseModel):
+    """Информация об ошибке шага пайплайна."""
+
+    step: str = Field(..., description="Название шага пайплайна")
+    status_code: int | None = Field(
         None,
-        description="Сайт компании (домен или URL). Нормализуется до домена без www.",
+        description="HTTP статус, если ошибка произошла на уровне HTTPException",
     )
-    pars_id: int | None = Field(
-        None,
-        description="Идентификатор записи pars_site.",
-    )
-    client_id: int | None = Field(
-        None,
-        description="Идентификатор клиента (clients_requests.id).",
-    )
-    run_analyze: bool = Field(
-        False,
-        description="Запускать ли шаг анализа перед сопоставлениями.",
-    )
-    analyze_options: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Настройки шага анализа (совместимы с /v1/analyze/{pars_id}).",
-    )
-    ib_match_options: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Опции для шага IB-match.",
-    )
-
-    @model_validator(mode="after")
-    def _ensure_identifier_present(self) -> "PipelineRequest":  # noqa: D401
-        """Проверяет, что указан хотя бы один идентификатор."""
-        has_any = any([self.inn, self.site, self.pars_id, self.client_id])
-        object.__setattr__(self, "_has_identifiers", has_any)
-        if not has_any and not self.run_analyze:
-            # При пакетном запуске анализ должен выполняться автоматически
-            self.run_analyze = True
-        return self
-
-    @property
-    def has_identifiers(self) -> bool:
-        """Признак, что во входном запросе были указаны идентификаторы."""
-
-        return self._has_identifiers
+    detail: str = Field(..., description="Описание ошибки")
 
 
-class ResolvedIdentifiers(BaseModel):
-    """Итоговые значения идентификаторов после разрешения."""
+class PipelineFullResponse(BaseModel):
+    """Результат полного пайплайна."""
 
-    inn: str | None = None
-    site: str | None = None
-    pars_id: int | None = None
-    client_id: int
-
-
-class PipelineClient(BaseModel):
-    """Сведения о выбранной записи клиента."""
-
-    id: int
-    company_name: str | None = None
-    inn: str | None = None
-    domain_1: str | None = None
-    domain_2: str | None = None
-    started_at: datetime | None = None
-    ended_at: datetime | None = None
-    created_at: datetime | None = None
-
-
-class PipelineParsSite(BaseModel):
-    """Краткие сведения по записи pars_site."""
-
-    id: int
-    domain_1: str | None = None
-    url: str | None = None
-    created_at: datetime | None = None
-
-
-class ParseSiteStage(BaseModel):
-    """Блок с информацией о pars_site и клиенте."""
-
-    client_id: int
-    client: PipelineClient
-    pars_sites: list[PipelineParsSite]
-    selected_pars_id: int | None = None
-
-
-class PipelineResponse(BaseModel):
-    """Полный ответ пайплайна."""
-
-    resolved: ResolvedIdentifiers
-    parse_site: ParseSiteStage
-    analyze: Optional[dict[str, Any]] = None
-    ib_match: Optional[dict[str, Any]] = None
-    equipment_selection: Optional[dict[str, Any]] = None
-    duration_ms: int
-
-
-class PipelineBatchItem(PipelineResponse):
-    """Результат пайплайна для одной организации при пакетном запуске."""
-
-    parse_run: Optional[dict[str, Any]] = None
-
-
-class PipelineBatchResponse(BaseModel):
-    """Ответ пакетного запуска пайплайна без входных идентификаторов."""
-
-    mode: Literal["batch"] = "batch"
-    total: int
-    items: list[PipelineBatchItem]
+    inn: str
+    lookup_card: OrgExtendedResponse | None = None
+    parse_site: ParseSiteResponse | None = None
+    analyze_json: AnalyzeFromInnResponse | None = None
+    ib_match: IbMatchResponse | None = None
+    equipment_selection: EquipmentSelectionResponse | None = None
+    errors: list[PipelineStepError] = Field(default_factory=list)
     duration_ms: int

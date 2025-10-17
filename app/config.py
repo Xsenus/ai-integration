@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     IB_EQUIPMENT_NAME_COLUMN: str = "equipment_name"
     IB_EQUIPMENT_VECTOR_COLUMN: str = "equipment_vector"
 
-    # === External analyze service (для POST /v1/lookup/ai-analyzer) ===
+    # === External analyze service (используется в /v1/analyze-json) ===
     # Можно указать любой из этих ключей в .env; приоритет у AI_ANALYZE_BASE/AI_ANALYZE_TIMEOUT
     AI_ANALYZE_BASE: Optional[str] = None     # напр.: http://37.221.125.221:8123
     ANALYZE_BASE: Optional[str] = None        # альтернативное имя переменной окружения
