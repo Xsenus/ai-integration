@@ -562,18 +562,17 @@ async def build_equipment_tables(
     _append_step_separator(report.log, "Шаг 0 — Клиент")
     client_rows = await _load_client(conn, client_request_id)
     report.client_rows = client_rows
-    first_row: Dict[str, Any] = {}
-    if client_rows:
-        first_row = _row_mapping(client_rows[0])
     report.company_id = await _resolve_company_id(
         conn, client_request_id, client_rows, report.log
     )
-    client_columns = ["id"]
-    if "company_id" in first_row:
-        client_columns.append("company_id")
-    client_columns.extend(
-        ["company_name", "inn", "domain_1", "started_at", "ended_at"]
-    )
+    client_columns = [
+        "id",
+        "company_name",
+        "inn",
+        "domain_1",
+        "started_at",
+        "ended_at",
+    ]
     _add_table(
         report,
         step="0",
@@ -843,7 +842,6 @@ async def build_equipment_tables(
         "EQUIPMENT_1way",
         equipment_1way,
         client_request_id,
-        report.company_id,
         report.log,
     )
     await _sync_equipment_table(
@@ -851,7 +849,6 @@ async def build_equipment_tables(
         "EQUIPMENT_2way",
         equipment_2way,
         client_request_id,
-        report.company_id,
         report.log,
     )
     await _sync_equipment_table(
@@ -859,7 +856,6 @@ async def build_equipment_tables(
         "EQUIPMENT_3way",
         equipment_3way,
         client_request_id,
-        report.company_id,
         report.log,
     )
     await _sync_equipment_table(
@@ -867,7 +863,6 @@ async def build_equipment_tables(
         "EQUIPMENT_ALL",
         equipment_all,
         client_request_id,
-        report.company_id,
         report.log,
     )
 
@@ -887,18 +882,17 @@ async def _load_client(
     conn: AsyncConnection, client_request_id: int
 ) -> List[Dict[str, Any]]:
     log.debug(
-        "equipment-selection: проверяем колонку company_id в public.clients_requests перед загрузкой клиента",
+        "equipment-selection: загружаем клиента из public.clients_requests (id=%s)",
+        client_request_id,
     )
-    await _ensure_table_column(
-        conn,
-        "clients_requests",
-        "company_id",
-        "BIGINT",
-    )
-    select_columns: List[str] = ["id", "company_id"]
-    select_columns.extend(
-        ["company_name", "inn", "domain_1", "started_at", "ended_at"]
-    )
+    select_columns: List[str] = [
+        "id",
+        "company_name",
+        "inn",
+        "domain_1",
+        "started_at",
+        "ended_at",
+    ]
 
     stmt = text(
         f"""
@@ -936,74 +930,66 @@ async def _resolve_company_id(
     client_rows: Sequence[Dict[str, Any]],
     log_messages: List[str],
 ) -> int:
-    resolved: Optional[int] = None
-    source = ""
+    resolved = client_request_id
 
     if client_rows:
-        first_row = _row_mapping(client_rows[0])
-        raw_company = first_row.get("company_id")
-        if raw_company is not None:
-            try:
-                resolved = int(raw_company)
-                source = "clients_requests.company_id"
-                _log_event(
-                    log_messages,
-                    f"clients_requests: колонка company_id заполнена значением {resolved}.",
-                )
-            except (TypeError, ValueError):
-                _log_event(
-                    log_messages,
-                    "clients_requests: колонка company_id заполнена некорректным значением, используем fallback.",
-                    level=logging.WARNING,
-                )
-                resolved = None
-        else:
-            _log_event(
-                log_messages,
-                "clients_requests: колонка company_id отсутствует или пуста, пробуем определить по pars_site.",
-                level=logging.WARNING,
-            )
-
-    if resolved is None:
-        stmt = text(
-            """
-            SELECT company_id, COUNT(*) AS rows_count
-            FROM public.pars_site
-            WHERE company_id = :cid
-            GROUP BY company_id
-            """
+        _log_event(
+            log_messages,
+            (
+                "clients_requests: используем первичный ключ id как company_id. "
+                "Отдельная колонка company_id не требуется и не заполняется."
+            ),
         )
-        log.debug(
-            "equipment-selection: ищем company_id через pars_site → %s",
-            stmt.text,
+    else:
+        _log_event(
+            log_messages,
+            "clients_requests: строка не найдена, расчёт завершится ошибкой выше по стеку.",
+            level=logging.WARNING,
         )
-        result = await conn.execute(stmt, {"cid": client_request_id})
-        row = result.mappings().first()
-        if row is not None:
-            resolved = int(row["company_id"])
-            rows_count = int(row.get("rows_count", 0))
-            source = "pars_site.company_id"
-            _log_event(
-                log_messages,
-                f"pars_site: найдено {rows_count} записей с company_id={resolved}.",
-            )
-        else:
-            _log_event(
-                log_messages,
-                "pars_site: записи с нужным company_id не найдены, используем clients_requests.id.",
-                level=logging.WARNING,
-            )
 
-    if resolved is None:
-        resolved = client_request_id
-        source = "fallback=clients_requests.id"
+    stmt = text(
+        """
+        SELECT COUNT(*) AS rows_count
+        FROM public.pars_site
+        WHERE company_id = :cid
+        """
+    )
+    log.debug(
+        "equipment-selection: проверяем pars_site на наличие company_id=%s",
+        resolved,
+    )
+    result = await conn.execute(stmt, {"cid": resolved})
+    row = result.mappings().first()
+    rows_count = 0
+    if row:
+        mapping = dict(row)
+        raw_count = mapping.get("rows_count")
+        if raw_count is not None:
+            rows_count = int(raw_count)
 
-    relation = "совпадает" if resolved == client_request_id else "отличается"
+    if rows_count:
+        _log_event(
+            log_messages,
+            (
+                "pars_site: найдено "
+                f"{rows_count} записей с company_id={resolved} (совпадает с clients_requests.id)."
+            ),
+        )
+    else:
+        _log_event(
+            log_messages,
+            (
+                "pars_site: записи с company_id="
+                f"{resolved} не найдены. Проверьте синхронизацию pars_site для клиента."
+            ),
+            level=logging.WARNING,
+        )
+
     _log_event(
         log_messages,
         (
             "Итоговое значение company_id для расчёта: "
-            f"{resolved} (источник: {source}, clients_requests.id={client_request_id}, {relation})."
+            f"{resolved} (источник: clients_requests.id)."
         ),
     )
     return resolved
@@ -1627,12 +1613,11 @@ async def _sync_equipment_table(
     table_name: str,
     rows: Sequence[EquipmentScore],
     client_request_id: int,
-    company_id: Optional[int],
     log_messages: List[str],
 ) -> None:
-    owner_id = company_id if company_id is not None else client_request_id
+    owner_id = client_request_id
     log.info(
-        "equipment-selection: начинаем синхронизацию таблицы %s (строк для записи=%s, owner_id=%s)",
+        "equipment-selection: начинаем синхронизацию таблицы %s (строк для записи=%s, clients_requests.id=%s)",
         table_name,
         len(rows),
         owner_id,
