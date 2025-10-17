@@ -11,10 +11,10 @@ from app.api.lookup import lookup_card_get
 from app.api.routes import (
     get_equipment_selection_by_inn,
     ib_match_by_inn_get,
-    parse_site_by_inn,
 )
 from app.api.analyze_json import analyze_from_inn_get
 from app.db.bitrix import get_bitrix_session
+from app.services.parse_site import ParseSiteRequest, run_parse_site
 from app.schemas.pipeline import (
     PipelineFullRequest,
     PipelineFullResponse,
@@ -93,7 +93,7 @@ async def run_full_pipeline(
     if can_continue:
         parse_result, _ = await _run_step(
             "parse_site",
-            lambda: parse_site_by_inn(inn=inn, session=session),
+            lambda: run_parse_site(ParseSiteRequest(inn=inn), session),
             errors=errors,
         )
     else:
