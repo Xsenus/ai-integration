@@ -43,3 +43,42 @@ class PipelineFullResponse(BaseModel):
     equipment_selection: EquipmentSelectionResponse | None = None
     errors: list[PipelineStepError] = Field(default_factory=list)
     duration_ms: int
+
+
+class PipelineAutoCandidate(BaseModel):
+    """Сводка по статусу пайплайна для конкретного ИНН."""
+
+    inn: str
+    client_request_id: int | None = Field(
+        None, description="ID записи clients_requests, если она существует"
+    )
+    has_clients_request: bool = Field(
+        False, description="Пройдена ли стадия создания clients_requests"
+    )
+    has_pars_site: bool = Field(
+        False, description="Есть ли pars_site для клиента"
+    )
+    has_ai_goods: bool = Field(
+        False, description="Есть ли записи ai_site_goods_types"
+    )
+    has_ai_equipment: bool = Field(
+        False, description="Есть ли записи ai_site_equipment"
+    )
+    has_equipment_selection: bool = Field(
+        False, description="Есть ли результаты EQUIPMENT_ALL"
+    )
+
+
+class PipelineAutoResult(BaseModel):
+    """Результат автоматического запуска пайплайна для ИНН."""
+
+    status: PipelineAutoCandidate
+    response: PipelineFullResponse | None = None
+    error: str | None = Field(None, description="Описание ошибки, если запуск не удался")
+
+
+class PipelineAutoResponse(BaseModel):
+    """Ответ автоматического запуска пайплайна."""
+
+    processed: list[PipelineAutoResult] = Field(default_factory=list)
+    skipped: list[PipelineAutoCandidate] = Field(default_factory=list)
