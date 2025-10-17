@@ -36,6 +36,7 @@ class EquipmentSelectionNotFound(Exception):
 
 _FOUR_DECIMALS = Decimal("0.0001")
 _PREVIEW_ROW_LIMIT = 15
+_EQUIPMENT_RESULTS_LIMIT = 15
 _COLUMN_EXISTS_CACHE: Dict[Tuple[str, str, str], bool] = {}
 
 
@@ -49,6 +50,19 @@ def _to_decimal(value: object, default: Decimal = Decimal(0)) -> Decimal:
 
 def _quantize(score: Decimal) -> Decimal:
     return score.quantize(_FOUR_DECIMALS)
+
+
+def _sort_equipment_rows(rows: Sequence["EquipmentScore"]) -> List["EquipmentScore"]:
+    return sorted(rows, key=lambda item: (-item.score, item.id))
+
+
+def _limit_equipment_rows(
+    rows: Sequence["EquipmentScore"], limit: int = _EQUIPMENT_RESULTS_LIMIT
+) -> List["EquipmentScore"]:
+    sorted_rows = _sort_equipment_rows(rows)
+    if limit is None:
+        return sorted_rows
+    return list(sorted_rows[:limit])
 
 
 def _jsonable(value: Any) -> Any:
@@ -681,6 +695,7 @@ async def build_equipment_tables(
         equipment_1way_details,
         prodclass_details,
     ) = await _compute_equipment_1way(conn, prodclass_agg, report.log)
+    equipment_1way = _limit_equipment_rows(equipment_1way)
     report.equipment_1way = equipment_1way
     report.prodclass_paths = path_log
     report.equipment_1way_details = equipment_1way_details
@@ -738,6 +753,7 @@ async def build_equipment_tables(
         goods_type_scores,
         equipment_2way_details,
     ) = await _compute_equipment_2way(conn, goods_types, report.log)
+    equipment_2way = _limit_equipment_rows(equipment_2way)
     report.equipment_2way = equipment_2way
     report.equipment_2way_goods = goods_type_scores
     report.equipment_2way_details = equipment_2way_details
@@ -783,6 +799,7 @@ async def build_equipment_tables(
     equipment_3way, equipment_3way_details = await _compute_equipment_3way(
         conn, site_equipment, report.log
     )
+    equipment_3way = _limit_equipment_rows(equipment_3way)
     report.equipment_3way = equipment_3way
     report.equipment_3way_details = equipment_3way_details
 
@@ -812,6 +829,7 @@ async def build_equipment_tables(
     equipment_all, equipment_all_sources = _merge_equipment_tables(
         equipment_1way, equipment_2way, equipment_3way, report.log
     )
+    equipment_all = _limit_equipment_rows(equipment_all)
     report.equipment_all = equipment_all
     report.equipment_all_sources = equipment_all_sources
 
@@ -1274,7 +1292,7 @@ async def _compute_equipment_1way(
         fallback_updates += updated
         prodclass_details.append(detail_entry)
 
-    rows_sorted = sorted(equipment_rows.values(), key=lambda item: item.id)
+    rows_sorted = _sort_equipment_rows(equipment_rows.values())
     _log_event(
         log_messages,
         "Шаг 2: SCORE_E1 рассчитан для "
@@ -1489,7 +1507,7 @@ async def _compute_equipment_2way(
         elif existing.name is None and eq_name:
             scores[eq_id] = EquipmentScore(eq_id, eq_name, existing.score, source="2way")
 
-    rows_sorted = sorted(scores.values(), key=lambda item: item.id)
+    rows_sorted = _sort_equipment_rows(scores.values())
     _log_event(
         log_messages,
         f"Шаг 3: SCORE_E2 рассчитан для {len(rows_sorted)} позиций.",
@@ -1554,6 +1572,7 @@ async def _compute_equipment_3way(
         EquipmentScore(eq_id, name_map.get(eq_id), score, source="3way")
         for eq_id, score in sorted(score_by_equipment.items())
     ]
+    rows = _sort_equipment_rows(rows)
     _log_event(
         log_messages,
         f"Шаг 4: SCORE_E3 подготовлен для {len(rows)} элементов оборудования.",
@@ -1600,7 +1619,7 @@ def _merge_equipment_tables(
             ):
                 combined[row.id] = candidate
 
-    final_rows = [item[1] for item in sorted(combined.values(), key=lambda x: x[1].id)]
+    final_rows = _sort_equipment_rows([entry[1] for entry in combined.values()])
     _log_event(
         log_messages,
         f"Шаг 5: после объединения осталось {len(final_rows)} уникальных записей.",
