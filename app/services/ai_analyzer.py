@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
+from collections.abc import Iterable as IterableABC, Mapping as MappingABC
 from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
@@ -18,6 +20,7 @@ _DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9\-\.]*\.[a-z]{2,}$", re.IGNORECASE)
 _GOODS_LOOKUP_TABLES = ("goods_types", "ib_goods_types", "goods_type")
 _EQUIPMENT_LOOKUP_TABLES = ("equipment", "ib_equipment", "equipment_types")
 _PRODCLASS_LOOKUP_TABLES = ("ib_prodclass", "prodclass", "product_class")
+_INDUSTRY_LOOKUP_TABLES = ("ib_industry", "industry", "industries")
 
 _PREFERRED_NAME_COLUMNS = (
     "name",
@@ -42,6 +45,14 @@ _ADDITIONAL_LOOKUP_COLUMNS = (
     "prodclass_name",
     "prodclass_title",
     "prodclass_text",
+    "industry",
+    "industry_id",
+    "industry_name",
+    "industry_title",
+    "industry_label",
+    "industry_full_name",
+    "industry_short_name",
+    "industry_code",
 )
 
 _MAX_PRODUCTS = 100
@@ -204,6 +215,103 @@ def _format_with_code(name: Optional[str], code: Any) -> Optional[str]:
     return clean_name
 
 
+def _maybe_parse_json(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return json.loads(text)
+            except (TypeError, ValueError):
+                return value
+    return value
+
+
+def _normalize_text_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    parsed = _maybe_parse_json(value)
+    if parsed is not value:
+        return _normalize_text_value(parsed)
+    value = parsed
+    if isinstance(value, (int, float)):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, MappingABC):
+        for key in ("label", "name", "title", "full_name", "short_name", "description"):
+            nested = value.get(key)
+            text = _normalize_text_value(nested)
+            if text:
+                return text
+        for nested in value.values():
+            text = _normalize_text_value(nested)
+            if text:
+                return text
+        return None
+    if isinstance(value, IterableABC) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            text = _normalize_text_value(item)
+            if text:
+                return text
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _extract_industry_label(info: Mapping[str, Any] | None) -> Optional[str]:
+    if not info:
+        return None
+    for key in (
+        "industry_label",
+        "industry_name",
+        "industry_title",
+        "industry_full_name",
+        "industry_short_name",
+        "industry",
+    ):
+        if key not in info:
+            continue
+        text = _normalize_text_value(info.get(key))
+        if text:
+            return text
+    return None
+
+
+def _extract_industry_id(info: Mapping[str, Any] | None) -> Optional[int]:
+    if not info:
+        return None
+    def _find_candidate(value: Any) -> Optional[int]:
+        parsed = _maybe_parse_json(value)
+        if parsed is not value:
+            return _find_candidate(parsed)
+        candidate = _safe_int(parsed)
+        if candidate is not None:
+            return candidate
+        if isinstance(parsed, MappingABC):
+            for nested_key in ("id", "industry_id", "code", "key"):
+                candidate = _find_candidate(parsed.get(nested_key))
+                if candidate is not None:
+                    return candidate
+            for nested_value in parsed.values():
+                candidate = _find_candidate(nested_value)
+                if candidate is not None:
+                    return candidate
+        if isinstance(parsed, IterableABC) and not isinstance(parsed, (str, bytes, bytearray)):
+            for item in parsed:
+                candidate = _find_candidate(item)
+                if candidate is not None:
+                    return candidate
+        return None
+
+    for key in ("industry_id", "industry", "industry_code"):
+        value = info.get(key)
+        candidate = _find_candidate(value)
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def _domain_from_value(value: Optional[str]) -> Optional[str]:
     normalized = _normalize_site(value)
     if not normalized:
@@ -297,6 +405,59 @@ def _resolve_goods_group(
     return None
 
 
+async def _enrich_prodclass_lookup_with_industry(
+    conn,
+    prod_lookup: Mapping[Any, dict[str, Any]] | None,
+) -> None:
+    if not prod_lookup:
+        return
+    pending: list[tuple[dict[str, Any], int]] = []
+    needed_ids: set[int] = set()
+    for info in prod_lookup.values():
+        if _extract_industry_label(info):
+            continue
+        industry_id = _extract_industry_id(info)
+        if industry_id is None:
+            continue
+        pending.append((info, industry_id))
+        needed_ids.add(industry_id)
+    if not pending or not needed_ids:
+        return
+    industry_lookup = await _load_lookup_table(
+        conn, _INDUSTRY_LOOKUP_TABLES, ("id", "industry_id", "industry")
+    )
+    if not industry_lookup:
+        return
+    label_keys = (
+        "industry_label",
+        "industry_name",
+        "industry_title",
+        "industry_full_name",
+        "industry_short_name",
+        "label",
+        "name",
+        "title",
+        "full_name",
+        "short_name",
+    )
+    for info, industry_id in pending:
+        industry_info = industry_lookup.get(industry_id)
+        if not industry_info:
+            continue
+        label = _lookup_value(industry_info, label_keys)
+        if label and not _extract_industry_label(info):
+            info["industry_label"] = label
+        if label and not _normalize_text_value(info.get("industry_name")):
+            info["industry_name"] = label
+        code = _lookup_value(industry_info, ("industry_code", "code"))
+        if code and not _normalize_text_value(info.get("industry_code")):
+            info["industry_code"] = code
+        if _safe_int(info.get("industry_id")) is None:
+            info["industry_id"] = industry_id
+        if _safe_int(info.get("industry")) is None:
+            info.setdefault("industry", industry_id)
+
+
 def _resolve_prodclass_name(
     row: Mapping[str, Any],
     lookup: Mapping[Any, Mapping[str, Any]] | None,
@@ -318,33 +479,31 @@ def _resolve_industry_from_prodclass(
     prod_rows: Iterable[Mapping[str, Any]],
     lookup: Mapping[Any, Mapping[str, Any]] | None,
 ) -> Optional[str]:
+    fallback_label: Optional[str] = None
     for row in sorted(prod_rows, key=lambda r: _score_sort_key(r, "prodclass_score")):
         identifier = row.get("prodclass")
         if identifier is None:
             identifier = row.get("prodclass_id")
         info = lookup.get(identifier) if lookup else None
-        label = _lookup_value(
-            info,
-            (
-                "prodclass",
-                "prodclass_name",
-                "name",
-                "title",
-                "full_name",
-                "short_name",
-                "label",
-            ),
-        )
-        if not label:
+        label = _extract_industry_label(info)
+        if not label and info:
+            # иногда колонка industry может содержать ID без текста; тогда label остаётся None
+            pass
+        if label:
+            industry_id = _extract_industry_id(info)
+            formatted = _format_with_id(label, industry_id)
+            if formatted:
+                return formatted
+        if fallback_label is None:
             for key in ("prodclass_name", "prodclass_title", "prodclass_text"):
                 value = row.get(key)
                 if value:
-                    label = str(value).strip()
-                    break
-        formatted = _format_with_id(label, identifier)
-        if formatted:
-            return formatted
-    return None
+                    fallback_label = _format_with_id(str(value).strip(), identifier)
+                    if fallback_label:
+                        break
+            if fallback_label is None:
+                fallback_label = _format_with_id(None, identifier)
+    return fallback_label
 
 
 def _compose_products(
@@ -614,6 +773,7 @@ async def analyze_company_by_inn(inn: str) -> dict:
                     prod_lookup = await _load_lookup_table(
                         conn, _PRODCLASS_LOOKUP_TABLES, ("id", "prodclass", "prodclass_id")
                     )
+                    await _enrich_prodclass_lookup_with_industry(conn, prod_lookup)
 
             if await _table_exists(conn, "public", "ai_site_equipment"):
                 sql_equipment = text(
