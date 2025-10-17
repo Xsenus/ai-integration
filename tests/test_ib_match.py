@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from app.services.ib_match import CatalogEntry, SourceRow, _match_rows
+from app.services.ib_match import CatalogEntry, SourceRow, _match_rows, _select_for_embedding
 from app.services.vector_similarity import cosine_similarity
 
 
@@ -51,3 +51,29 @@ def test_match_rows_clamps_negative_scores_before_persisting() -> None:
 
     assert matches[0].score == 0.0
     assert updates[0]["score"] == 0.0
+
+
+def test_select_for_embedding_skips_rows_without_source_text() -> None:
+    rows = [
+        SourceRow(ai_id=1, text="", vector=None),
+        SourceRow(ai_id=2, text="   ", vector=None, embed_text=None),
+        SourceRow(ai_id=3, text="ok", vector=None),
+    ]
+
+    result = _select_for_embedding(rows, reembed=False)
+
+    assert [row.ai_id for row in result] == [3]
+
+
+def test_select_for_embedding_flags_dimension_mismatch() -> None:
+    rows = [
+        SourceRow(ai_id=1, text="vector", vector=[0.1, 0.2], embed_text="vector"),
+    ]
+
+    result = _select_for_embedding(rows, reembed=False, expected_size=3)
+
+    assert [row.ai_id for row in result] == [1]
+
+    rows[0].vector = [0.1, 0.2, 0.3]
+
+    assert _select_for_embedding(rows, reembed=False, expected_size=3) == []

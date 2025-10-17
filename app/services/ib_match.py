@@ -18,6 +18,7 @@ _DEFAULT_EMBED_BASE = "http://37.221.125.221:8123"
 _EMBED_ENDPOINT = "/ai-search"
 _MAX_BATCH_SIZE = 64
 _BORDER_WIDTH = 88
+_MAX_EMBED_TEXT_LENGTH = 6000
 
 
 class IbMatchServiceError(RuntimeError):
@@ -33,6 +34,7 @@ class SourceRow:
     ai_id: int
     text: str
     vector: Optional[List[float]]
+    embed_text: Optional[str] = None
 
 
 @dataclass
@@ -50,6 +52,24 @@ class MatchResult:
     match_ib_name: Optional[str]
     score: Optional[float]
     note: str = ""
+
+
+def _prepare_embed_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > _MAX_EMBED_TEXT_LENGTH:
+        return text[:_MAX_EMBED_TEXT_LENGTH]
+    return text
+
+
+def _infer_vector_size(entries: Sequence[CatalogEntry]) -> Optional[int]:
+    for entry in entries:
+        if entry.vector:
+            return len(entry.vector)
+    return None
 
 
 def _serialize_goods_match(match: MatchResult) -> dict[str, Any]:
@@ -114,6 +134,7 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
                 ai_id=int(row["id"]),
                 text=str(row["goods_type"] or ""),
                 vector=_parse_pgvector(row["text_vector"]),
+                embed_text=_prepare_embed_text(row.get("goods_type")),
             )
             for row in goods_rows_raw.mappings()
         ]
@@ -135,6 +156,7 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
                 ai_id=int(row["id"]),
                 text=str(row["equipment"] or ""),
                 vector=_parse_pgvector(row["text_vector"]),
+                embed_text=_prepare_embed_text(row.get("equipment")),
             )
             for row in equip_rows_raw.mappings()
         ]
@@ -148,7 +170,12 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         pars_rows_raw = await conn.execute(
             text(
                 """
-                SELECT ps.id, ps.domain_1, ps.url, ps.text_vector::text AS text_vector
+                SELECT ps.id,
+                       ps.domain_1,
+                       ps.url,
+                       ps.text_vector::text AS text_vector,
+                       ps.description,
+                       ps.text_par
                 FROM public.pars_site AS ps
                 WHERE ps.company_id = :client_id
                 ORDER BY ps.id
@@ -163,11 +190,15 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             url = str(row.get("url") or "").strip()
             label_bits = [bit for bit in (domain, url) if bit]
             label = " | ".join(label_bits) if label_bits else f"pars_site:{row['id']}"
+            description = _prepare_embed_text(row.get("description"))
+            raw_text = _prepare_embed_text(row.get("text_par"))
+            embed_text = description or raw_text or None
             prodclass_rows.append(
                 SourceRow(
                     ai_id=int(row["id"]),
                     text=label,
                     vector=vector,
+                    embed_text=embed_text,
                 )
             )
         log.info(
@@ -280,17 +311,36 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             for row in existing_prodclass_raw.mappings()
         }
 
-    goods_embed_targets = _select_for_embedding(goods_rows, reembed_if_exists)
-    equipment_embed_targets = _select_for_embedding(equipment_rows, reembed_if_exists)
+    goods_expected_size = _infer_vector_size(ib_goods)
+    equipment_expected_size = _infer_vector_size(ib_equipment)
+    prodclass_expected_size = _infer_vector_size(ib_prodclass)
+
+    goods_embed_targets = _select_for_embedding(
+        goods_rows,
+        reembed_if_exists,
+        expected_size=goods_expected_size,
+    )
+    equipment_embed_targets = _select_for_embedding(
+        equipment_rows,
+        reembed_if_exists,
+        expected_size=equipment_expected_size,
+    )
+    prodclass_embed_targets = _select_for_embedding(
+        prodclass_rows,
+        reembed_if_exists,
+        expected_size=prodclass_expected_size,
+    )
     log.info(
-        "ib-match: embedding targets for client_id=%s → goods=%s, equipment=%s",
+        "ib-match: embedding targets for client_id=%s → goods=%s, equipment=%s, prodclass=%s",
         client_id,
         len(goods_embed_targets),
         len(equipment_embed_targets),
+        len(prodclass_embed_targets),
     )
 
     goods_embeddings_generated = 0
     equipment_embeddings_generated = 0
+    prodclass_embeddings_generated = 0
 
     if goods_embed_targets:
         log.info("ib-match: generating %s goods embeddings", len(goods_embed_targets))
@@ -308,6 +358,17 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             row.vector = vector
     else:
         log.info("ib-match: equipment embeddings already exist — skipping regeneration")
+    if prodclass_embed_targets:
+        log.info(
+            "ib-match: generating %s prodclass embeddings",
+            len(prodclass_embed_targets),
+        )
+        prodclass_vectors = await _embed_and_update_rows(prodclass_embed_targets)
+        prodclass_embeddings_generated = len(prodclass_embed_targets)
+        for row, vector in zip(prodclass_embed_targets, prodclass_vectors):
+            row.vector = vector
+    else:
+        log.info("ib-match: prodclass embeddings already exist — skipping regeneration")
 
     goods_matches, goods_updates = _match_rows(goods_rows, ib_goods)
     equipment_matches, equipment_updates = _match_rows(
@@ -328,14 +389,16 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         match.ai_id for match in prodclass_matches if match.match_ib_id is None
     ]
     log.info(
-        "ib-match: prepared %s goods updates and %s equipment updates for client_id=%s",
+        "ib-match: prepared updates for client_id=%s → goods=%s, equipment=%s, prodclass=%s",
+        client_id,
         len(goods_updates),
         len(equipment_updates),
-        client_id,
+        len(prodclass_updates),
     )
 
     goods_vectors_persisted = 0
     equipment_vectors_persisted = 0
+    prodclass_vectors_persisted = 0
     prodclass_updated = 0
     prodclass_inserted = 0
     prodclass_cleared = 0
@@ -383,6 +446,27 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
                     {"id": row.ai_id, "vec": literal},
                 )
                 equipment_vectors_persisted += 1
+        if prodclass_embed_targets:
+            update_vec_prodclass_sql = text(
+                """
+                UPDATE public.pars_site
+                SET text_vector = CAST(:vec AS vector)
+                WHERE id = :id
+                """
+            )
+            for row in prodclass_embed_targets:
+                literal = _vector_to_literal(row.vector)
+                if literal is None:
+                    log.warning(
+                        "ib-match: skipping pars_site vector update for id=%s — empty vector",
+                        row.ai_id,
+                    )
+                    continue
+                await conn.execute(
+                    update_vec_prodclass_sql,
+                    {"id": row.ai_id, "vec": literal},
+                )
+                prodclass_vectors_persisted += 1
         if goods_updates:
             update_goods_sql = text(
                 """
@@ -449,10 +533,11 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
                     await conn.execute(update_prodclass_sql, update_payload)
                     prodclass_updated += 1
     log.info(
-        "ib-match: database updates applied for client_id=%s (goods_vectors=%s, equipment_vectors=%s, goods_matches=%s, equipment_matches=%s, prodclass_matches=%s, prodclass_cleared=%s)",
+        "ib-match: database updates applied for client_id=%s (goods_vectors=%s, equipment_vectors=%s, prodclass_vectors=%s, goods_matches=%s, equipment_matches=%s, prodclass_matches=%s, prodclass_cleared=%s)",
         client_id,
         goods_vectors_persisted,
         equipment_vectors_persisted,
+        prodclass_vectors_persisted,
         len(goods_updates),
         len(equipment_updates),
         len(prodclass_updates),
@@ -480,6 +565,7 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         prodclass_matches=prodclass_matches,
         goods_embeddings_generated=goods_embeddings_generated,
         equipment_embeddings_generated=equipment_embeddings_generated,
+        prodclass_embeddings_generated=prodclass_embeddings_generated,
         goods_updated=goods_updated,
         equipment_updated=equipment_updated,
         prodclass_updated=prodclass_updated,
@@ -516,6 +602,8 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             "equipment_updated": equipment_updated,
             "equipment_embeddings_generated": equipment_embeddings_generated,
             "equipment_embedded": equipment_embeddings_generated,
+            "prodclass_embeddings_generated": prodclass_embeddings_generated,
+            "prodclass_embedded": prodclass_embeddings_generated,
             "ib_goods_with_vectors": len(ib_goods),
             "catalog_goods_total": len(ib_goods),
             "ib_equipment_with_vectors": len(ib_equipment),
@@ -585,17 +673,27 @@ async def assign_ib_matches_by_inn(*, inn: str, reembed_if_exists: bool) -> dict
     return result
 
 
-def _select_for_embedding(rows: Sequence[SourceRow], reembed: bool) -> List[SourceRow]:
+def _select_for_embedding(
+    rows: Sequence[SourceRow],
+    reembed: bool,
+    *,
+    expected_size: Optional[int] = None,
+) -> List[SourceRow]:
     items: List[SourceRow] = []
     for row in rows:
+        source = (row.embed_text or row.text or "").strip()
+        if not source:
+            continue
         if reembed or not row.vector:
-            if row.text and row.text.strip():
-                items.append(row)
+            items.append(row)
+            continue
+        if expected_size is not None and len(row.vector or []) != expected_size:
+            items.append(row)
     return items
 
 
 async def _embed_and_update_rows(rows: Sequence[SourceRow]) -> List[List[float]]:
-    texts = [row.text.strip() for row in rows]
+    texts = [(row.embed_text or row.text or "").strip() for row in rows]
     vectors: List[List[float]] = []
     for batch in _batched(texts, _MAX_BATCH_SIZE):
         vectors.extend(await _embed_texts(batch))
@@ -823,6 +921,7 @@ def _build_report(
     prodclass_matches: Sequence[MatchResult],
     goods_embeddings_generated: int,
     equipment_embeddings_generated: int,
+    prodclass_embeddings_generated: int,
     goods_updated: int,
     equipment_updated: int,
     prodclass_updated: int,
@@ -866,6 +965,11 @@ def _build_report(
     lines.append(
         _format_embedding_line(
             "equipment", equipment_embeddings_generated, len(equipment_rows)
+        )
+    )
+    lines.append(
+        _format_embedding_line(
+            "prodclass", prodclass_embeddings_generated, len(prodclass_rows)
         )
     )
 
