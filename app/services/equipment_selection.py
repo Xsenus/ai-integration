@@ -8,10 +8,25 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from pydantic import BaseModel, Field
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from app.schemas.equipment_selection import (
+    ClientRow as ClientRowModel,
+    Equipment3WayDetailRow as Equipment3WayDetailModel,
+    EquipmentAllRow as EquipmentAllRowModel,
+    EquipmentDetailRow as EquipmentDetailModel,
+    EquipmentGoodsLinkRow as EquipmentGoodsLinkModel,
+    EquipmentSelectionResponse,
+    EquipmentWayRow as EquipmentWayRowModel,
+    GoodsTypeRow as GoodsTypeRowModel,
+    GoodsTypeScoreRow as GoodsTypeScoreModel,
+    ProdclassDetail as ProdclassDetailModel,
+    ProdclassSourceRow as ProdclassSourceRowModel,
+    SampleTable,
+    SiteEquipmentRow as SiteEquipmentRowModel,
+    WorkshopRow as WorkshopRowModel,
+)
 log = logging.getLogger("services.equipment_selection")
 
 
@@ -144,6 +159,27 @@ def _row_mapping(row: Any) -> Dict[str, Any]:
     return dict(row)
 
 
+def _maybe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _convert_decimals(payload: Dict[str, Any]) -> Dict[str, Any]:
+    converted: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, Decimal):
+            converted[key] = float(value)
+        else:
+            converted[key] = value
+    return converted
+
+
 @dataclass(slots=True)
 class EquipmentScore:
     id: int
@@ -161,16 +197,19 @@ class TableData:
     rows: List[List[Any]]
     raw_rows: List[List[Any]]
     preview: str
+    section_title: Optional[str] = None
 
 
 @dataclass(slots=True)
 class EquipmentStepReport:
+    company_id: Optional[int] = None
     client_rows: Sequence[Dict[str, Any]] = field(default_factory=list)
     goods_types: Sequence[Dict[str, Any]] = field(default_factory=list)
     site_equipment: Sequence[Dict[str, Any]] = field(default_factory=list)
     prodclass_rows: Sequence[Dict[str, Any]] = field(default_factory=list)
     prodclass_agg: Sequence[Dict[str, Any]] = field(default_factory=list)
     prodclass_paths: Sequence[Dict[str, Any]] = field(default_factory=list)
+    prodclass_details: Sequence[Dict[str, Any]] = field(default_factory=list)
     equipment_1way: Sequence[EquipmentScore] = field(default_factory=list)
     equipment_1way_details: Sequence[Dict[str, Any]] = field(default_factory=list)
     equipment_2way: Sequence[EquipmentScore] = field(default_factory=list)
@@ -184,45 +223,217 @@ class EquipmentStepReport:
     log: List[str] = field(default_factory=list)
 
 
-class TableDataModel(BaseModel):
-    step: str = Field(description="Номер шага (например, '2.b').")
-    table_id: str = Field(description="Внутренний идентификатор таблицы.")
-    title: str = Field(description="Человекочитаемый заголовок таблицы.")
-    columns: List[str] = Field(description="Названия колонок в порядке отображения.")
-    rows: List[List[Any]] = Field(description="Строки таблицы (значения по колонкам).")
-    row_count: int = Field(description="Количество строк в таблице.")
-    preview: str = Field(description="Строковое представление таблицы в стиле примера.")
-
-
-class EquipmentSelectionResult(BaseModel):
-    client_request_id: int = Field(description="Идентификатор clients_requests.id.")
-    tables: List[TableDataModel] = Field(description="Список таблиц, отсортированных по шагам расчёта.")
-    log: List[str] = Field(description="Подробный журнал выполнения расчёта.")
-
-
 async def compute_equipment_selection(
     conn: AsyncConnection, client_request_id: int
-) -> EquipmentSelectionResult:
+) -> EquipmentSelectionResponse:
     log.info(
         "equipment-selection: запуск расчёта для clients_requests.id=%s",
         client_request_id,
     )
     report = await build_equipment_tables(conn, client_request_id)
-    tables = [
-        TableDataModel(
-            step=table.step,
-            table_id=table.table_id,
-            title=table.title,
-            columns=table.columns,
-            rows=[[ _jsonable(value) for value in row ] for row in table.rows],
-            row_count=len(table.rows),
-            preview=table.preview,
+    response = _build_response(report)
+    return response
+
+
+def _create_sample_table(table: TableData) -> SampleTable:
+    lines: List[str] = []
+    if table.section_title:
+        border = "=" * 18
+        lines.append(f"{border} {table.section_title} {border}")
+        lines.append("")
+    lines.extend(table.preview.splitlines())
+    return SampleTable(title=table.title, lines=lines)
+
+
+def _convert_equipment_scores(rows: Sequence[EquipmentScore]) -> List[EquipmentWayRowModel]:
+    return [
+        EquipmentWayRowModel(
+            id=row.id,
+            equipment_name=row.name,
+            score=float(_to_decimal(row.score)),
         )
-        for table in report.tables
+        for row in rows
     ]
-    return EquipmentSelectionResult(
-        client_request_id=client_request_id,
-        tables=tables,
+
+
+def _convert_equipment_all(rows: Sequence[EquipmentScore]) -> List[EquipmentAllRowModel]:
+    return [
+        EquipmentAllRowModel(
+            id=row.id,
+            equipment_name=row.name,
+            score=float(_to_decimal(row.score)),
+            source=row.source,
+        )
+        for row in rows
+    ]
+
+
+def _convert_equipment_detail_list(
+    items: Sequence[Any],
+) -> List[EquipmentDetailModel]:
+    result: List[EquipmentDetailModel] = []
+    for item in items:
+        mapping = _row_mapping(item)
+        eq_id = mapping.get("id")
+        if eq_id is None:
+            continue
+        result.append(
+            EquipmentDetailModel(
+                id=int(eq_id),
+                equipment_name=mapping.get("equipment_name"),
+                workshop_id=mapping.get("workshop_id"),
+                equipment_score=_maybe_float(mapping.get("equipment_score")),
+                equipment_score_real=_maybe_float(mapping.get("equipment_score_real")),
+                equipment_score_max=_maybe_float(mapping.get("equipment_score_max")),
+                score_1=_maybe_float(mapping.get("SCORE_1") or mapping.get("score_1")),
+                factor=_maybe_float(mapping.get("factor")),
+                score_e1=_maybe_float(mapping.get("SCORE_E1") or mapping.get("score_e1")),
+                path=str(mapping.get("path", "")),
+            )
+        )
+    return result
+
+
+def _convert_goods_links(items: Sequence[Any]) -> List[EquipmentGoodsLinkModel]:
+    result: List[EquipmentGoodsLinkModel] = []
+    for item in items:
+        mapping = _row_mapping(item)
+        equipment_id = mapping.get("id") or mapping.get("equipment_id")
+        goods_type_id = mapping.get("goods_type_id")
+        if equipment_id is None or goods_type_id is None:
+            continue
+        result.append(
+            EquipmentGoodsLinkModel(
+                equipment_id=int(equipment_id),
+                goods_type_id=int(goods_type_id),
+                crore_2=_maybe_float(mapping.get("CRORE_2") or mapping.get("crore_2")) or 0.0,
+                crore_3=_maybe_float(mapping.get("CRORE_3") or mapping.get("crore_3")) or 0.0,
+                score_e2=_maybe_float(mapping.get("SCORE_E2") or mapping.get("score_e2")) or 0.0,
+                equipment_name=mapping.get("equipment_name"),
+            )
+        )
+    return result
+
+
+def _convert_goods_type_scores(items: Sequence[Any]) -> List[GoodsTypeScoreModel]:
+    result: List[GoodsTypeScoreModel] = []
+    for item in items:
+        mapping = _row_mapping(item)
+        goods_type_id = mapping.get("goods_type_id")
+        if goods_type_id is None:
+            continue
+        result.append(
+            GoodsTypeScoreModel(
+                goods_type_id=int(goods_type_id),
+                crore_2=_maybe_float(mapping.get("CRORE_2") or mapping.get("crore_2")) or 0.0,
+            )
+        )
+    return result
+
+
+def _convert_equipment_3way_details(
+    items: Sequence[Any],
+) -> List[Equipment3WayDetailModel]:
+    result: List[Equipment3WayDetailModel] = []
+    for item in items:
+        mapping = _row_mapping(item)
+        equipment_id = mapping.get("equipment_id")
+        if equipment_id is None:
+            continue
+        result.append(
+            Equipment3WayDetailModel(
+                equipment_id=int(equipment_id),
+                equipment_score=_maybe_float(mapping.get("equipment_score")),
+                score_e3=_maybe_float(mapping.get("SCORE_E3") or mapping.get("score_e3")),
+            )
+        )
+    return result
+
+
+def _convert_workshops(items: Optional[Sequence[Any]]) -> Optional[List[WorkshopRowModel]]:
+    if not items:
+        return None
+    return [
+        WorkshopRowModel(**_convert_decimals(_row_mapping(item)))
+        for item in items
+    ]
+
+
+def _convert_prodclass_details(
+    items: Sequence[Dict[str, Any]]
+) -> List[ProdclassDetailModel]:
+    result: List[ProdclassDetailModel] = []
+    for item in items:
+        mapping = dict(item)
+        prodclass_id = mapping.get("prodclass_id")
+        if prodclass_id is None:
+            continue
+        equipment_details = _convert_equipment_detail_list(mapping.get("equipment", []))
+        detail = ProdclassDetailModel(
+            prodclass_id=int(prodclass_id),
+            prodclass_name=mapping.get("prodclass_name"),
+            score_1=_maybe_float(mapping.get("score_1")),
+            votes=int(mapping.get("votes", 0)),
+            path=str(mapping.get("path", "")),
+            workshops=_convert_workshops(mapping.get("workshops")) or [],
+            fallback_industry_id=mapping.get("fallback_industry_id"),
+            fallback_prodclass_ids=mapping.get("fallback_prodclass_ids"),
+            fallback_workshops=_convert_workshops(mapping.get("fallback_workshops")),
+            equipment=equipment_details,
+        )
+        result.append(detail)
+    return result
+
+
+def _build_response(report: EquipmentStepReport) -> EquipmentSelectionResponse:
+    client_model: Optional[ClientRowModel] = None
+    if report.client_rows:
+        client_model = ClientRowModel(**_convert_decimals(_row_mapping(report.client_rows[0])))
+
+    goods_types = [
+        GoodsTypeRowModel(**_convert_decimals(_row_mapping(row)))
+        for row in report.goods_types
+    ]
+    site_equipment = [
+        SiteEquipmentRowModel(**_convert_decimals(_row_mapping(row)))
+        for row in report.site_equipment
+    ]
+    prodclass_rows = [
+        ProdclassSourceRowModel(**_convert_decimals(_row_mapping(row)))
+        for row in report.prodclass_rows
+    ]
+    prodclass_details = _convert_prodclass_details(report.prodclass_details)
+
+    goods_type_scores = _convert_goods_type_scores(report.equipment_2way_goods)
+    goods_links = _convert_goods_links(report.equipment_2way_details)
+    equipment_2way_details = list(goods_links)
+
+    equipment_1way_models = _convert_equipment_scores(report.equipment_1way)
+    equipment_2way_models = _convert_equipment_scores(report.equipment_2way)
+    equipment_3way_models = _convert_equipment_scores(report.equipment_3way)
+    equipment_all_models = _convert_equipment_all(report.equipment_all)
+
+    equipment_1way_details = _convert_equipment_detail_list(report.equipment_1way_details)
+    equipment_3way_details = _convert_equipment_3way_details(report.equipment_3way_details)
+
+    sample_tables = [_create_sample_table(table) for table in report.tables]
+
+    return EquipmentSelectionResponse(
+        client=client_model,
+        goods_types=goods_types,
+        site_equipment=site_equipment,
+        prodclass_rows=prodclass_rows,
+        prodclass_details=prodclass_details,
+        goods_type_scores=goods_type_scores,
+        goods_links=goods_links,
+        equipment_1way=equipment_1way_models,
+        equipment_1way_details=equipment_1way_details,
+        equipment_2way=equipment_2way_models,
+        equipment_2way_details=equipment_2way_details,
+        equipment_3way=equipment_3way_models,
+        equipment_3way_details=equipment_3way_details,
+        equipment_all=equipment_all_models,
+        sample_tables=sample_tables,
         log=list(report.log),
     )
 
@@ -269,6 +480,10 @@ async def build_equipment_tables(
     _append_step_separator(report.log, "Шаг 0 — Клиент")
     client_rows = await _load_client(conn, client_request_id)
     report.client_rows = client_rows
+    if client_rows:
+        first_row = _row_mapping(client_rows[0])
+        company_id = first_row.get("company_id")
+        report.company_id = None if company_id is None else int(company_id)
     _add_table(
         report,
         step="0",
@@ -283,6 +498,7 @@ async def build_equipment_tables(
             "started_at",
             "ended_at",
         ],
+        section_title="Шаг 0 — Клиент",
     )
     report.log.append(
         f"Шаг 0: загружена карточка клиента (строк: {len(client_rows)})."
@@ -306,6 +522,7 @@ async def build_equipment_tables(
             "url",
             "created_at",
         ],
+        section_title="Шаг 1 — Данные с сайта",
     )
     report.log.append(
         f"Шаг 1.a: найдено {len(goods_types)} записей ai_site_goods_types."
@@ -351,6 +568,7 @@ async def build_equipment_tables(
             "url",
             "created_at",
         ],
+        section_title="Шаг 2 — SCORE_E1 через prodclass",
     )
     report.log.append(
         f"Шаг 2.a: загружено {len(prodclass_rows)} записей ai_site_prodclass."
@@ -374,10 +592,12 @@ async def build_equipment_tables(
         equipment_1way,
         path_log,
         equipment_1way_details,
+        prodclass_details,
     ) = await _compute_equipment_1way(conn, prodclass_agg, report.log)
     report.equipment_1way = equipment_1way
     report.prodclass_paths = path_log
     report.equipment_1way_details = equipment_1way_details
+    report.prodclass_details = prodclass_details
 
     _add_table(
         report,
@@ -412,13 +632,17 @@ async def build_equipment_tables(
             "path",
         ],
     )
+    equipment_1way_table = [
+        {"id": item.id, "equipment_name": item.name, "score": item.score}
+        for item in equipment_1way
+    ]
     _add_table(
         report,
         step="2.d",
         table_id="equipment_1way",
         title="2.d) EQUIPMENT_1way (ID, equipment_name, SCORE)",
-        rows=equipment_1way,
-        columns=["id", "name", "score", "source"],
+        rows=equipment_1way_table,
+        columns=["id", "equipment_name", "score"],
     )
 
     _append_step_separator(report.log, "Шаг 3 — SCORE_E2 через goods_type")
@@ -438,6 +662,7 @@ async def build_equipment_tables(
         title="3.a) ID_4 = goods_type_ID и CRORE_2 = goods_types_score",
         rows=goods_type_scores,
         columns=["goods_type_id", "CRORE_2"],
+        section_title="Шаг 3 — SCORE_E2 через goods_type",
     )
     _add_table(
         report,
@@ -454,13 +679,17 @@ async def build_equipment_tables(
             "SCORE_E2",
         ],
     )
+    equipment_2way_table = [
+        {"id": item.id, "equipment_name": item.name, "score": item.score}
+        for item in equipment_2way
+    ]
     _add_table(
         report,
         step="3.d",
         table_id="equipment_2way",
         title="3.d) EQUIPMENT_2way (ID, equipment_name, SCORE)",
-        rows=equipment_2way,
-        columns=["id", "name", "score", "source"],
+        rows=equipment_2way_table,
+        columns=["id", "equipment_name", "score"],
     )
 
     _append_step_separator(report.log, "Шаг 4 — SCORE_E3 через ai_site_equipment")
@@ -477,14 +706,19 @@ async def build_equipment_tables(
         title="4.a) ai_site_equipment (equipment_ID, equipment_score, SCORE_E3)",
         rows=equipment_3way_details,
         columns=["equipment_id", "equipment_score", "SCORE_E3"],
+        section_title="Шаг 4 — SCORE_E3 через ai_site_equipment",
     )
+    equipment_3way_table = [
+        {"id": item.id, "equipment_name": item.name, "score": item.score}
+        for item in equipment_3way
+    ]
     _add_table(
         report,
         step="4.b",
         table_id="equipment_3way",
         title="4.b) EQUIPMENT_3way (ID, equipment_name, SCORE)",
-        rows=equipment_3way,
-        columns=["id", "name", "score", "source"],
+        rows=equipment_3way_table,
+        columns=["id", "equipment_name", "score"],
     )
 
     _append_step_separator(report.log, "Шаг 5 — Сборка EQUIPMENT_ALL")
@@ -501,14 +735,19 @@ async def build_equipment_tables(
         title="5.a) Объединённый список до очистки",
         rows=equipment_all_sources,
         columns=["id", "equipment_name", "score", "source", "priority"],
+        section_title="Шаг 5 — Сборка EQUIPMENT_ALL",
     )
+    equipment_all_table = [
+        {"id": item.id, "equipment_name": item.name, "score": item.score, "source": item.source}
+        for item in equipment_all
+    ]
     _add_table(
         report,
         step="5.b",
         table_id="equipment_all",
         title="5.b) EQUIPMENT_ALL (после дедупликации)",
-        rows=equipment_all,
-        columns=["id", "name", "score", "source"],
+        rows=equipment_all_table,
+        columns=["id", "equipment_name", "score", "source"],
     )
 
     await _sync_equipment_table(
@@ -516,6 +755,7 @@ async def build_equipment_tables(
         "EQUIPMENT_1way",
         equipment_1way,
         client_request_id,
+        report.company_id,
         report.log,
     )
     await _sync_equipment_table(
@@ -523,6 +763,7 @@ async def build_equipment_tables(
         "EQUIPMENT_2way",
         equipment_2way,
         client_request_id,
+        report.company_id,
         report.log,
     )
     await _sync_equipment_table(
@@ -530,6 +771,7 @@ async def build_equipment_tables(
         "EQUIPMENT_3way",
         equipment_3way,
         client_request_id,
+        report.company_id,
         report.log,
     )
     await _sync_equipment_table(
@@ -537,6 +779,7 @@ async def build_equipment_tables(
         "EQUIPMENT_ALL",
         equipment_all,
         client_request_id,
+        report.company_id,
         report.log,
     )
 
@@ -556,7 +799,7 @@ async def _load_client(
 ) -> List[Dict[str, Any]]:
     stmt = text(
         """
-        SELECT id, company_name, inn, domain_1, started_at, ended_at
+        SELECT id, company_id, company_name, inn, domain_1, started_at, ended_at
         FROM public.clients_requests
         WHERE id = :cid
         """
@@ -680,10 +923,16 @@ async def _compute_equipment_1way(
     conn: AsyncConnection,
     prodclass_agg: Sequence[Dict[str, Any]],
     log_messages: List[str],
-) -> Tuple[List[EquipmentScore], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[
+    List[EquipmentScore],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
     equipment_rows: Dict[int, EquipmentScore] = {}
     path_log: List[Dict[str, Any]] = []
     details: List[Dict[str, Any]] = []
+    prodclass_details: List[Dict[str, Any]] = []
     direct_updates = 0
     fallback_updates = 0
 
@@ -691,12 +940,30 @@ async def _compute_equipment_1way(
         prodclass_id = int(row["prodclass_id"])
         score_1 = _to_decimal(row["SCORE_1"])
         pc_name = row.get("prodclass_name")
+        votes = int(row.get("votes", 0)) if row.get("votes") is not None else 0
+
+        detail_entry: Dict[str, Any] = {
+            "prodclass_id": prodclass_id,
+            "prodclass_name": pc_name,
+            "score_1": score_1,
+            "votes": votes,
+            "path": "",
+            "workshops": [],
+            "fallback_industry_id": None,
+            "fallback_prodclass_ids": None,
+            "fallback_workshops": None,
+            "equipment": [],
+        }
 
         workshops = await _fetch_workshops(conn, [prodclass_id])
         if workshops:
+            workshop_dicts = [_row_mapping(w) for w in workshops]
+            detail_entry["path"] = "direct"
+            detail_entry["workshops"] = workshop_dicts
             equipments = await _fetch_equipment_by_workshops(
-                conn, [int(w["id"]) for w in workshops]
+                conn, [int(w["id"]) for w in workshop_dicts]
             )
+            before_details = len(details)
             updated = _apply_equipment_scores(
                 equipments,
                 score_1,
@@ -705,6 +972,10 @@ async def _compute_equipment_1way(
                 details,
                 path="direct",
             )
+            new_equipment = [
+                dict(details[idx]) for idx in range(before_details, len(details))
+            ]
+            detail_entry["equipment"] = new_equipment
             path_log.append(
                 {
                     "prodclass_id": prodclass_id,
@@ -715,10 +986,12 @@ async def _compute_equipment_1way(
                 }
             )
             direct_updates += updated
+            prodclass_details.append(detail_entry)
             continue
 
         industry_id = await _fetch_industry(conn, prodclass_id)
         if industry_id is None:
+            detail_entry["path"] = "fallback_missing_industry"
             path_log.append(
                 {
                     "prodclass_id": prodclass_id,
@@ -728,11 +1001,15 @@ async def _compute_equipment_1way(
                     "equipment": 0,
                 }
             )
+            prodclass_details.append(detail_entry)
             continue
 
         related_prodclasses = await _fetch_prodclass_ids_by_industry(conn, industry_id)
         workshops_fb = await _fetch_workshops(conn, related_prodclasses)
         if not workshops_fb:
+            detail_entry["path"] = "fallback_no_workshops"
+            detail_entry["fallback_industry_id"] = industry_id
+            detail_entry["fallback_prodclass_ids"] = related_prodclasses
             path_log.append(
                 {
                     "prodclass_id": prodclass_id,
@@ -742,11 +1019,18 @@ async def _compute_equipment_1way(
                     "equipment": 0,
                 }
             )
+            prodclass_details.append(detail_entry)
             continue
 
+        fallback_workshop_dicts = [_row_mapping(w) for w in workshops_fb]
+        detail_entry["path"] = "fallback"
+        detail_entry["fallback_industry_id"] = industry_id
+        detail_entry["fallback_prodclass_ids"] = related_prodclasses
+        detail_entry["fallback_workshops"] = fallback_workshop_dicts
         equipments_fb = await _fetch_equipment_by_workshops(
-            conn, [int(w["id"]) for w in workshops_fb]
+            conn, [int(w["id"]) for w in fallback_workshop_dicts]
         )
+        before_details = len(details)
         updated = _apply_equipment_scores(
             equipments_fb,
             score_1,
@@ -755,6 +1039,10 @@ async def _compute_equipment_1way(
             details,
             path="fallback",
         )
+        new_equipment = [
+            dict(details[idx]) for idx in range(before_details, len(details))
+        ]
+        detail_entry["equipment"] = new_equipment
         path_log.append(
             {
                 "prodclass_id": prodclass_id,
@@ -765,13 +1053,14 @@ async def _compute_equipment_1way(
             }
         )
         fallback_updates += updated
+        prodclass_details.append(detail_entry)
 
     rows_sorted = sorted(equipment_rows.values(), key=lambda item: item.id)
     log_messages.append(
         "Шаг 2: SCORE_E1 рассчитан для "
         f"{len(rows_sorted)} позиций (direct={direct_updates}, fallback={fallback_updates})."
     )
-    return rows_sorted, path_log, details
+    return rows_sorted, path_log, details, prodclass_details
 
 
 async def _fetch_workshops(
@@ -1055,6 +1344,7 @@ async def _sync_equipment_table(
     table_name: str,
     rows: Sequence[EquipmentScore],
     client_request_id: int,
+    company_id: Optional[int],
     log_messages: List[str],
 ) -> None:
     await conn.execute(
@@ -1125,12 +1415,13 @@ async def _sync_equipment_table(
     now = datetime.now(timezone.utc)
     updates: List[Dict[str, Any]] = []
     inserts: List[Dict[str, Any]] = []
+    owner_id = company_id if company_id is not None else client_request_id
 
     for row in deduped_rows:
         new_score = _quantize(_to_decimal(row.score))
         payload = {
             "id": row.id,
-            "company_id": client_request_id,
+            "company_id": owner_id,
             "equipment_name": row.name,
             "score": new_score,
             "created_at": now,
@@ -1144,7 +1435,7 @@ async def _sync_equipment_table(
         needs_update = (
             current.get("equipment_name") != row.name
             or current.get("score") != new_score
-            or current.get("company_id") != client_request_id
+            or current.get("company_id") != owner_id
             or current.get("created_at") is None
         )
 
@@ -1196,6 +1487,7 @@ def _add_table(
     title: str,
     rows: Sequence[Any],
     columns: Sequence[str],
+    section_title: Optional[str] = None,
 ) -> None:
     formatted_rows: List[List[Any]] = []
     raw_rows: List[List[Any]] = []
@@ -1214,13 +1506,13 @@ def _add_table(
             rows=formatted_rows,
             raw_rows=raw_rows,
             preview=preview,
+            section_title=section_title,
         )
     )
 
 
 __all__ = [
     "EquipmentSelectionNotFound",
-    "EquipmentSelectionResult",
     "build_equipment_tables",
     "compute_equipment_selection",
     "resolve_client_request_id",

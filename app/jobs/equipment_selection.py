@@ -72,24 +72,16 @@ def main() -> None:
         print(json.dumps(payload, default=_json_default, ensure_ascii=False, indent=2))
         return
 
-    tables = payload.get("tables", [])
+    tables = payload.get("sample_tables", [])
     for table in tables:
-        preview = table.get("preview")
-        if preview:
-            print(f"\n{preview}")
+        lines = table.get("lines", [])
+        if not lines:
+            title = table.get("title", "Таблица")
+            print(f"\n=== {title} ===\nПусто.")
             continue
-
-        print(f"\n=== {table['title']} (шаг {table['step']}) ===")
-        rows = table.get("rows", [])
-        columns = table.get("columns", [])
-        if not rows:
-            print("Пусто.")
-            continue
-        if tabulate is None:
-            for row in rows:
-                print(dict(zip(columns, row)))
-        else:
-            print(tabulate(rows, headers=columns, tablefmt="github", showindex=False))
+        print()
+        for line in lines:
+            print(line)
 
     print("\n=== Журнал выполнения ===")
     for entry in payload.get("log", []):

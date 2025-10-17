@@ -44,9 +44,9 @@ from app.services.parse_site import (
     schedule_parse_site_background,
     run_parse_site,
 )
+from app.schemas.equipment_selection import EquipmentSelectionResponse
 from app.services.equipment_selection import (
     EquipmentSelectionNotFound,
-    EquipmentSelectionResult,
     compute_equipment_selection,
     resolve_client_request_id,
 )
@@ -654,7 +654,7 @@ router.include_router(parse_site_router)
 
 @equipment_selection_router.get(
     "",
-    response_model=EquipmentSelectionResult,
+    response_model=EquipmentSelectionResponse,
     summary="Расчёт оборудования по clients_requests.id",
 )
 async def get_equipment_selection(
@@ -690,7 +690,7 @@ async def get_equipment_selection(
 
 @equipment_selection_router.get(
     "/by-inn/{inn}",
-    response_model=EquipmentSelectionResult,
+    response_model=EquipmentSelectionResponse,
     summary="Расчёт оборудования по последней записи клиента с указанным ИНН",
 )
 async def get_equipment_selection_by_inn(
