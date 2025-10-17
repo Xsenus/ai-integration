@@ -38,6 +38,29 @@ def test_select_primary_prodclass_uses_lookup_text_label():
     }
 
 
+def test_select_primary_prodclass_handles_string_identifier():
+    prod_rows = [
+        {
+            "prodclass": "17",
+            "prodclass_score": 0.73,
+        }
+    ]
+    lookup = {
+        17: {
+            "text": "Добыча меди",
+        }
+    }
+
+    result = _select_primary_prodclass(prod_rows, lookup)
+
+    assert result == {
+        "id": 17,
+        "name": "Добыча меди",
+        "label": "[17] Добыча меди",
+        "score": 0.73,
+    }
+
+
 def test_resolve_industry_from_prodclass_prefers_industry_label():
     prod_rows = [
         {
@@ -62,6 +85,24 @@ def test_resolve_industry_from_prodclass_fallback_uses_prodclass_name():
         {
             "prodclass": 33,
             "prodclass_score": 0.55,
+        }
+    ]
+    lookup = {
+        33: {
+            "text": "Обогащение руды",
+        }
+    }
+
+    label = _resolve_industry_from_prodclass(prod_rows, lookup)
+
+    assert label == "[33] Обогащение руды"
+
+
+def test_resolve_industry_from_prodclass_accepts_string_identifier():
+    prod_rows = [
+        {
+            "prodclass": "33",
+            "prodclass_score": 0.41,
         }
     ]
     lookup = {

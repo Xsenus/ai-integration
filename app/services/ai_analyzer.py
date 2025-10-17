@@ -161,7 +161,7 @@ async def _load_lookup_table(
             continue
         mapping: dict[Any, dict[str, Any]] = {}
         for row in rows.mappings():
-            key = row.get(id_col)
+            key = _normalize_lookup_key(row.get(id_col))
             if key is None:
                 continue
             mapping[key] = {col: row.get(col) for col in select_cols if col != id_col}
@@ -359,9 +359,12 @@ def _resolve_from_lookup(
     *,
     prefer_group: bool = False,
 ) -> Optional[str]:
-    if not lookup or identifier is None:
+    if not lookup:
         return None
-    info = lookup.get(identifier)
+    normalized_identifier = _normalize_lookup_key(identifier)
+    if normalized_identifier is None:
+        return None
+    info = lookup.get(normalized_identifier)
     if not info:
         return None
     columns = _GROUP_NAME_COLUMNS if prefer_group else _PREFERRED_NAME_COLUMNS
@@ -464,6 +467,20 @@ async def _enrich_prodclass_lookup_with_industry(
             info.setdefault("industry", industry_id)
 
 
+def _normalize_lookup_key(identifier: Any) -> Any:
+    """Normalizes lookup identifiers to improve matching across types."""
+
+    if isinstance(identifier, str):
+        identifier = identifier.strip()
+        if not identifier:
+            return None
+        as_int = _safe_int(identifier)
+        return as_int if as_int is not None else identifier
+
+    as_int = _safe_int(identifier)
+    return as_int if as_int is not None else identifier
+
+
 def _resolve_prodclass_name(
     row: Mapping[str, Any],
     lookup: Mapping[Any, Mapping[str, Any]] | None,
@@ -472,7 +489,7 @@ def _resolve_prodclass_name(
         value = row.get(key)
         if value:
             return str(value).strip(), False
-    identifier = row.get("prodclass")
+    identifier = _normalize_lookup_key(row.get("prodclass"))
     label = _resolve_from_lookup(lookup, identifier)
     if label:
         return label, False
@@ -487,9 +504,9 @@ def _resolve_industry_from_prodclass(
 ) -> Optional[str]:
     fallback_label: Optional[str] = None
     for row in sorted(prod_rows, key=lambda r: _score_sort_key(r, "prodclass_score")):
-        identifier = row.get("prodclass")
+        identifier = _normalize_lookup_key(row.get("prodclass"))
         if identifier is None:
-            identifier = row.get("prodclass_id")
+            identifier = _normalize_lookup_key(row.get("prodclass_id"))
         info = lookup.get(identifier) if lookup else None
         label = _extract_industry_label(info)
         if not label and info:
@@ -514,9 +531,9 @@ def _select_primary_prodclass(
     lookup: Mapping[Any, Mapping[str, Any]] | None,
 ) -> Optional[dict[str, Any]]:
     for row in sorted(prod_rows, key=lambda r: _score_sort_key(r, "prodclass_score")):
-        identifier = row.get("prodclass")
+        identifier = _normalize_lookup_key(row.get("prodclass"))
         if identifier is None:
-            identifier = row.get("prodclass_id")
+            identifier = _normalize_lookup_key(row.get("prodclass_id"))
         if identifier is None:
             continue
         prodclass_id = _safe_int(identifier)
