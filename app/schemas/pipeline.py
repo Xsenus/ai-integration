@@ -16,7 +16,7 @@ class PipelineFullRequest(BaseModel):
         ...,
         min_length=4,
         max_length=20,
-        regex=r"^\d+$",
+        pattern=r"^\d+$",
         description="ИНН клиента",
     )
 

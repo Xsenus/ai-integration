@@ -155,7 +155,7 @@ async def parse_site_by_inn(
         ...,
         min_length=4,
         max_length=20,
-        regex=r"^\d+$",
+        pattern=r"^\d+$",
         description="ИНН компании, для которой нужно подтянуть домен",
     ),
     parse_domain: str | None = Query(
@@ -255,7 +255,7 @@ async def get_equipment_selection(
     summary="Расчёт оборудования по последней записи клиента с указанным ИНН",
 )
 async def get_equipment_selection_by_inn(
-    inn: str = Path(..., min_length=4, max_length=20, regex=r"^\d+$"),
+    inn: str = Path(..., min_length=4, max_length=20, pattern=r"^\d+$"),
 ) -> EquipmentSelectionResponse:
     log.info("equipment-selection GET/by-inn: starting for INN %s", inn)
     engine = get_postgres_engine()
