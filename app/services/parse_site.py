@@ -4,7 +4,6 @@ import asyncio
 import itertools
 import json
 import logging
-import math
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -39,6 +38,7 @@ from app.services.dadata_client import find_party_by_inn
 from app.services.mapping import map_summary_from_dadata
 from app.services.analyze_client import fetch_embedding, fetch_site_description
 from app.services.scrape import FetchError, fetch_and_chunk, to_home_url
+from app.services.vector_similarity import cosine_similarity
 
 log = logging.getLogger("services.parse_site")
 
@@ -261,28 +261,6 @@ def _vector_to_literal(vector: Sequence[float] | None) -> Optional[str]:
     if not values:
         return None
     return "[" + ",".join(f"{x:.7f}" for x in values) + "]"
-
-
-def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> Optional[float]:
-    if not vec_a or not vec_b:
-        return None
-    if len(vec_a) != len(vec_b):
-        return None
-    dot = 0.0
-    norm_a = 0.0
-    norm_b = 0.0
-    for a, b in zip(vec_a, vec_b):
-        fa = float(a)
-        fb = float(b)
-        dot += fa * fb
-        norm_a += fa * fa
-        norm_b += fb * fb
-    if norm_a <= 0.0 or norm_b <= 0.0:
-        return None
-    denom = math.sqrt(norm_a) * math.sqrt(norm_b)
-    if denom == 0:
-        return None
-    return dot / denom
 
 
 def _okved_item_code(obj: Any) -> str:
@@ -1024,7 +1002,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                         okved_vectors_cache[code] = vector
             if okved_vectors_cache:
                 for code, vector in okved_vectors_cache.items():
-                    raw_score = _cosine_similarity(description_vector, vector)
+                    raw_score = cosine_similarity(description_vector, vector)
                     if raw_score is None:
                         continue
                     okved_scores_raw.append(raw_score)
