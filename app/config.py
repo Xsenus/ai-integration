@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     IB_EQUIPMENT_NAME_COLUMN: str = "equipment_name"
     IB_EQUIPMENT_VECTOR_COLUMN: str = "equipment_vector"
 
+    IB_PRODCLASS_TABLE: str = "ib_prodclass"
+    IB_PRODCLASS_ID_COLUMN: str = "id"
+    IB_PRODCLASS_NAME_COLUMN: str = "prodclass_name"
+    IB_PRODCLASS_VECTOR_COLUMN: str = "prodclass_vector"
+
     # === External analyze service (используется в /v1/analyze-json) ===
     # Можно указать любой из этих ключей в .env; приоритет у AI_ANALYZE_BASE/AI_ANALYZE_TIMEOUT
     AI_ANALYZE_BASE: Optional[str] = None     # напр.: http://37.221.125.221:8123
