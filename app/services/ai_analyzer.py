@@ -191,7 +191,8 @@ def _format_with_id(name: Optional[str], identifier: Any) -> Optional[str]:
     ident_str = str(identifier).strip()
     if not ident_str:
         return clean_name
-    return f"{clean_name} [{ident_str}]" if clean_name else f"[{ident_str}]"
+    bracketed = f"[{ident_str}]"
+    return f"{bracketed} {clean_name}".strip() if clean_name else bracketed
 
 
 def _format_with_code(name: Optional[str], code: Any) -> Optional[str]:
@@ -199,7 +200,7 @@ def _format_with_code(name: Optional[str], code: Any) -> Optional[str]:
     code_str = str(code).strip() if code is not None else ""
     if code_str:
         bracketed = f"[{code_str}]"
-        return f"{clean_name} {bracketed}".strip() if clean_name else bracketed
+        return f"{bracketed} {clean_name}".strip() if clean_name else bracketed
     return clean_name
 
 

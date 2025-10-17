@@ -222,12 +222,10 @@ def _ai_analyzer_response_from_payload(
     company = CompanyBlock(
         domain1=
         data.get("domain1")
-        or data.get("domain1_description")
-        or data.get("domain1_site"),
+        or data.get("domain1_description"),
         domain2=
         data.get("domain2")
-        or data.get("domain2_description")
-        or data.get("domain2_site"),
+        or data.get("domain2_description"),
     )
 
     products = [
