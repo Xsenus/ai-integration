@@ -112,7 +112,7 @@ def _resolve_effective_url(requested_url: str, response: httpx.Response) -> str:
 async def fetch_home_via_scraperapi(
     domain_or_url: str,
     *,
-    retries: int = 3,
+    retries: int = 2,
     max_redirects: int | None = None,
 ) -> tuple[str, str]:
     if not settings.SCRAPERAPI_KEY:
