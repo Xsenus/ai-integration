@@ -44,9 +44,9 @@ from app.services.parse_site import (
     schedule_parse_site_background,
     run_parse_site,
 )
+from app.schemas.equipment_selection import EquipmentSelectionResponse
 from app.services.equipment_selection import (
     EquipmentSelectionNotFound,
-    EquipmentSelectionResult,
     compute_equipment_selection,
     resolve_client_request_id,
 )
@@ -55,6 +55,9 @@ log = logging.getLogger("api.routes")
 router = APIRouter(prefix="/v1")
 ib_match_router = APIRouter(prefix="/ib-match", tags=["IB Matching"])
 parse_site_router = APIRouter(prefix="/parse-site", tags=["Parse Site"])
+equipment_selection_router = APIRouter(
+    prefix="/equipment-selection", tags=["Equipment Selection"]
+)
 
 
 # =========================
@@ -649,9 +652,9 @@ async def parse_site_by_inn(
 router.include_router(parse_site_router)
 
 
-@router.get(
-    "/equipment-selection",
-    response_model=EquipmentSelectionResult,
+@equipment_selection_router.get(
+    "",
+    response_model=EquipmentSelectionResponse,
     summary="Расчёт оборудования по clients_requests.id",
 )
 async def get_equipment_selection(
@@ -685,9 +688,9 @@ async def get_equipment_selection(
     return result
 
 
-@router.get(
-    "/equipment-selection/by-inn/{inn}",
-    response_model=EquipmentSelectionResult,
+@equipment_selection_router.get(
+    "/by-inn/{inn}",
+    response_model=EquipmentSelectionResponse,
     summary="Расчёт оборудования по последней записи клиента с указанным ИНН",
 )
 async def get_equipment_selection_by_inn(
@@ -725,3 +728,6 @@ async def get_equipment_selection_by_inn(
         result.model_dump(),
     )
     return result
+
+
+router.include_router(equipment_selection_router)
