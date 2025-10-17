@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,6 +20,7 @@ class EquipmentSelectionNotFound(Exception):
 
 
 _FOUR_DECIMALS = Decimal("0.0001")
+_PREVIEW_ROW_LIMIT = 15
 
 
 def _to_decimal(value: object, default: Decimal = Decimal(0)) -> Decimal:
@@ -40,6 +41,95 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
+
+def _format_preview_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, Decimal):
+        quantized = _quantize(value)
+        text = format(quantized.normalize(), "f")
+        return text.rstrip("0").rstrip(".") or "0"
+    if isinstance(value, float):
+        text = f"{value:.4f}"
+        return text.rstrip("0").rstrip(".") or "0"
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    return str(value)
+
+
+def _is_numeric_column(values: Sequence[Any]) -> bool:
+    for value in values:
+        if value in (None, ""):
+            continue
+        if isinstance(value, (int, float, Decimal)):
+            continue
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                continue
+            try:
+                Decimal(candidate)
+            except Exception:
+                return False
+            else:
+                continue
+        return False
+    return True
+
+
+def _align_text(text: str, width: int, align_right: bool) -> str:
+    if align_right:
+        return text.rjust(width)
+    return text.ljust(width)
+
+
+def _render_table_preview(title: str, columns: Sequence[str], raw_rows: Sequence[Sequence[Any]]) -> str:
+    lines: List[str] = [f"=== {title} ==="]
+    if not raw_rows:
+        lines.append("Пусто.")
+        return "\n".join(lines)
+
+    display_rows = [list(row) for row in raw_rows[:_PREVIEW_ROW_LIMIT]]
+    formatted: List[List[str]] = []
+    for row in display_rows:
+        formatted.append([_format_preview_value(value) for value in row])
+
+    columns_list = list(columns)
+    widths: List[int] = []
+    align_right_flags: List[bool] = []
+
+    for idx, column in enumerate(columns_list):
+        col_entries = [row[idx] for row in formatted]
+        width = max([len(column)] + [len(entry) for entry in col_entries]) if col_entries else len(column)
+        widths.append(width)
+        align_right_flags.append(_is_numeric_column([row[idx] for row in display_rows]))
+
+    header = "| " + " | ".join(
+        _align_text(columns_list[idx], widths[idx], False) for idx in range(len(columns_list))
+    ) + " |"
+    separator = "|" + "|".join("-" * (width + 2) for width in widths) + "|"
+
+    lines.append(header)
+    lines.append(separator)
+
+    for row in formatted:
+        line = "| " + " | ".join(
+            _align_text(row[idx], widths[idx], align_right_flags[idx])
+            for idx in range(len(columns_list))
+        ) + " |"
+        lines.append(line)
+
+    if len(raw_rows) > _PREVIEW_ROW_LIMIT:
+        remaining = len(raw_rows) - _PREVIEW_ROW_LIMIT
+        lines.append(f"... ещё {remaining} строк")
+
+    return "\n".join(lines)
+
+
+def _append_step_separator(log_messages: List[str], title: str) -> None:
+    border = "=" * 18
+    log_messages.append(f"{border} {title} {border}")
 
 
 def _row_mapping(row: Any) -> Dict[str, Any]:
@@ -69,6 +159,8 @@ class TableData:
     title: str
     columns: List[str]
     rows: List[List[Any]]
+    raw_rows: List[List[Any]]
+    preview: str
 
 
 @dataclass(slots=True)
@@ -99,6 +191,7 @@ class TableDataModel(BaseModel):
     columns: List[str] = Field(description="Названия колонок в порядке отображения.")
     rows: List[List[Any]] = Field(description="Строки таблицы (значения по колонкам).")
     row_count: int = Field(description="Количество строк в таблице.")
+    preview: str = Field(description="Строковое представление таблицы в стиле примера.")
 
 
 class EquipmentSelectionResult(BaseModel):
@@ -123,6 +216,7 @@ async def compute_equipment_selection(
             columns=table.columns,
             rows=[[ _jsonable(value) for value in row ] for row in table.rows],
             row_count=len(table.rows),
+            preview=table.preview,
         )
         for table in report.tables
     ]
@@ -172,6 +266,7 @@ async def build_equipment_tables(
         client_request_id,
     )
 
+    _append_step_separator(report.log, "Шаг 0 — Клиент")
     client_rows = await _load_client(conn, client_request_id)
     report.client_rows = client_rows
     _add_table(
@@ -193,13 +288,14 @@ async def build_equipment_tables(
         f"Шаг 0: загружена карточка клиента (строк: {len(client_rows)})."
     )
 
+    _append_step_separator(report.log, "Шаг 1 — Данные с сайта")
     goods_types = await _load_goods_types(conn, client_request_id)
     report.goods_types = goods_types
     _add_table(
         report,
         step="1.a",
         table_id="goods_types",
-        title="1.a) Типы продукции (ai_site_goods_types)",
+        title="1.a) Типы продукции (ai_site_goods_types.goods_type)",
         rows=goods_types,
         columns=[
             "id",
@@ -221,7 +317,7 @@ async def build_equipment_tables(
         report,
         step="1.b",
         table_id="site_equipment",
-        title="1.b) Оборудование с сайта (ai_site_equipment)",
+        title="1.b) Оборудование с сайта (ai_site_equipment.equipment)",
         rows=site_equipment,
         columns=[
             "id",
@@ -237,13 +333,14 @@ async def build_equipment_tables(
         f"Шаг 1.b: найдено {len(site_equipment)} элементов оборудования с сайта."
     )
 
+    _append_step_separator(report.log, "Шаг 2 — SCORE_E1 через prodclass")
     prodclass_rows = await _load_prodclass_rows(conn, client_request_id)
     report.prodclass_rows = prodclass_rows
     _add_table(
         report,
         step="2.a",
         table_id="prodclass_rows",
-        title="2.a) Записи ai_site_prodclass",
+        title="2.a) ai_site_prodclass (все записи клиента)",
         rows=prodclass_rows,
         columns=[
             "ai_row_id",
@@ -265,7 +362,7 @@ async def build_equipment_tables(
         report,
         step="2.b",
         table_id="prodclass_agg",
-        title="2.b) Средние prodclass_score (SCORE_1)",
+        title="2.b) Средний prodclass_score (SCORE_1) по каждому prodclass",
         rows=prodclass_agg,
         columns=["prodclass_id", "prodclass_name", "SCORE_1", "votes"],
     )
@@ -324,6 +421,7 @@ async def build_equipment_tables(
         columns=["id", "name", "score", "source"],
     )
 
+    _append_step_separator(report.log, "Шаг 3 — SCORE_E2 через goods_type")
     (
         equipment_2way,
         goods_type_scores,
@@ -337,7 +435,7 @@ async def build_equipment_tables(
         report,
         step="3.a",
         table_id="equipment_2way_goods",
-        title="3.a) Goods_type и CRORE_2",
+        title="3.a) ID_4 = goods_type_ID и CRORE_2 = goods_types_score",
         rows=goods_type_scores,
         columns=["goods_type_id", "CRORE_2"],
     )
@@ -365,6 +463,7 @@ async def build_equipment_tables(
         columns=["id", "name", "score", "source"],
     )
 
+    _append_step_separator(report.log, "Шаг 4 — SCORE_E3 через ai_site_equipment")
     equipment_3way, equipment_3way_details = await _compute_equipment_3way(
         conn, site_equipment, report.log
     )
@@ -375,7 +474,7 @@ async def build_equipment_tables(
         report,
         step="4.a",
         table_id="equipment_3way_details",
-        title="4.a) Источник SCORE_E3",
+        title="4.a) ai_site_equipment (equipment_ID, equipment_score, SCORE_E3)",
         rows=equipment_3way_details,
         columns=["equipment_id", "equipment_score", "SCORE_E3"],
     )
@@ -388,6 +487,7 @@ async def build_equipment_tables(
         columns=["id", "name", "score", "source"],
     )
 
+    _append_step_separator(report.log, "Шаг 5 — Сборка EQUIPMENT_ALL")
     equipment_all, equipment_all_sources = _merge_equipment_tables(
         equipment_1way, equipment_2way, equipment_3way, report.log
     )
@@ -411,11 +511,36 @@ async def build_equipment_tables(
         columns=["id", "name", "score", "source"],
     )
 
-    await _sync_equipment_table(conn, "EQUIPMENT_1way", equipment_1way, report.log)
-    await _sync_equipment_table(conn, "EQUIPMENT_2way", equipment_2way, report.log)
-    await _sync_equipment_table(conn, "EQUIPMENT_3way", equipment_3way, report.log)
-    await _sync_equipment_table(conn, "EQUIPMENT_ALL", equipment_all, report.log)
+    await _sync_equipment_table(
+        conn,
+        "EQUIPMENT_1way",
+        equipment_1way,
+        client_request_id,
+        report.log,
+    )
+    await _sync_equipment_table(
+        conn,
+        "EQUIPMENT_2way",
+        equipment_2way,
+        client_request_id,
+        report.log,
+    )
+    await _sync_equipment_table(
+        conn,
+        "EQUIPMENT_3way",
+        equipment_3way,
+        client_request_id,
+        report.log,
+    )
+    await _sync_equipment_table(
+        conn,
+        "EQUIPMENT_ALL",
+        equipment_all,
+        client_request_id,
+        report.log,
+    )
 
+    _append_step_separator(report.log, "Итоговый отчёт")
     report.log.append(
         "Расчёт оборудования завершён. Обновлены таблицы EQUIPMENT_* в базе данных."
     )
@@ -929,71 +1054,110 @@ async def _sync_equipment_table(
     conn: AsyncConnection,
     table_name: str,
     rows: Sequence[EquipmentScore],
+    client_request_id: int,
     log_messages: List[str],
 ) -> None:
-    if not rows:
-        log_messages.append(
-            f"{table_name}: данных нет — существующие записи оставлены без изменений."
-        )
-        return
-
     await conn.execute(
         text(
             f"""
             CREATE TABLE IF NOT EXISTS "{table_name}"(
                 id BIGINT PRIMARY KEY,
+                company_id BIGINT,
                 equipment_name TEXT,
-                score NUMERIC(8,4)
+                score NUMERIC(8,4),
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ
             )
             """
         )
     )
 
-    # На исторических базах таблицы могли быть без поля equipment_name или без первичного ключа.
+    await conn.execute(
+        text(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS company_id BIGINT')
+    )
     await conn.execute(
         text(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS equipment_name TEXT')
     )
     await conn.execute(
         text(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS score NUMERIC(8,4)')
     )
-
-    # Собираем текущие значения, чтобы обновлять только изменившиеся записи.
-    result = await conn.execute(
-        text(f'SELECT id, equipment_name, score FROM "{table_name}"')
+    await conn.execute(
+        text(
+            f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ'
+        )
     )
-    existing_map = {
-        int(row["id"]): (row.get("equipment_name"), _quantize(_to_decimal(row.get("score"))))
-        for row in result.mappings()
-    }
+    await conn.execute(
+        text(
+            f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ'
+        )
+    )
 
-    # На всякий случай устраняем дубликаты по id, сохраняя порядок первых появлений.
+    if not rows:
+        log_messages.append(
+            f"{table_name}: данных нет — существующие записи оставлены без изменений."
+        )
+        return
+
+    result = await conn.execute(
+        text(
+            f"""
+            SELECT id, company_id, equipment_name, score, created_at, updated_at
+            FROM "{table_name}"
+            """
+        )
+    )
+    existing_map: Dict[int, Dict[str, Any]] = {}
+    for record in result.mappings():
+        existing_map[int(record["id"])] = {
+            "company_id": record.get("company_id"),
+            "equipment_name": record.get("equipment_name"),
+            "score": _quantize(_to_decimal(record.get("score"))),
+            "created_at": record.get("created_at"),
+            "updated_at": record.get("updated_at"),
+        }
+
     unique_rows: Dict[int, EquipmentScore] = {}
     for item in rows:
         if item.id not in unique_rows:
             unique_rows[item.id] = item
     deduped_rows = list(unique_rows.values())
 
+    now = datetime.now(timezone.utc)
     updates: List[Dict[str, Any]] = []
     inserts: List[Dict[str, Any]] = []
 
     for row in deduped_rows:
         new_score = _quantize(_to_decimal(row.score))
-        payload = {"id": row.id, "equipment_name": row.name, "score": new_score}
+        payload = {
+            "id": row.id,
+            "company_id": client_request_id,
+            "equipment_name": row.name,
+            "score": new_score,
+            "created_at": now,
+            "updated_at": now,
+        }
         current = existing_map.get(row.id)
         if current is None:
             inserts.append(payload)
             continue
 
-        current_name, current_score = current
-        if current_name != row.name or current_score != new_score:
+        needs_update = (
+            current.get("equipment_name") != row.name
+            or current.get("score") != new_score
+            or current.get("company_id") != client_request_id
+            or current.get("created_at") is None
+        )
+
+        if needs_update or current.get("updated_at") is None:
+            payload["created_at"] = current.get("created_at") or now
             updates.append(payload)
 
     if inserts:
         await conn.execute(
             text(
                 f"""
-                INSERT INTO "{table_name}"(id, equipment_name, score)
-                VALUES (:id, :equipment_name, :score)
+                INSERT INTO "{table_name}"(id, company_id, equipment_name, score, created_at, updated_at)
+                VALUES (:id, :company_id, :equipment_name, :score, :created_at, :updated_at)
                 """
             ),
             inserts,
@@ -1004,8 +1168,11 @@ async def _sync_equipment_table(
             text(
                 f"""
                 UPDATE "{table_name}"
-                SET equipment_name = :equipment_name,
-                    score = :score
+                SET company_id = :company_id,
+                    equipment_name = :equipment_name,
+                    score = :score,
+                    created_at = COALESCE(created_at, :created_at),
+                    updated_at = :updated_at
                 WHERE id = :id
                 """
             ),
@@ -1031,9 +1198,13 @@ def _add_table(
     columns: Sequence[str],
 ) -> None:
     formatted_rows: List[List[Any]] = []
+    raw_rows: List[List[Any]] = []
     for row in rows:
         mapping = _row_mapping(row)
-        formatted_rows.append([_jsonable(mapping.get(col)) for col in columns])
+        raw_row = [mapping.get(col) for col in columns]
+        raw_rows.append(raw_row)
+        formatted_rows.append([_jsonable(value) for value in raw_row])
+    preview = _render_table_preview(title, columns, raw_rows)
     report.tables.append(
         TableData(
             step=step,
@@ -1041,6 +1212,8 @@ def _add_table(
             title=title,
             columns=list(columns),
             rows=formatted_rows,
+            raw_rows=raw_rows,
+            preview=preview,
         )
     )
 

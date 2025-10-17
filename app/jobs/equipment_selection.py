@@ -74,6 +74,11 @@ def main() -> None:
 
     tables = payload.get("tables", [])
     for table in tables:
+        preview = table.get("preview")
+        if preview:
+            print(f"\n{preview}")
+            continue
+
         print(f"\n=== {table['title']} (шаг {table['step']}) ===")
         rows = table.get("rows", [])
         columns = table.get("columns", [])
