@@ -38,7 +38,11 @@ from app.models.bitrix import DaDataResult
 from app.repo.bitrix_repo import replace_dadata_raw, upsert_company_summary
 from app.services.dadata_client import find_party_by_inn
 from app.services.mapping import map_summary_from_dadata
-from app.services.analyze_client import fetch_embedding, fetch_site_description
+from app.services.analyze_client import (
+    AnalyzeServiceUnavailable,
+    fetch_embedding,
+    fetch_site_description,
+)
 from app.services.scrape import FetchError, fetch_and_chunk, to_home_url
 from app.services.vector_similarity import cosine_similarity
 
@@ -458,11 +462,16 @@ async def _generate_site_description(
             embed_model=settings.embed_model,
             label=label,
         )
+    except AnalyzeServiceUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001
         log.warning("parse-site: не удалось получить описание (%s): %s", label, exc)
         return None, None
     if description and not vector:
-        vector = await _embed_text(description, label=f"site-desc:{inn}:{domain}")
+        try:
+            vector = await _embed_text(description, label=f"site-desc:{inn}:{domain}")
+        except AnalyzeServiceUnavailable:
+            raise
     return description, vector
 
 
@@ -472,6 +481,8 @@ async def _embed_text(text: str, *, label: str) -> Optional[list[float]]:
 
     try:
         vector = await fetch_embedding(text, label=label)
+    except AnalyzeServiceUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001
         log.warning("parse-site: не удалось получить embedding (%s): %s", label, exc)
         return None
@@ -1081,22 +1092,35 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             description_status = "Не удалось выделить текст сайта"
             result_notes.append("Не удалось выделить текст сайта")
         else:
-            description, description_vector = await _generate_site_description(
-                full_text,
-                domain=domain_for_pars or normalized_domain,
-                inn=inn,
-            )
-            if description and description_vector:
-                description_status = "Описание и вектор получены"
-            elif description:
-                description_status = "Описание получено без вектора"
-                result_notes.append("Вектор описания не получен")
-            elif description_vector:
-                description_status = "Вектор получен без описания"
-                result_notes.append("Описание не получено, но embedding сформирован")
+            try:
+                description, description_vector = await _generate_site_description(
+                    full_text,
+                    domain=domain_for_pars or normalized_domain,
+                    inn=inn,
+                )
+            except AnalyzeServiceUnavailable as exc:
+                log.warning(
+                    "parse-site: analyze service unavailable for %s (%s): %s",
+                    domain_for_pars or normalized_domain,
+                    inn,
+                    exc,
+                )
+                description = None
+                description_vector = None
+                description_status = "Нет доступа к сервису"
+                result_notes.append("Нет доступа к сервису")
             else:
-                description_status = "Описание не получено"
-                result_notes.append("Описание не получено")
+                if description and description_vector:
+                    description_status = "Описание и вектор получены"
+                elif description:
+                    description_status = "Описание получено без вектора"
+                    result_notes.append("Вектор описания не получен")
+                elif description_vector:
+                    description_status = "Вектор получен без описания"
+                    result_notes.append("Описание не получено, но embedding сформирован")
+                else:
+                    description_status = "Описание не получено"
+                    result_notes.append("Описание не получено")
 
         if description_status is None:
             description_status = "Описание не формировалось"

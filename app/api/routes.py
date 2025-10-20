@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.bitrix import get_bitrix_session
 from app.db.postgres import get_postgres_engine
 from app.schemas.equipment_selection import EquipmentSelectionResponse
 from app.schemas.ib_match import IbMatchInnRequest, IbMatchRequest, IbMatchResponse
+from app.services.analyze_health import probe_analyze_service
 from app.services.equipment_selection import (
     EquipmentSelectionNotFound,
     compute_equipment_selection,
@@ -28,6 +30,20 @@ parse_site_router = APIRouter(prefix="/parse-site", tags=["Parse Site"])
 equipment_selection_router = APIRouter(
     prefix="/equipment-selection", tags=["Equipment Selection"]
 )
+
+
+@router.get(
+    "/analyze/health",
+    summary="Проверка доступности внешнего сервиса анализа",
+)
+async def analyze_health_probe() -> JSONResponse:
+    result = await probe_analyze_service(label="GET /v1/analyze/health")
+    status_code = (
+        status.HTTP_200_OK if result.get("ok") else status.HTTP_503_SERVICE_UNAVAILABLE
+    )
+    if not result.get("detail"):
+        result["detail"] = None
+    return JSONResponse(status_code=status_code, content=result)
 
 
 async def _assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> IbMatchResponse:

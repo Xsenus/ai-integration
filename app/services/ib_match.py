@@ -10,6 +10,10 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.db.postgres import get_postgres_engine
+from app.services.analyze_client import (
+    AnalyzeServiceUnavailable,
+    ensure_service_available,
+)
 from app.services.vector_similarity import cosine_similarity
 
 log = logging.getLogger("services.ib_match")
@@ -620,6 +624,11 @@ async def _embed_texts(texts: Sequence[str]) -> List[List[float]]:
     base = settings.analyze_base or _DEFAULT_EMBED_BASE
     if not base:
         raise IbMatchServiceError("Embedding service base URL is not configured", status_code=503)
+    try:
+        await ensure_service_available(base, label="ib-match:embedding")
+    except AnalyzeServiceUnavailable as exc:
+        log.warning("ib-match: analyze service unavailable: %s", exc)
+        raise IbMatchServiceError(str(exc), status_code=503) from exc
     url = base.rstrip("/") + _EMBED_ENDPOINT
     timeout = settings.analyze_timeout
     result: List[List[float]] = []

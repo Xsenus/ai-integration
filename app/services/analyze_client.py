@@ -8,52 +8,17 @@ from typing import Any, Optional
 import httpx
 
 from app.config import settings
+from app.services.analyze_health import (
+    AnalyzeServiceUnavailable,
+    ensure_service_available,
+    get_analyze_http_client,
+    normalize_analyze_base,
+)
 
 log = logging.getLogger("services.analyze_client")
 
 _MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 0.5
-
-_client_pool: dict[str, httpx.AsyncClient] = {}
-_client_lock = asyncio.Lock()
-
-def _normalize_base(url: Optional[str]) -> Optional[str]:
-    if not url:
-        return None
-    base = url.strip()
-    if not base:
-        return None
-    if not base.startswith(("http://", "https://")):
-        base = "http://" + base
-    return base.rstrip("/")
-
-
-def _build_timeout() -> httpx.Timeout:
-    timeout_s = max(1, int(settings.analyze_timeout or 30))
-    connect = min(float(timeout_s), 10.0)
-    write = min(float(timeout_s), 10.0)
-    read = float(timeout_s)
-    return httpx.Timeout(timeout_s, connect=connect, read=read, write=write)
-
-
-async def _get_client(base_url: str) -> httpx.AsyncClient:
-    normalized = _normalize_base(base_url)
-    if not normalized:
-        raise ValueError("Empty base URL")
-
-    async with _client_lock:
-        client = _client_pool.get(normalized)
-        if client is not None:
-            return client
-
-        transport = httpx.AsyncHTTPTransport(retries=2)
-        client = httpx.AsyncClient(
-            base_url=normalized,
-            timeout=_build_timeout(),
-            transport=transport,
-        )
-        _client_pool[normalized] = client
-        return client
 
 
 def _coerce_vector(value: Any) -> Optional[list[float]]:
@@ -77,6 +42,8 @@ def _coerce_vector(value: Any) -> Optional[list[float]]:
         except (TypeError, ValueError):
             continue
     return result or None
+
+
 async def _post_with_retries(
     base_url: str,
     path: str,
@@ -85,7 +52,7 @@ async def _post_with_retries(
     label: str,
 ) -> httpx.Response | None:
     try:
-        client = await _get_client(base_url)
+        client = await get_analyze_http_client(base_url)
     except Exception as exc:  # noqa: BLE001
         log.warning("analyze-client: не удалось создать HTTP-клиент (%s): %s", label, exc)
         return None
@@ -140,10 +107,12 @@ async def fetch_site_description(
     if chat_model:
         payload["chat_model"] = chat_model
 
-    base_url = _normalize_base(settings.analyze_base)
+    base_url = normalize_analyze_base(settings.analyze_base)
     if not base_url:
         log.warning("analyze-client: ANALYZE_BASE не настроен (%s)", label)
         return None, None
+
+    await ensure_service_available(base_url, label=f"health:{label}")
 
     response = await _post_with_retries(base_url, "/v1/site-profile", payload, label=label)
     if response is None:
@@ -187,10 +156,12 @@ async def fetch_site_description(
 
 async def fetch_embedding(text: str, *, label: str) -> Optional[list[float]]:
     payload = {"q": text}
-    base_url = _normalize_base(settings.analyze_base)
+    base_url = normalize_analyze_base(settings.analyze_base)
     if not base_url:
         log.warning("analyze-client: ANALYZE_BASE не настроен (%s)", label)
         return None
+
+    await ensure_service_available(base_url, label=f"health:{label}")
 
     response = await _post_with_retries(base_url, "/ai-search", payload, label=label)
     if response is None:
@@ -226,6 +197,8 @@ async def fetch_embedding(text: str, *, label: str) -> Optional[list[float]]:
 
 
 __all__ = [
+    "AnalyzeServiceUnavailable",
+    "ensure_service_available",
     "fetch_site_description",
     "fetch_embedding",
 ]
