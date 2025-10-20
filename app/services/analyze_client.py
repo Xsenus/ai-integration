@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from http import HTTPStatus
 from typing import Any, Mapping, Optional
 
 import httpx
@@ -20,6 +21,14 @@ _RETRY_BASE_DELAY = 0.5
 
 _client_pool: dict[str, httpx.AsyncClient] = {}
 _client_lock = asyncio.Lock()
+
+
+class AnalyzeClientRequestError(RuntimeError):
+    """Ошибка обращения к внешнему сервису анализа."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 def _normalize_base(url: Optional[str]) -> Optional[str]:
     if not url:
@@ -249,10 +258,78 @@ async def fetch_embedding(text: str, *, label: str) -> Optional[list[float]]:
     return None
 
 
+async def submit_analyze_request(
+    *,
+    path: str,
+    payload: Mapping[str, Any],
+    label: str,
+) -> tuple[int, dict[str, Any]]:
+    """Вызывает произвольный JSON-эндпоинт внешнего анализатора."""
+
+    base_url = get_analyze_base_url()
+    if not base_url:
+        raise AnalyzeClientRequestError(
+            "ANALYZE_BASE is not configured",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    await ensure_service_available(base_url, label=f"health:{label}")
+
+    payload_dict = {key: value for key, value in payload.items()}
+
+    response = await _post_with_retries(base_url, path, payload_dict, label=label)
+    if response is None:
+        raise AnalyzeClientRequestError(
+            "Failed to reach analyze service",
+            status_code=HTTPStatus.BAD_GATEWAY,
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:  # noqa: BLE001
+        log.warning(
+            "analyze-client: non-JSON response (%s @ %s): %s",
+            label,
+            base_url,
+            response.text,
+        )
+        raise AnalyzeClientRequestError(
+            "Analyze service returned a non-JSON response",
+            status_code=HTTPStatus.BAD_GATEWAY,
+        ) from exc
+
+    status_code = response.status_code
+    if status_code >= 400:
+        log.warning(
+            "analyze-client: %s returned %s (%s)",
+            path,
+            status_code,
+            label,
+        )
+    else:
+        log.info(
+            "analyze-client: %s succeeded (%s, status=%s)",
+            path,
+            label,
+            status_code,
+        )
+
+    if not isinstance(data, dict):
+        log.debug(
+            "analyze-client: unexpected payload type (%s @ %s → %s)",
+            label,
+            path,
+            type(data),
+        )
+    return status_code, data if isinstance(data, dict) else {"value": data}
+
+
 __all__ = [
     "AnalyzeServiceUnavailable",
     "ensure_service_available",
     "get_analyze_base_url",
     "fetch_site_description",
     "fetch_embedding",
+    "AnalyzeClientRequestError",
+    "submit_analyze_request",
 ]

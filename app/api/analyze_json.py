@@ -19,8 +19,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.sqltypes import Text
 
 from app.services.analyze_client import (
+    AnalyzeClientRequestError,
     AnalyzeServiceUnavailable,
     ensure_service_available,
+    submit_analyze_request,
 )
 from app.services.parse_site import ParseSiteRequest, run_parse_site
 from app.config import settings
@@ -33,6 +35,9 @@ from app.schemas.analyze_json import (
     AnalyzeFromInnRequest,
     AnalyzeFromInnResponse,
     AnalyzeFromInnRun,
+    PromptGenerationResponse,
+    PromptSiteAvailableRequest,
+    PromptSiteUnavailableRequest,
 )
 
 log = logging.getLogger("api.analyze-json")
@@ -121,6 +126,60 @@ def _summarize_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         else:
             summary[key] = value
     return summary
+
+
+async def _forward_prompt_request(
+    *,
+    path: str,
+    payload: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    """Вызывает prompt-эндпоинт внешнего сервиса и обрабатывает ответ."""
+
+    payload_summary = _summarize_external_payload(payload)
+    log.info(
+        "analyze-json: forwarding %s payload → %s",
+        label,
+        payload_summary,
+    )
+
+    try:
+        status_code, data = await submit_analyze_request(
+            path=path,
+            payload=payload,
+            label=f"analyze-json:{label}",
+        )
+    except AnalyzeClientRequestError as exc:
+        log.warning(
+            "analyze-json: failed to reach prompt endpoint %s → %s",
+            label,
+            exc,
+        )
+        raise HTTPException(
+            status_code=exc.status_code or status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+
+    if status_code >= 400:
+        log.warning(
+            "analyze-json: prompt endpoint %s returned %s → %s",
+            label,
+            status_code,
+            data,
+        )
+        detail: Any
+        if isinstance(data, (dict, list)):
+            detail = data
+        else:
+            detail = {"detail": data}
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    log.info(
+        "analyze-json: prompt endpoint %s succeeded (status=%s)",
+        label,
+        status_code,
+    )
+    return data
 
 
 async def _get_table_columns(
@@ -2348,6 +2407,44 @@ async def _run_analyze(
         domains_processed=domains_processed,
         runs=runs,
     )
+
+
+@router.post(
+    "/prompts/site-available",
+    response_model=PromptGenerationResponse,
+    summary="Генерация промпта для компаний с сайтом",
+)
+async def build_prompt_site_available(
+    payload: PromptSiteAvailableRequest,
+) -> PromptGenerationResponse:
+    """Формирует промпт и вызывает OpenAI для компаний с доступным сайтом."""
+
+    payload_data = payload.model_dump(exclude_none=True)
+    response_data = await _forward_prompt_request(
+        path="/v1/prompts/site-available",
+        payload=payload_data,
+        label="prompts.site-available",
+    )
+    return PromptGenerationResponse.model_validate(response_data)
+
+
+@router.post(
+    "/prompts/site-unavailable",
+    response_model=PromptGenerationResponse,
+    summary="Генерация промпта для компаний без сайта",
+)
+async def build_prompt_site_unavailable(
+    payload: PromptSiteUnavailableRequest,
+) -> PromptGenerationResponse:
+    """Формирует промпт и вызывает OpenAI для компаний без сайта."""
+
+    payload_data = payload.model_dump(exclude_none=True)
+    response_data = await _forward_prompt_request(
+        path="/v1/prompts/site-unavailable",
+        payload=payload_data,
+        label="prompts.site-unavailable",
+    )
+    return PromptGenerationResponse.model_validate(response_data)
 
 
 @router.post(
