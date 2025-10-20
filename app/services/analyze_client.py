@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import httpx
 
 from app.config import settings
+from app.services.analyze_health import (
+    AnalyzeServiceUnavailable,
+    ensure_analyze_service_available,
+)
 
 log = logging.getLogger("services.analyze_client")
 
@@ -26,6 +30,12 @@ def _normalize_base(url: Optional[str]) -> Optional[str]:
     if not base.startswith(("http://", "https://")):
         base = "http://" + base
     return base.rstrip("/")
+
+
+def get_analyze_base_url() -> Optional[str]:
+    """Возвращает нормализованный базовый URL внешнего сервиса анализа."""
+
+    return _normalize_base(settings.analyze_base)
 
 
 def _build_timeout() -> httpx.Timeout:
@@ -77,6 +87,16 @@ def _coerce_vector(value: Any) -> Optional[list[float]]:
         except (TypeError, ValueError):
             continue
     return result or None
+async def ensure_service_available(base_url: str, *, label: str) -> None:
+    """Проверяет доступность внешнего сервиса анализа."""
+
+    await ensure_analyze_service_available(
+        base_url,
+        label=label,
+        client_factory=_get_client,
+    )
+
+
 async def _post_with_retries(
     base_url: str,
     path: str,
@@ -140,10 +160,12 @@ async def fetch_site_description(
     if chat_model:
         payload["chat_model"] = chat_model
 
-    base_url = _normalize_base(settings.analyze_base)
+    base_url = get_analyze_base_url()
     if not base_url:
         log.warning("analyze-client: ANALYZE_BASE не настроен (%s)", label)
         return None, None
+
+    await ensure_service_available(base_url, label=f"health:{label}")
 
     response = await _post_with_retries(base_url, "/v1/site-profile", payload, label=label)
     if response is None:
@@ -187,10 +209,12 @@ async def fetch_site_description(
 
 async def fetch_embedding(text: str, *, label: str) -> Optional[list[float]]:
     payload = {"q": text}
-    base_url = _normalize_base(settings.analyze_base)
+    base_url = get_analyze_base_url()
     if not base_url:
         log.warning("analyze-client: ANALYZE_BASE не настроен (%s)", label)
         return None
+
+    await ensure_service_available(base_url, label=f"health:{label}")
 
     response = await _post_with_retries(base_url, "/ai-search", payload, label=label)
     if response is None:
@@ -226,6 +250,9 @@ async def fetch_embedding(text: str, *, label: str) -> Optional[list[float]]:
 
 
 __all__ = [
+    "AnalyzeServiceUnavailable",
+    "ensure_service_available",
+    "get_analyze_base_url",
     "fetch_site_description",
     "fetch_embedding",
 ]

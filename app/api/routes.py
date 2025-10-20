@@ -9,6 +9,11 @@ from app.db.bitrix import get_bitrix_session
 from app.db.postgres import get_postgres_engine
 from app.schemas.equipment_selection import EquipmentSelectionResponse
 from app.schemas.ib_match import IbMatchInnRequest, IbMatchRequest, IbMatchResponse
+from app.services.analyze_client import (
+    AnalyzeServiceUnavailable,
+    ensure_service_available,
+    get_analyze_base_url,
+)
 from app.services.equipment_selection import (
     EquipmentSelectionNotFound,
     compute_equipment_selection,
@@ -25,6 +30,7 @@ log = logging.getLogger("api.routes")
 router = APIRouter(prefix="/v1")
 ib_match_router = APIRouter(prefix="/ib-match", tags=["IB Matching"])
 parse_site_router = APIRouter(prefix="/parse-site", tags=["Parse Site"])
+analyze_service_router = APIRouter(prefix="/analyze-service", tags=["Analyze Service"])
 equipment_selection_router = APIRouter(
     prefix="/equipment-selection", tags=["Equipment Selection"]
 )
@@ -127,6 +133,26 @@ async def ib_match_by_inn_get(
 
 
 router.include_router(ib_match_router)
+
+
+@analyze_service_router.get("/health")
+async def analyze_service_healthcheck() -> dict[str, object]:
+    """Проверяет доступность внешнего сервиса анализа."""
+
+    base_url = get_analyze_base_url()
+    if not base_url:
+        log.warning("analyze-service: ANALYZE_BASE is not configured")
+        raise HTTPException(status_code=503, detail="ANALYZE_BASE is not configured")
+
+    try:
+        await ensure_service_available(base_url, label="api.analyze-service.health")
+    except AnalyzeServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return {"ok": True, "base_url": base_url}
+
+
+router.include_router(analyze_service_router)
 
 
 @parse_site_router.post(
