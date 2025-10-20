@@ -10,6 +10,11 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.db.postgres import get_postgres_engine
+from app.services.analyze_client import (
+    AnalyzeServiceUnavailable,
+    ensure_service_available,
+)
+from app.services.analyze_health import ensure_analyze_client_health
 from app.services.vector_similarity import cosine_similarity
 
 log = logging.getLogger("services.ib_match")
@@ -620,14 +625,28 @@ async def _embed_texts(texts: Sequence[str]) -> List[List[float]]:
     base = settings.analyze_base or _DEFAULT_EMBED_BASE
     if not base:
         raise IbMatchServiceError("Embedding service base URL is not configured", status_code=503)
-    url = base.rstrip("/") + _EMBED_ENDPOINT
+    try:
+        await ensure_service_available(base, label="ib-match:embedding")
+    except AnalyzeServiceUnavailable as exc:
+        log.warning("ib-match: analyze service unavailable: %s", exc)
+        raise IbMatchServiceError(str(exc), status_code=503) from exc
+    normalized_base = base.rstrip("/")
     timeout = settings.analyze_timeout
     result: List[List[float]] = []
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for text in texts:
+    async with httpx.AsyncClient(base_url=normalized_base, timeout=timeout) as client:
+        for index, text in enumerate(texts, start=1):
+            try:
+                await ensure_analyze_client_health(
+                    client,
+                    label=f"ib-match:embedding:{index}",
+                    target=normalized_base,
+                )
+            except AnalyzeServiceUnavailable as exc:
+                log.warning("ib-match: analyze service unavailable: %s", exc)
+                raise IbMatchServiceError(str(exc), status_code=503) from exc
             payload = {"q": text}
             try:
-                response = await client.post(url, json=payload)
+                response = await client.post(_EMBED_ENDPOINT, json=payload)
             except httpx.HTTPError as exc:  # noqa: BLE001
                 log.warning("ib-match: embedding request failed: %s", exc)
                 raise IbMatchServiceError(

@@ -18,6 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.sqltypes import Text
 
+from app.services.analyze_client import (
+    AnalyzeServiceUnavailable,
+    ensure_service_available,
+)
 from app.services.parse_site import ParseSiteRequest, run_parse_site
 from app.config import settings
 from app.db.bitrix import bitrix_session
@@ -1900,6 +1904,17 @@ async def _run_analyze(
             inn=inn,
             detail="ANALYZE_BASE is not configured",
             request_context=payload_data,
+        )
+
+    try:
+        await ensure_service_available(base_url, label=f"analyze-json:{inn}")
+    except AnalyzeServiceUnavailable as exc:
+        _log_and_raise(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            inn=inn,
+            detail=str(exc),
+            request_context=payload_data,
+            level=logging.WARNING,
         )
 
     if payload.refresh_site:
