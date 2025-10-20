@@ -3,7 +3,77 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class PromptSiteAvailableRequest(BaseModel):
+    """Запрос на генерацию промпта для компании с доступным сайтом."""
+
+    text_par: str = Field(..., description="Текст, собранный с сайта компании")
+    company_name: str = Field(..., description="Название компании")
+    okved: str = Field(..., description="Код ОКВЭД компании")
+    chat_model: Optional[str] = Field(
+        None,
+        description="Переопределение модели OpenAI для генерации ответа",
+    )
+    embed_model: Optional[str] = Field(
+        None,
+        description="Переопределение модели эмбеддингов",
+    )
+
+
+class PromptSiteUnavailableRequest(BaseModel):
+    """Запрос на генерацию промпта для компании без доступного сайта."""
+
+    okved: str = Field(..., description="Код ОКВЭД компании")
+    chat_model: Optional[str] = Field(
+        None,
+        description="Переопределение модели OpenAI",
+    )
+
+
+class PromptGenerationEvent(BaseModel):
+    """Этап обработки при генерации промпта."""
+
+    step: str = Field(..., description="Идентификатор этапа")
+    status: str = Field(..., description="Статус выполнения этапа")
+    detail: Optional[str] = Field(None, description="Дополнительная информация")
+    duration_ms: Optional[int] = Field(None, description="Длительность этапа в мс")
+
+
+class PromptGenerationTimings(BaseModel):
+    """Сводные длительности этапов генерации промпта."""
+
+    build_prompt_ms: Optional[int] = Field(None, description="Длительность подготовки промпта")
+    openai_ms: Optional[int] = Field(None, description="Длительность вызова OpenAI")
+    parse_ms: Optional[int] = Field(None, description="Длительность постобработки ответа")
+
+
+class PromptGenerationResponse(BaseModel):
+    """Ответ эндпоинтов генерации промптов."""
+
+    model_config = ConfigDict(extra="allow")
+
+    success: bool = Field(..., description="Признак успешного завершения операции")
+    prompt: Optional[str] = Field(None, description="Построенный промпт")
+    prompt_len: Optional[int] = Field(None, description="Длина промпта в символах")
+    answer: Optional[str] = Field(None, description="Ответ модели OpenAI")
+    answer_len: Optional[int] = Field(None, description="Длина ответа в символах")
+    parsed: Optional[dict[str, Any]] = Field(None, description="Результат постобработки ответа")
+    started_at: Optional[datetime] = Field(None, description="Время начала обработки")
+    finished_at: Optional[datetime] = Field(None, description="Время окончания обработки")
+    duration_ms: Optional[int] = Field(None, description="Общая длительность обработки")
+    events: list[PromptGenerationEvent] = Field(
+        default_factory=list,
+        description="Хронологический список этапов обработки",
+    )
+    timings: Optional[PromptGenerationTimings] = Field(
+        None,
+        description="Сводные длительности этапов",
+    )
+    chat_model: Optional[str] = Field(None, description="Использованная модель OpenAI")
+    embed_model: Optional[str] = Field(None, description="Использованная модель эмбеддингов")
+    error: Optional[str] = Field(None, description="Сообщение об ошибке")
 
 
 class AnalyzeFromInnRequest(BaseModel):
