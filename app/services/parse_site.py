@@ -4,10 +4,11 @@ import asyncio
 import itertools
 import json
 import logging
-import math
 import re
+import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from datetime import datetime, timezone
+from typing import Any, Iterable, Mapping, Optional, Sequence, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -39,6 +40,7 @@ from app.services.dadata_client import find_party_by_inn
 from app.services.mapping import map_summary_from_dadata
 from app.services.analyze_client import fetch_embedding, fetch_site_description
 from app.services.scrape import FetchError, fetch_and_chunk, to_home_url
+from app.services.vector_similarity import cosine_similarity
 
 log = logging.getLogger("services.parse_site")
 
@@ -119,6 +121,11 @@ class ParseSiteRequest(BaseModel):
     )
 
 
+class OkvedScoreItem(BaseModel):
+    code: str
+    score: float
+
+
 class ParsedSiteResult(BaseModel):
     requested_domain: str
     used_domain: str | None
@@ -129,6 +136,11 @@ class ParsedSiteResult(BaseModel):
     description: str | None = None
     has_description_vector: bool = False
     okved_score: float | None = None
+    okved_score_avg: float | None = None
+    okved_scores: list[OkvedScoreItem] = Field(default_factory=list)
+    description_status: str | None = None
+    notes: list[str] = Field(default_factory=list)
+    processing_ms: int | None = None
 
 
 class OkvedAlert(BaseModel):
@@ -137,6 +149,12 @@ class OkvedAlert(BaseModel):
 
 
 class ParseSiteResponse(BaseModel):
+    status: Literal["success", "partial_success"]
+    message: str
+    started_at: datetime
+    finished_at: datetime
+    duration_seconds: float
+    duration_ms: int
     company_id: int
     domain_1: str | None
     domain_2: str | None
@@ -144,6 +162,9 @@ class ParseSiteResponse(BaseModel):
     planned_domains: list[str]
     successful_domains: list[str]
     chunks_inserted: int
+    domains_attempted: int
+    domains_succeeded: int
+    failed_domains: list[str] = Field(default_factory=list)
     results: list[ParsedSiteResult]
     okved_text: str | None = None
     okved_alerts: list[OkvedAlert] = Field(default_factory=list)
@@ -156,6 +177,7 @@ class _DomainFetchResult:
     chunks: list[str] | None = None
     normalized_domain: str | None = None
     error: str | None = None
+    elapsed_ms: int | None = None
 
 
 def _normalize_domain_candidate(domain: str) -> Optional[str]:
@@ -261,28 +283,6 @@ def _vector_to_literal(vector: Sequence[float] | None) -> Optional[str]:
     if not values:
         return None
     return "[" + ",".join(f"{x:.7f}" for x in values) + "]"
-
-
-def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> Optional[float]:
-    if not vec_a or not vec_b:
-        return None
-    if len(vec_a) != len(vec_b):
-        return None
-    dot = 0.0
-    norm_a = 0.0
-    norm_b = 0.0
-    for a, b in zip(vec_a, vec_b):
-        fa = float(a)
-        fb = float(b)
-        dot += fa * fb
-        norm_a += fa * fa
-        norm_b += fb * fb
-    if norm_a <= 0.0 or norm_b <= 0.0:
-        return None
-    denom = math.sqrt(norm_a) * math.sqrt(norm_b)
-    if denom == 0:
-        return None
-    return dot / denom
 
 
 def _okved_item_code(obj: Any) -> str:
@@ -403,6 +403,43 @@ def _format_score(value: float) -> float:
         return float(f"{value:.4f}")
     except (TypeError, ValueError):
         return value
+
+
+def _summarize_okved_scores(
+    scores_by_code: Mapping[str, float],
+    okved_entries: Sequence[tuple[str, str]],
+) -> tuple[Optional[float], Optional[float], list[OkvedScoreItem], list[str]]:
+    """Возвращает скор по основному ОКВЭДу, средний скор и расшифровку."""
+
+    notes: list[str] = []
+    if not scores_by_code:
+        return None, None, [], notes
+
+    main_code: Optional[str] = okved_entries[0][0] if okved_entries else None
+    main_score: Optional[float] = None
+
+    if main_code and main_code in scores_by_code:
+        main_score = _format_score(scores_by_code[main_code])
+    elif main_code:
+        notes.append("Не удалось вычислить скор по основному ОКВЭД")
+
+    avg_score = _format_score(
+        sum(scores_by_code.values()) / len(scores_by_code)
+    ) if scores_by_code else None
+
+    details: list[OkvedScoreItem] = []
+    used_codes: set[str] = set()
+    for code, _ in okved_entries:
+        if code in scores_by_code:
+            details.append(OkvedScoreItem(code=code, score=_format_score(scores_by_code[code])))
+            used_codes.add(code)
+
+    for code, value in scores_by_code.items():
+        if code in used_codes:
+            continue
+        details.append(OkvedScoreItem(code=code, score=_format_score(value)))
+
+    return main_score, avg_score, details, notes
 
 
 async def _generate_site_description(
@@ -645,6 +682,9 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         inn,
         payload.save_client_request,
     )
+
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = time.perf_counter()
 
     manual_domains: list[object] = []
     manual_emails: list[object] = []
@@ -893,6 +933,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             position,
             total_domains_to_fetch,
         )
+        fetch_started = time.perf_counter()
         try:
             home_url, chunks, normalized_domain = await fetch_and_chunk(domain_candidate)
             log.info(
@@ -902,11 +943,13 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                 home_url,
                 normalized_domain,
             )
+            elapsed_ms = int((time.perf_counter() - fetch_started) * 1000)
             return _DomainFetchResult(
                 requested_domain=domain_candidate,
                 home_url=home_url,
                 chunks=chunks,
                 normalized_domain=normalized_domain,
+                elapsed_ms=elapsed_ms,
             )
         except FetchError as e:
             log.warning(
@@ -914,14 +957,24 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                 domain_candidate,
                 e,
             )
-            return _DomainFetchResult(requested_domain=domain_candidate, error=str(e))
+            elapsed_ms = int((time.perf_counter() - fetch_started) * 1000)
+            return _DomainFetchResult(
+                requested_domain=domain_candidate,
+                error=str(e),
+                elapsed_ms=elapsed_ms,
+            )
         except Exception as e:  # noqa: BLE001
             log.exception(
                 "parse-site: непредвиденная ошибка при обработке домена %s",
                 domain_candidate,
             )
             message = str(e) or e.__class__.__name__
-            return _DomainFetchResult(requested_domain=domain_candidate, error=message)
+            elapsed_ms = int((time.perf_counter() - fetch_started) * 1000)
+            return _DomainFetchResult(
+                requested_domain=domain_candidate,
+                error=message,
+                elapsed_ms=elapsed_ms,
+            )
 
     fetch_tasks = [
         asyncio.create_task(_fetch_domain_parallel(domain_candidate, idx))
@@ -947,11 +1000,20 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         elif domain_candidate in fetch_results_pool and not domain_results:
             fetch_results_pool.pop(domain_candidate, None)
 
+        post_fetch_started = time.perf_counter()
+        accumulated_ms = int(fetch_result.elapsed_ms or 0) if fetch_result else 0
+        result_notes: list[str] = []
+        description_status: Optional[str] = None
+        okved_score_avg: Optional[float] = None
+        okved_details: list[OkvedScoreItem] = []
+
         if fetch_result is None:
             log.warning(
                 "parse-site: результат загрузки отсутствует для домена %s",
                 domain_candidate,
             )
+            elapsed_ms = accumulated_ms + int((time.perf_counter() - post_fetch_started) * 1000)
+            result_notes.append("Контент не получен")
             results.append(
                 ParsedSiteResult(
                     requested_domain=domain_candidate,
@@ -960,11 +1022,16 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                     chunks_inserted=0,
                     success=False,
                     error="Результат загрузки отсутствует",
+                    description_status="Контент не получен",
+                    notes=result_notes,
+                    processing_ms=elapsed_ms,
                 )
             )
             continue
 
         if fetch_result.error:
+            elapsed_ms = accumulated_ms + int((time.perf_counter() - post_fetch_started) * 1000)
+            result_notes.append("Ошибка загрузки сайта")
             results.append(
                 ParsedSiteResult(
                     requested_domain=domain_candidate,
@@ -973,6 +1040,9 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                     chunks_inserted=0,
                     success=False,
                     error=fetch_result.error,
+                    description_status="Контент не получен",
+                    notes=result_notes,
+                    processing_ms=elapsed_ms,
                 )
             )
             continue
@@ -982,6 +1052,8 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         chunks = list(fetch_result.chunks or [])
 
         if not home_url or not normalized_domain:
+            elapsed_ms = accumulated_ms + int((time.perf_counter() - post_fetch_started) * 1000)
+            result_notes.append("Не удалось получить главную страницу")
             results.append(
                 ParsedSiteResult(
                     requested_domain=domain_candidate,
@@ -990,6 +1062,9 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                     chunks_inserted=0,
                     success=False,
                     error=fetch_result.error or "Не удалось получить главную страницу",
+                    description_status="Главная страница недоступна",
+                    notes=result_notes,
+                    processing_ms=elapsed_ms,
                 )
             )
             continue
@@ -1002,17 +1077,36 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         full_text = "\n\n".join(chunks or [])
         description: Optional[str] = None
         description_vector: Optional[list[float]] = None
-        if full_text:
+        if not full_text:
+            description_status = "Не удалось выделить текст сайта"
+            result_notes.append("Не удалось выделить текст сайта")
+        else:
             description, description_vector = await _generate_site_description(
                 full_text,
                 domain=domain_for_pars or normalized_domain,
                 inn=inn,
             )
+            if description and description_vector:
+                description_status = "Описание и вектор получены"
+            elif description:
+                description_status = "Описание получено без вектора"
+                result_notes.append("Вектор описания не получен")
+            elif description_vector:
+                description_status = "Вектор получен без описания"
+                result_notes.append("Описание не получено, но embedding сформирован")
+            else:
+                description_status = "Описание не получено"
+                result_notes.append("Описание не получено")
+
+        if description_status is None:
+            description_status = "Описание не формировалось"
 
         vector_literal = _vector_to_literal(description_vector)
+        if vector_literal:
+            result_notes.append("Вектор подготовлен к сохранению")
 
         okved_score: Optional[float] = None
-        okved_scores_raw: list[float] = []
+        okved_scores_map: dict[str, float] = {}
         if description_vector and okved_entries:
             if not okved_vectors_cache and okved_entries:
                 for code, text_value in okved_entries:
@@ -1024,10 +1118,10 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                         okved_vectors_cache[code] = vector
             if okved_vectors_cache:
                 for code, vector in okved_vectors_cache.items():
-                    raw_score = _cosine_similarity(description_vector, vector)
+                    raw_score = cosine_similarity(description_vector, vector)
                     if raw_score is None:
                         continue
-                    okved_scores_raw.append(raw_score)
+                    okved_scores_map[code] = raw_score
                     log.info(
                         "parse-site: okved score для %s (%s) → %s",
                         domain_for_pars,
@@ -1040,27 +1134,40 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                     domain_for_pars,
                 )
 
-        if okved_scores_raw:
-            avg_raw = sum(okved_scores_raw) / len(okved_scores_raw)
-            okved_score = _format_score(avg_raw)
+        okved_score, okved_score_avg, okved_details, notes_from_scores = _summarize_okved_scores(
+            okved_scores_map,
+            okved_entries,
+        )
+        result_notes.extend(notes_from_scores)
+
+        if okved_score is not None:
             log.info(
-                "parse-site: усреднённый okved score для %s → %s (ОКВЭДов=%s)",
+                "parse-site: основной okved score для %s → %s",
                 domain_for_pars,
                 okved_score,
-                len(okved_scores_raw),
             )
-            if okved_score < _OKVED_ALERT_THRESHOLD:
-                alert_domain = domain_for_pars or normalized_domain
-                okved_alerts.append(OkvedAlert(domain=alert_domain, score=okved_score))
-        elif description_vector and okved_entries:
+        elif okved_score_avg is not None:
             log.info(
-                "parse-site: okved score не вычислен для %s — отсутствуют валидные векторы",
-                domain_for_pars,
+                "parse-site: основной okved score отсутствует, средний → %s",
+                okved_score_avg,
+            )
+
+        effective_score_for_alert = okved_score if okved_score is not None else okved_score_avg
+        if (
+            effective_score_for_alert is not None
+            and effective_score_for_alert < _OKVED_ALERT_THRESHOLD
+        ):
+            alert_domain = domain_for_pars or normalized_domain
+            okved_alerts.append(
+                OkvedAlert(domain=alert_domain, score=effective_score_for_alert)
             )
 
         if domain_candidate not in domain_order_index:
             domain_order_index[domain_candidate] = len(domain_order_index)
-        client_domain_scores[domain_candidate] = okved_score
+        effective_score_for_sort = (
+            okved_score if okved_score is not None else okved_score_avg
+        )
+        client_domain_scores[domain_candidate] = effective_score_for_sort
         ordered_domains = _sort_domains_by_score(
             client_domain_scores,
             domain_order_index,
@@ -1284,6 +1391,9 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                 vector_literal=vector_literal,
             )
 
+        total_elapsed_ms = accumulated_ms + int((time.perf_counter() - post_fetch_started) * 1000)
+        result_notes.append("Парсинг завершён успешно")
+
         result = ParsedSiteResult(
             requested_domain=domain_candidate,
             used_domain=domain_for_pars,
@@ -1294,6 +1404,11 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             description=description,
             has_description_vector=bool(description_vector),
             okved_score=okved_score,
+            okved_score_avg=okved_score_avg,
+            okved_scores=okved_details,
+            description_status=description_status,
+            notes=result_notes,
+            processing_ms=total_elapsed_ms,
         )
         results.append(result)
         successes.append(result)
@@ -1331,11 +1446,34 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         total_inserted,
     )
 
+    finished_at = datetime.now(timezone.utc)
+    total_duration_seconds = time.perf_counter() - started_monotonic
+    duration_seconds = round(total_duration_seconds, 3)
+    duration_ms = max(0, int(total_duration_seconds * 1000))
+    domains_attempted = len(results)
+    domains_succeeded = len(successes)
+    failed_domains = [r.requested_domain for r in results if not r.success]
+    status: Literal["success", "partial_success"] = (
+        "success" if domains_attempted == domains_succeeded else "partial_success"
+    )
+    if status == "success":
+        message = f"Обработаны все домены ({domains_succeeded} из {domains_attempted})"
+    else:
+        message = (
+            f"Обработаны не все домены: {domains_succeeded} из {domains_attempted} успешно"
+        )
+
     if company_id_pg is None:
         raise HTTPException(status_code=500, detail="PG company_id is undefined after parsing")
 
     primary = successes[0]
     return ParseSiteResponse(
+        status=status,
+        message=message,
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_seconds=duration_seconds,
+        duration_ms=duration_ms,
         company_id=company_id_pg,
         domain_1=f"www.{final_domain_1}" if final_domain_1 else None,
         domain_2=f"www.{final_domain_2}" if final_domain_2 else None,
@@ -1343,6 +1481,9 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         planned_domains=planned_domains,
         successful_domains=successful_used_domains,
         chunks_inserted=total_inserted,
+        domains_attempted=domains_attempted,
+        domains_succeeded=domains_succeeded,
+        failed_domains=failed_domains,
         results=results,
         okved_text=okved_text,
         okved_alerts=okved_alerts,
@@ -1431,6 +1572,8 @@ __all__ = [
     "ParseSiteRequest",
     "ParseSiteResponse",
     "ParsedSiteResult",
+    "OkvedAlert",
+    "OkvedScoreItem",
     "run_parse_site",
     "schedule_parse_site_background",
 ]
