@@ -335,14 +335,7 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
     prodclass_matches, prodclass_updates_raw = _match_rows(
         prodclass_rows, ib_prodclass
     )
-    prodclass_updates = [
-        {
-            "text_pars_id": payload["id"],
-            "prodclass": payload["match_id"],
-            "prodclass_score": payload["score"],
-        }
-        for payload in prodclass_updates_raw
-    ]
+    prodclass_updates = _normalize_prodclass_updates(prodclass_updates_raw)
     prodclass_clear_ids = [
         match.ai_id for match in prodclass_matches if match.match_ib_id is None
     ]
@@ -727,6 +720,28 @@ async def _augment_prodclass_catalog(catalog: List[CatalogEntry]) -> int:
                     )
 
     return added
+
+
+def _normalize_prodclass_updates(
+    updates: Sequence[dict[str, Any]]
+) -> List[dict[str, Any]]:
+    """Подготавливает payload для upsert'ов prodclass."""
+
+    normalized: List[dict[str, Any]] = []
+    for payload in updates:
+        match_id = payload.get("match_id")
+        score = payload.get("score")
+        if match_id is None or score is None:
+            continue
+        normalized.append(
+            {
+                "text_pars_id": int(payload["id"]),
+                "prodclass": int(match_id),
+                "score": float(score),
+                "prodclass_score": float(score),
+            }
+        )
+    return normalized
 
 
 def _match_rows(

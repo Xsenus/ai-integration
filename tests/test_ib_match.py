@@ -6,7 +6,12 @@ import math
 
 import app.services.ib_match as ib_match_mod
 
-from app.services.ib_match import CatalogEntry, SourceRow, _match_rows
+from app.services.ib_match import (
+    CatalogEntry,
+    SourceRow,
+    _match_rows,
+    _normalize_prodclass_updates,
+)
 from app.services.vector_similarity import cosine_similarity
 
 
@@ -69,3 +74,18 @@ def test_match_rows_uses_name_fallback_when_catalog_vector_is_misleading() -> No
     assert matches[0].note == "vector_source=name_embedding"
     assert updates[0]["match_id"] == 10
     assert math.isclose(matches[0].score or 0.0, 1.0, rel_tol=1e-9)
+
+
+def test_normalize_prodclass_updates_preserves_score_for_sql_payload() -> None:
+    rows = [SourceRow(ai_id=7, text="pars", vector=[1.0, 0.0])]
+    entry = CatalogEntry(ib_id=11, name="label")
+    entry.add_vector([1.0, 0.0], source=ib_match_mod._VECTOR_SOURCE_CATALOG)
+
+    _, updates = _match_rows(rows, [entry])
+    normalized = _normalize_prodclass_updates(updates)
+
+    assert normalized
+    payload = normalized[0]
+    assert payload["score"] == payload["prodclass_score"]
+    assert payload["prodclass"] == 11
+    assert payload["text_pars_id"] == 7
