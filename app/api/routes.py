@@ -135,21 +135,32 @@ async def ib_match_by_inn_get(
 router.include_router(ib_match_router)
 
 
-@analyze_service_router.get("/health")
-async def analyze_service_healthcheck() -> dict[str, object]:
-    """Проверяет доступность внешнего сервиса анализа."""
-
+async def _run_analyze_health_check(*, label: str) -> dict[str, object]:
     base_url = get_analyze_base_url()
     if not base_url:
         log.warning("analyze-service: ANALYZE_BASE is not configured")
         raise HTTPException(status_code=503, detail="ANALYZE_BASE is not configured")
 
     try:
-        await ensure_service_available(base_url, label="api.analyze-service.health")
+        await ensure_service_available(base_url, label=label)
     except AnalyzeServiceUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return {"ok": True, "base_url": base_url}
+
+
+@router.get("/analyze/health")
+async def analyze_healthcheck() -> dict[str, object]:
+    """Совместимость со старыми клиентами проверки здоровья."""
+
+    return await _run_analyze_health_check(label="api.analyze.health")
+
+
+@analyze_service_router.get("/health")
+async def analyze_service_healthcheck() -> dict[str, object]:
+    """Проверяет доступность внешнего сервиса анализа."""
+
+    return await _run_analyze_health_check(label="api.analyze-service.health")
 
 
 router.include_router(analyze_service_router)
