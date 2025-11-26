@@ -1,8 +1,11 @@
 # Пошаговый сценарий обработки `/v1/analyze-json`
 
-Ниже описан полный цикл, который выполняет сервис при вызове GET или POST
-маршрута `/v1/analyze-json`. Формат основан на актуальной реализации
-`app/api/analyze_json.py`.
+Ниже описан полный цикл, который выполняет сервис при вызове GET или POST маршрута `/v1/analyze-json`. Формат основан на актуальной реализации `app/api/analyze_json.py` и модели `AnalyzeFromInnResponse`.
+
+## Формат запроса
+* **POST /v1/analyze-json** — принимает `AnalyzeFromInnRequest` с ИНН, опциональными доменами, флагом `refresh_site` и признаком `include_catalogs`.
+* **GET /v1/analyze-json/{inn}** — использует только ИНН и query‑параметры; если `refresh_site=true`, предварительно запускает `/v1/parse-site`.
+* В обоих случаях обязательны `ANALYZE_BASE` и DSN основной БД; при их отсутствии возвращается `400`/`503` с описанием причины.
 
 ## 1. Приём запроса и первичная валидация
 1. FastAPI-роуты `/v1/analyze-json` (POST) и `/v1/analyze-json/{inn}` (GET)

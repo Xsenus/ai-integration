@@ -1,72 +1,65 @@
 # AI Integration Service
 
-AI Integration Service — асинхронное FastAPI-приложение, которое объединяет работу с данными Bitrix24, DaData и внутренними витринами PostgreSQL. Приложение хранит результаты DaData и витринные данные в нескольких базах, синхронизирует компании из Bitrix24 и умеет инициировать внешний AI-анализ по домену компании.
+Асинхронное FastAPI‑приложение, которое объединяет Bitrix24, DaData, ScraperAPI, собственные витрины PostgreSQL и внешний сервис AI‑анализа. Сервис хранит текстовые снимки сайтов, каталожные результаты и вычисленные классы/оборудование, а также умеет запускать полный пайплайн по ИНН в один клик.
 
-## Архитектура
+## Краткая архитектура
 
-- **FastAPI** (`app/main.py`) — точка входа, инициализирует подключения к четырём БД (`bitrix_data`, `parsing_data`, `pp719`, основная `postgres`), настраивает CORS и запускает фоновый цикл синхронизации компаний из Bitrix24.
-- **API-модули**
-  - `app/api/lookup.py` — расширенные карточки компании `/v1/lookup/card` (POST/GET) с записью сведений в PostgreSQL и `parsing_data`.
-  - `app/api/routes.py` — маршруты IB-match, парсинга сайтов и расчёта оборудования.
-- **Бэкенд-слой**
-  - `app/db/*` — подключение и вспомогательные операции для каждой базы, включая создание таблиц Bitrix и зеркалирование данных в `clients_requests`/`pars_site`.
-  - `app/bitrix/b24_client.py` и `app/jobs/b24_sync_job.py` — клиент Bitrix24 и фоновая синхронизация компаний в `bitrix_data`.
-  - `app/services/*` — интеграции с DaData, ScraperAPI и сервисом AI-анализа.
+* **Веб‑слой:** `app/main.py` и роутеры в `app/api/*` формируют REST API, настраивают CORS и инициализируют подключения к БД.
+* **Данные:** четыре отдельные базы (`bitrix_data`, `parsing_data`, `pp719`, основная `postgres`) и вспомогательные таблицы (`clients_requests`, `pars_site`, `ai_site_*`). Подключения создаются лениво — если DSN отсутствует, соответствующий функционал отключается.
+* **Интеграции:**
+  * Bitrix24 — клиент `app/bitrix/b24_client.py` и фоновая синхронизация `app/jobs/b24_sync_job.py` создают/обновляют `b24_companies_raw`.
+  * Парсинг сайтов — ScraperAPI и собственные утилиты (`app/services/parse_site.py`) формируют текстовые снапшоты и embeddings.
+  * Внешний AI‑анализ — HTTP‑клиент в `app/services/analyze_client.py` и обработчик `app/api/analyze_json.py`.
+  * Каталоги и расчёт оборудования — функции в `app/services/ib_match.py` и `app/services/equipment_selection.py` работают с справочниками из `postgres`.
 
-## Предварительные требования
+Подробные заметки о ключевых потоках лежат в каталоге `docs/`.
 
-- Python 3.11+
-- PostgreSQL c доступом к базам `bitrix_data`, `parsing_data`, `pp719` и основной `postgres`
-- Доступ к сторонним сервисам (DaData, ScraperAPI, внешний AI-анализ) при необходимости
+## Быстрый старт
 
-## Настройка окружения
-
-1. Создайте виртуальное окружение и установите зависимости:
+1. Подготовьте окружение:
    ```bash
    python -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-2. Скопируйте `.env.example` в `.env` и заполните значения под свою инфраструктуру.
+2. Скопируйте `.env.example` → `.env` и заполните DSN БД, ключи DaData/ScraperAPI и URL внешнего AI‑анализа.
+3. Запустите приложение:
+   ```bash
+   uvicorn app.main:app --reload
+   ```
 
-### Переменные окружения
+При старте сервис проверяет подключение к доступным БД, создаёт `b24_companies_raw` в `bitrix_data`, обеспечивает схему `parsing_data` и (при `B24_SYNC_ENABLED=true`) запускает фоновую синхронизацию Bitrix24.
 
-`.env.example` содержит все доступные ключи и комментарии. Основные группы настроек:
+## Настройки окружения
 
-- **Базы данных**
-  - `POSTGRES_DATABASE_URL`, `BITRIX_DATABASE_URL`, `PARSING_DATABASE_URL`, `PP719_DATABASE_URL`
-- **Логирование и SQL**
-  - `LOG_LEVEL`, `ECHO_SQL`
-- **DaData и ScraperAPI**
-  - `DADATA_API_KEY`, `DADATA_SECRET_KEY`, `SCRAPERAPI_KEY`
-- **Внешний AI-анализ**
-  - `AI_ANALYZE_BASE` (`ANALYZE_BASE` в качестве альтернативы)
-  - `AI_ANALYZE_TIMEOUT` (`ANALYZE_TIMEOUT` как альтернативное имя)
-- **Bitrix24**
-  - `B24_BASE_URL`, лимиты и параметры batch (`B24_PAGE_LIMIT`, `B24_BATCH_*`)
-  - настройки фоновой синхронизации (`B24_SYNC_*`)
-  - флаги логирования (`B24_LOG_VERBOSE`, `B24_LOG_BODIES`, `B24_LOG_BODY_CHARS`)
-- **CORS** — `CORS_ALLOW_ORIGINS`, `CORS_ALLOW_METHODS`, `CORS_ALLOW_HEADERS`, `CORS_ALLOW_CREDENTIALS`
-- **Парсинг сайтов** — `PARSE_MAX_CHUNK_SIZE`, `PARSE_MIN_HTML_LEN`
+`.env.example` содержит полный список переменных. Ключевые группы:
 
-## Запуск приложения
+* **Базы данных:** `POSTGRES_DATABASE_URL`, `BITRIX_DATABASE_URL`, `PARSING_DATABASE_URL`, `PP719_DATABASE_URL`.
+* **Логирование/SQL:** `LOG_LEVEL`, `ECHO_SQL` (подробный вывод SQLAlchemy).
+* **DaData/ScraperAPI:** `DADATA_API_KEY`, `DADATA_SECRET_KEY`, `SCRAPERAPI_KEY`, ограничения парсинга (`PARSE_MAX_CHUNK_SIZE`, `PARSE_MIN_HTML_LEN`).
+* **Внешний AI‑анализ:** `AI_ANALYZE_BASE`/`ANALYZE_BASE`, таймаут `AI_ANALYZE_TIMEOUT`/`ANALYZE_TIMEOUT`.
+* **Bitrix24:** `B24_BASE_URL`, лимиты запросов (`B24_PAGE_LIMIT`, `B24_BATCH_*`), параметры синхронизации (`B24_SYNC_*`) и флаги логирования (`B24_LOG_*`).
+* **CORS:** `CORS_ALLOW_ORIGINS`, `CORS_ALLOW_METHODS`, `CORS_ALLOW_HEADERS`, `CORS_ALLOW_CREDENTIALS`.
 
-```bash
-uvicorn app.main:app --reload
-```
+## API‑карточка
 
-При старте приложение проверяет доступность подключений, создаёт при необходимости таблицу `b24_companies_raw` в `bitrix_data` и, если включена опция `B24_SYNC_ENABLED`, запускает фоновый цикл синхронизации с Bitrix24.
+| Маршрут | Назначение |
+| --- | --- |
+| `GET /health` | Проверяет доступность всех настроенных БД. |
+| `POST /v1/lookup/card`, `GET /v1/lookup/{inn}/card` | Создание/чтение расширенной карточки компании с сохранением в `bitrix_data` и `parsing_data`. |
+| `POST /v1/parse-site`, `GET /v1/parse-site/{inn}` | Парсинг главных страниц доменов, сохранение текста/embedding в `pars_site` и привязка к ИНН. |
+| `POST /v1/analyze-json`, `GET /v1/analyze-json/{inn}` | Подготовка снапшотов, вызов внешнего AI‑сервиса и запись каталожных ответов в БД. |
+| `POST /v1/ib-match`, `POST/GET /v1/ib-match/by-inn` | Сопоставление `pars_site.text_vector` с каталогами `ib_prodclass`/оборудования. |
+| `GET /v1/equipment-selection`, `GET /v1/equipment-selection/by-inn/{inn}` | Расчёт комплекта оборудования по последней записи клиента в `clients_requests`. |
+| `GET /v1/analyze-service/health` | Проверка доступности внешнего сервиса анализа. |
+| `POST /v1/pipeline/full` | Последовательный запуск lookup → parse-site → analyze-json → ib-match → equipment-selection для переданного ИНН. |
+| `POST /v1/pipeline/auto` | Автообработка нескольких ИНН без готового результата расчёта оборудования. |
 
-## Основные эндпоинты
-
-- `GET /health` — пинг всех сконфигурированных баз.
-- `POST /v1/lookup/card` и `GET /v1/lookup/{inn}/card` — получение и сохранение расширенных карточек компании по ИНН с записью в обе БД.
-- `POST /v1/analyze-json` — полный цикл подготовки текста, запроса к внешнему JSON-интерфейсу анализа и записи ответа в БД.
-- `POST /v1/parse-site` и `GET /v1/parse-site/{inn}` — загрузка главной страницы компании через ScraperAPI, нарезка текста на чанки и сохранение в `pars_site` (GET автоматически ищет домен по ИНН).
+Детализированные сценарии и структуры ответов описаны в документах `docs/analyze_json_flow.md`, `docs/parse_site_pipeline.md`, `docs/analyze_json_changes.md`, `docs/prodclass_matching.md`, `docs/industry_detection.md` и `docs/pipeline_overview.md`.
 
 ## Полезные заметки
 
-- Подключения к базам создаются лениво; при отсутствии DSN соответствующий функционал отключается.
-- Для запуска синхронизации с Bitrix24 необходимо одновременно задать `BITRIX_DATABASE_URL`, `B24_BASE_URL` и включить `B24_SYNC_ENABLED`.
-- Парсер сайтов автоматически дополняет `clients_requests` данными о домене и может переиспользовать последний домен компании из основной БД.
-
+* DSN для БД не обязательны: сервис автоматически отключает функции, завязанные на отсутствующие подключения.
+* Для запуска Bitrix‑синхронизации нужны одновременно `BITRIX_DATABASE_URL`, `B24_BASE_URL` и `B24_SYNC_ENABLED=true`.
+* Парсер сайтов обновляет `clients_requests` и может повторно использовать домен, уже сохранённый для компании.
+* Все косинусные сравнения embeddings выполняются общей функцией `services.vector_similarity.cosine_similarity`, поэтому результаты согласованы между сервисами.
