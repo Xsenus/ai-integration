@@ -4,6 +4,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Iterable as IterableABC, Mapping as MappingABC
+from difflib import SequenceMatcher
 from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
@@ -112,6 +113,29 @@ def _okved_to_industry(okved: Optional[str]) -> Optional[str]:
     if 94 <= code2 <= 96: return "Общественные/личные услуги"
     return None
 
+
+def _compute_description_okved_score(
+    description: Optional[str], okved: Optional[str]
+) -> Optional[float]:
+    """Оценка сходства описания сайта и ОКВЭД/отрасли через SequenceMatcher."""
+
+    if not description or not okved:
+        return None
+
+    industry_label = _okved_to_industry(okved) or okved
+    if not industry_label:
+        return None
+
+    normalized_desc = " ".join(str(description).split()).lower()
+    normalized_industry = str(industry_label).strip().lower()
+    if not normalized_desc or not normalized_industry:
+        return None
+
+    ratio = SequenceMatcher(None, normalized_desc[:2000], normalized_industry).ratio()
+    if ratio <= 0:
+        return None
+    return round(ratio, 4)
+
 async def _table_exists(conn, schema: str, table: str) -> bool:
     q = text("""
         SELECT EXISTS (
@@ -121,6 +145,22 @@ async def _table_exists(conn, schema: str, table: str) -> bool:
         )
     """)
     res = await conn.execute(q, {"schema": schema, "table": table})
+    return bool(res.scalar())
+
+
+async def _column_exists(conn, schema: str, table: str, column: str) -> bool:
+    q = text(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = :schema AND table_name = :table AND column_name = :column
+        )
+        """
+    )
+    res = await conn.execute(
+        q, {"schema": schema, "table": table, "column": column}
+    )
     return bool(res.scalar())
 
 async def _get_table_columns(conn, schema: str, table: str) -> set[str]:
@@ -589,6 +629,17 @@ def _resolve_industry_from_prodclass(
     return fallback_label
 
 
+def _resolve_tnved_code(
+    row: Mapping[str, Any], lookup: Mapping[Any, Mapping[str, Any]] | None
+) -> Optional[str]:
+    identifier = row.get("goods_type_id") or row.get("goods_type_ID")
+    info = lookup.get(identifier) if lookup else None
+    code = _lookup_value(info, ("code", "goods_type_code", "goods_type_id"))
+    if not code and identifier is not None:
+        code = str(identifier).strip()
+    return code or None
+
+
 def _select_primary_prodclass(
     prod_rows: Iterable[Mapping[str, Any]],
     lookup: Mapping[Any, Mapping[str, Any]] | None,
@@ -605,12 +656,16 @@ def _select_primary_prodclass(
             name = None
         label = _format_with_id(name, prodclass_id if prodclass_id is not None else identifier)
         score = _as_float(row.get("prodclass_score"))
-        return {
+        description_okved_score = _as_float(row.get("description_okved_score"))
+        result = {
             "id": prodclass_id,
             "name": name,
             "label": label,
             "score": score,
         }
+        if description_okved_score is not None:
+            result["description_okved_score"] = description_okved_score
+        return result
     return None
 
 
@@ -639,6 +694,7 @@ def _compose_products(
         goods_entry = None
         goods_group = None
         goods_label = None
+        tnved_code = None
         if text_id is not None:
             for candidate in goods_by_text.get(text_id, []):
                 candidate_id = candidate.get("id")
@@ -646,6 +702,7 @@ def _compose_products(
                     continue
                 goods_entry = candidate
                 goods_group = _resolve_goods_group(candidate, goods_lookup)
+                tnved_code = _resolve_tnved_code(candidate, goods_lookup)
                 used_goods_ids.add(candidate_id)
                 goods_label = _format_with_id(
                     candidate.get("goods_type"),
@@ -672,6 +729,7 @@ def _compose_products(
             {
                 "name": final_name,
                 "goods_group": goods_group,
+                "tnved_code": tnved_code,
                 "domain": domain,
                 "url": url,
             }
@@ -696,6 +754,7 @@ def _compose_products(
                 {
                     "name": label,
                     "goods_group": _resolve_goods_group(row, goods_lookup),
+                    "tnved_code": _resolve_tnved_code(row, goods_lookup),
                     "domain": domain,
                     "url": url,
                 }
@@ -865,9 +924,17 @@ async def analyze_company_by_inn(inn: str) -> dict:
                     )
 
             if await _table_exists(conn, "public", "ai_site_prodclass"):
+                has_okved_score = await _column_exists(
+                    conn, "public", "ai_site_prodclass", "description_okved_score"
+                )
+                prod_columns = (
+                    "pc.id, pc.text_pars_id, pc.prodclass, pc.prodclass_score,"
+                )
+                if has_okved_score:
+                    prod_columns += " pc.description_okved_score,"
                 sql_prod = text(
-                    """
-                    SELECT pc.id, pc.text_pars_id, pc.prodclass, pc.prodclass_score,
+                    f"""
+                    SELECT {prod_columns}
                            ps.domain_1, ps.url, ps.id AS pars_site_id
                     FROM public.ai_site_prodclass AS pc
                     JOIN public.pars_site AS ps ON ps.id = pc.text_pars_id
@@ -1015,6 +1082,21 @@ async def analyze_company_by_inn(inn: str) -> dict:
         if not okved_src:
             okved_src = okved_fallback
         industry = _okved_to_industry(okved_src)
+
+    description_okved_score: Optional[float] = None
+    if primary_prodclass:
+        description_okved_score = primary_prodclass.get("description_okved_score")
+    if description_okved_score is None:
+        okved_src_for_score = (cr or {}).get("okved_main") if cr else None
+        if not okved_src_for_score:
+            okved_src_for_score = okved_fallback
+        joined_description = " ".join([d for d in domain_descriptions if d])
+        description_okved_score = _compute_description_okved_score(
+            joined_description, okved_src_for_score
+        )
+        if primary_prodclass and description_okved_score is not None:
+            primary_prodclass = dict(primary_prodclass)
+            primary_prodclass["description_okved_score"] = description_okved_score
 
     utp = (cr or {}).get("utp") if cr else None
     letter = (cr or {}).get("pismo") if cr else None
