@@ -27,6 +27,10 @@ class AiProdclass(BaseModel):
         None,
         description="Скор продкласса из таблицы ai_site_prodclass",
     )
+    description_okved_score: Optional[float] = Field(
+        None,
+        description="Сходство описания сайта и ОКВЭД (где хранится — ai_site_prodclass.description_okved_score)",
+    )
 
 
 class AiProduct(BaseModel):
@@ -36,6 +40,10 @@ class AiProduct(BaseModel):
     goods_group: Optional[str] = Field(
         None,
         description="Группа продукции ЕАЭС (GOODS_TYPE)",
+    )
+    tnved_code: Optional[str] = Field(
+        None,
+        description="Код ТНВЭД/ЕАЭС из goods_type_id, если доступен",
     )
     domain: Optional[str] = Field(None, description="Домен источника")
     url: Optional[str] = Field(None, description="Ссылка на страницу с описанием")

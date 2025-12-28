@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from collections import defaultdict
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -971,6 +972,83 @@ def _normalize_score(value: Any) -> Optional[float]:
     return float(f"{num:.2f}")
 
 
+def _okved_to_industry_label(okved: Optional[str]) -> Optional[str]:
+    if not okved:
+        return None
+    match = re.search(r"(\d{2})", str(okved))
+    if not match:
+        return None
+    code2 = int(match.group(1))
+    if 10 <= code2 <= 12:
+        return "Пищевая промышленность"
+    if 13 <= code2 <= 15:
+        return "Текстиль/одежда"
+    if 16 <= code2 <= 18:
+        return "Деревообработка/бумага/печать"
+    if 19 <= code2 <= 22:
+        return "Химия/полимеры"
+    if 23 <= code2 <= 25:
+        return "Неметаллы/металлы/машиностроение"
+    if 26 <= code2 <= 28:
+        return "Электроника/оборудование"
+    if 29 <= code2 <= 30:
+        return "Авто/транспортное машиностроение"
+    if 31 <= code2 <= 33:
+        return "Прочее производство/ремонт"
+    if 35 <= code2 <= 39:
+        return "Энергетика/вода/утилизация"
+    if 41 <= code2 <= 43:
+        return "Строительство"
+    if 45 <= code2 <= 47:
+        return "Торговля"
+    if 49 <= code2 <= 53:
+        return "Транспорт и логистика"
+    if 55 <= code2 <= 56:
+        return "Гостиницы/общепит"
+    if 58 <= code2 <= 63:
+        return "IT/связь/медиа"
+    if 64 <= code2 <= 66:
+        return "Финансы/страхование"
+    if 68 == code2:
+        return "Недвижимость"
+    if 69 <= code2 <= 75:
+        return "Проф. и научные услуги"
+    if 77 <= code2 <= 82:
+        return "Адм. услуги"
+    if 84 == code2:
+        return "Госуправление"
+    if 85 == code2:
+        return "Образование"
+    if 86 <= code2 <= 88:
+        return "Здравоохранение/соцуслуги"
+    if 90 <= code2 <= 93:
+        return "Культура/спорт/развлечения"
+    if 94 <= code2 <= 96:
+        return "Общественные/личные услуги"
+    return None
+
+
+def _compute_description_okved_score(
+    description: Optional[str], okved: Optional[str]
+) -> Optional[float]:
+    if not description or not okved:
+        return None
+
+    industry_label = _okved_to_industry_label(okved) or okved
+    if not industry_label:
+        return None
+
+    normalized_desc = " ".join(str(description).split()).lower()
+    normalized_industry = str(industry_label).strip().lower()
+    if not normalized_desc or not normalized_industry:
+        return None
+
+    ratio = SequenceMatcher(None, normalized_desc[:2000], normalized_industry).ratio()
+    if ratio <= 0:
+        return None
+    return round(ratio, 4)
+
+
 async def _prodclass_exists(conn: AsyncConnection, prodclass_id: int) -> bool:
     """Проверяет наличие prodclass в справочнике ib_prodclass."""
 
@@ -1233,10 +1311,16 @@ async def _apply_db_payload(
         prodclass_stale_ids: list[int] = []
         prodclass_columns = await _get_table_columns(conn, "ai_site_prodclass")
         prodclass_has_created_at = "created_at" in prodclass_columns
+        prodclass_has_okved_score = "description_okved_score" in prodclass_columns
+
+        select_cols = "id, prodclass, prodclass_score"
+        if prodclass_has_okved_score:
+            select_cols += ", description_okved_score"
+
         result = await conn.execute(
             text(
-                """
-                SELECT id, prodclass, prodclass_score
+                f"""
+                SELECT {select_cols}
                 FROM public.ai_site_prodclass
                 WHERE text_pars_id = :pid
                 ORDER BY id ASC
@@ -1248,6 +1332,27 @@ async def _apply_db_payload(
         prodclass_stale_ids = [row.get("id") for row in prodclass_rows[:-1] if row.get("id") is not None]
         if prodclass_rows:
             prodclass_row = prodclass_rows[-1]
+
+        okved_main: Optional[str] = None
+        if snapshot.company_id:
+            okved_query = text(
+                """
+                SELECT okved_main
+                FROM public.clients_requests
+                WHERE id = :cid
+                LIMIT 1
+                """
+            )
+            okved_row = await conn.execute(
+                okved_query, {"cid": snapshot.company_id}
+            )
+            okved_data = okved_row.mappings().first()
+            if okved_data:
+                okved_main = okved_data.get("okved_main")
+
+        description_okved_score = _compute_description_okved_score(
+            description_value or snapshot.text, okved_main
+        ) if prodclass_has_okved_score else None
 
         if description_present and "description" in cols:
             update_sql = "UPDATE public.pars_site SET description = :description WHERE id = :id"
@@ -1304,59 +1409,76 @@ async def _apply_db_payload(
                     if prodclass_row is not None and score_to_use is None:
                         score_to_use = _normalize_score(prodclass_row.get("prodclass_score"))
 
+                    params = {
+                        "pid": snapshot.pars_id,
+                        "prodclass": candidate_prodclass_id,
+                        "score": score_to_use,
+                        "description_okved_score": description_okved_score,
+                    }
+
                     if prodclass_row is None:
+                        columns = ["text_pars_id", "prodclass", "prodclass_score"]
+                        values = [":pid", ":prodclass", ":score"]
+                        if prodclass_has_okved_score:
+                            columns.append("description_okved_score")
+                            values.append(":description_okved_score")
+
                         insert_prodclass_sql = (
                             "INSERT INTO public.ai_site_prodclass "
-                            "(text_pars_id, prodclass, prodclass_score) "
-                            "VALUES (:pid, :prodclass, :score) RETURNING id"
+                            f"({', '.join(columns)}) "
+                            f"VALUES ({', '.join(values)}) RETURNING id"
                         )
                         log.info(
-                            "analyze-json: inserting prodclass (pars_id=%s, prodclass=%s, score=%s) using SQL: %s",
+                            "analyze-json: inserting prodclass (pars_id=%s, prodclass=%s, score=%s, desc_okved=%s) using SQL: %s",
                             snapshot.pars_id,
                             candidate_prodclass_id,
                             score_to_use,
+                            description_okved_score,
                             insert_prodclass_sql,
                         )
                         insert_result = await conn.execute(
                             text(insert_prodclass_sql),
-                            {
-                                "pid": snapshot.pars_id,
-                                "prodclass": candidate_prodclass_id,
-                                "score": score_to_use,
-                            },
+                            params,
                         )
                         prodclass_row = {
                             "id": insert_result.scalar_one(),
                             "prodclass": candidate_prodclass_id,
                             "prodclass_score": score_to_use,
+                            "description_okved_score": description_okved_score,
                         }
                     else:
+                        set_clauses = ["prodclass = :prodclass", "prodclass_score = :score"]
+                        if prodclass_has_okved_score:
+                            set_clauses.append(
+                                "description_okved_score = :description_okved_score"
+                            )
                         update_prodclass_sql = (
                             "UPDATE public.ai_site_prodclass "
-                            "SET prodclass = :prodclass, prodclass_score = :score"
+                            f"SET {', '.join(set_clauses)}"
                         )
                         if prodclass_has_created_at:
                             update_prodclass_sql += ", created_at = TIMEZONE('UTC', now())"
                         update_prodclass_sql += " WHERE id = :row_id"
                         log.info(
-                            "analyze-json: updating prodclass (pars_id=%s, prodclass=%s, score=%s) using SQL: %s",
+                            "analyze-json: updating prodclass (pars_id=%s, prodclass=%s, score=%s, desc_okved=%s) using SQL: %s",
                             snapshot.pars_id,
                             candidate_prodclass_id,
                             score_to_use,
+                            description_okved_score,
                             update_prodclass_sql,
                         )
                         await conn.execute(
                             text(update_prodclass_sql),
                             {
+                                **params,
                                 "row_id": prodclass_row.get("id"),
-                                "prodclass": candidate_prodclass_id,
-                                "score": score_to_use,
                             },
                         )
                         prodclass_row = {
                             "id": prodclass_row.get("id"),
                             "prodclass": candidate_prodclass_id,
                             "prodclass_score": score_to_use,
+                            "description_okved_score": description_okved_score,
                         }
             else:
                 log.warning(
