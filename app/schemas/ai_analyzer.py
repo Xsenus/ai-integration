@@ -31,6 +31,18 @@ class AiProdclass(BaseModel):
         None,
         description="Сходство описания сайта и ОКВЭД (где хранится — ai_site_prodclass.description_okved_score)",
     )
+    description_score: Optional[float] = Field(
+        None,
+        description="Сходство описания сайта с названием компании (ai_site_prodclass.description_score)",
+    )
+    okved_score: Optional[float] = Field(
+        None,
+        description="Сходство описания сайта и ОКВЭД (ai_site_prodclass.okved_score)",
+    )
+    prodclass_by_okved: Optional[int] = Field(
+        None,
+        description="Класс производства по ОКВЭД при недоступном сайте (ai_site_prodclass.prodclass_by_okved)",
+    )
 
 
 class AiProduct(BaseModel):

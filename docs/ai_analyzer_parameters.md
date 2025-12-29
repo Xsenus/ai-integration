@@ -73,7 +73,7 @@
   `clients_requests`, затем fallback из `dadata_result` Bitrix или
   Postgres и переводится в человекочитаемую отрасль. Пусто, если нет ни
   продкласса, ни ОКВЭД.
-  【F:app/services/ai_analyzer.py†L978-L1037】【F:app/schemas/ai_analyzer.py†L55-L67】
+  【F:app/services/ai_analyzer.py†L1102-L1131】【F:app/schemas/ai_analyzer.py†L76-L95】
 
 * **ai.utp** — напрямую `clients_requests.utp`. Если поле пустое в
   таблице, в карточке будет `null/—`.
@@ -87,7 +87,7 @@
   участвовали (`clients_requests`, `pars_site`, `ai_site_*`,
   `dadata_result(Bitrix/PG)`). Если ничего не найдено, значение
   `"no sources found"`.
-  【F:app/services/ai_analyzer.py†L1019-L1053】
+  【F:app/services/ai_analyzer.py†L1133-L1150】
 
 ## Что НЕ вычисляется
 * AI-роутер не запускает анализ заново и не обращается к внешним
@@ -108,14 +108,20 @@
      `label=[id] name`, `score` (тот самый “уровень соответствия”).
      Данные появляются только если в БД есть строки `ai_site_prodclass`
      для `company_id`; анализатор сам ничего не досчитывает.
-     【F:app/services/ai_analyzer.py†L956-L1032】【F:app/schemas/ai_analyzer.py†L9-L33】
+     【F:app/services/ai_analyzer.py†L935-L1131】【F:app/schemas/ai_analyzer.py†L17-L45】
+   * Дополнительно в `ai.prodclass` возвращаются `description_score`
+     (сходство описания с названием компании), `okved_score`
+     (сходство описания с ОКВЭД) и `prodclass_by_okved` — он заполняется,
+     если внешний сервис смог классифицировать только по ОКВЭД при
+     недоступном сайте. Все значения берутся напрямую из
+     `ai_site_prodclass`, поэтому старые ответы остаются совместимыми.
 
 2. **«Домен для парсинга».**
    * В ответе это `ai.sites[]` и вспомогательные `domain1_site/domain2_site`.
      Список строится из `pars_site.url/domain_1` по `company_id`, дальше
      — из `clients_requests.domain_1/2` с дедупликацией. Если таблицы
      пустые, блок остаётся пустым. Никаких вычислений/валидации кроме
-     нормализации URL нет.【F:app/services/ai_analyzer.py†L904-L955】
+     нормализации URL нет.【F:app/services/ai_analyzer.py†L995-L1040】
 
 3. **«Соответствие ИИ-описания сайта и ОКВЭД».**
    * Теперь считаем при разборе `analyze-json`: берём описание сайта
@@ -124,22 +130,22 @@
      `ai_site_prodclass.description_okved_score`, если она есть. В ответе
      значение возвращается как `ai.prodclass.description_okved_score`; если
      колонки нет, скор вычисляется на лету и подставляется только в ответ.
-     【F:app/api/analyze_json.py†L1234-L1310】【F:app/services/ai_analyzer.py†L970-L1005】【F:app/schemas/ai_analyzer.py†L15-L27】
+     【F:app/api/analyze_json.py†L1316-L1520】【F:app/services/ai_analyzer.py†L1102-L1131】【F:app/schemas/ai_analyzer.py†L17-L45】
 
 4. **«ИИ-описание сайта».**
-   * Это `company.domain1/domain2` в ответе: берём два последних
-     `pars_site.description` по `company_id`, при нехватке —
-     `clients_requests.site_1/2_description`. Никакой генерации текста в
-     момент запроса нет; если описаний нет в таблицах, поле пустое.
-     【F:app/services/ai_analyzer.py†L904-L955】
+  * Это `company.domain1/domain2` в ответе: берём два последних
+    `pars_site.description` по `company_id`, при нехватке —
+    `clients_requests.site_1/2_description`. Никакой генерации текста в
+    момент запроса нет; если описаний нет в таблицах, поле пустое.
+    【F:app/services/ai_analyzer.py†L995-L1040】
 
 5. **«Топ-10 оборудования».**
-   * Мы возвращаем `ai.equipment[]`, собранный из `ai_site_equipment`
-     (сортировка по `equipment_score`, дедупликация по названию+URL).
-     Лимит по коду — 100 записей; отдельного “топ-10” не режем. Если нужны
-     строго 10 позиций, это надо обрезать на фронте или добавить фильтр в
-     сервисе. Без строк в `ai_site_equipment` блок будет пустым.
-     【F:app/services/ai_analyzer.py†L835-L905】【F:app/services/ai_analyzer.py†L956-L1032】
+  * Мы возвращаем `ai.equipment[]`, собранный из `ai_site_equipment`
+    (сортировка по `equipment_score`, дедупликация по названию+URL).
+    Лимит по коду — 100 записей; отдельного “топ-10” не режем. Если нужны
+    строго 10 позиций, это надо обрезать на фронте или добавить фильтр в
+    сервисе. Без строк в `ai_site_equipment` блок будет пустым.
+    【F:app/services/ai_analyzer.py†L835-L905】【F:app/services/ai_analyzer.py†L935-L1131】
 
 6. **«Виды найденной продукции на сайте и ТНВЭД».**
    * Это `ai.products[]`: собираем связки из `ai_site_prodclass` и
