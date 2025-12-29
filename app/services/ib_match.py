@@ -291,7 +291,7 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         existing_prodclass_raw = await conn.execute(
             text(
                 """
-                SELECT pc.id, pc.text_pars_id
+                SELECT pc.id, pc.text_pars_id, pc.prodclass, pc.prodclass_score
                 FROM public.ai_site_prodclass AS pc
                 JOIN public.pars_site AS ps ON ps.id = pc.text_pars_id
                 WHERE ps.company_id = :client_id
@@ -299,10 +299,17 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             ),
             {"client_id": client_id},
         )
-        prodclass_existing_map = {
-            int(row["text_pars_id"]): int(row["id"])
-            for row in existing_prodclass_raw.mappings()
-        }
+        prodclass_existing_map = {}
+        for row in existing_prodclass_raw.mappings():
+            prodclass_existing_map[int(row["text_pars_id"])] = {
+                "id": int(row["id"]),
+                "prodclass": row.get("prodclass"),
+                "prodclass_score": (
+                    float(row["prodclass_score"])
+                    if row.get("prodclass_score") is not None
+                    else None
+                ),
+            }
 
     goods_embed_targets = _select_for_embedding(goods_rows, reembed_if_exists)
     equipment_embed_targets = _select_for_embedding(equipment_rows, reembed_if_exists)
@@ -341,9 +348,10 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         prodclass_rows, ib_prodclass
     )
     prodclass_updates = _normalize_prodclass_updates(prodclass_updates_raw)
-    prodclass_clear_ids = [
-        match.ai_id for match in prodclass_matches if match.match_ib_id is None
-    ]
+    # prodclass_clear_ids = [
+    #     match.ai_id for match in prodclass_matches if match.match_ib_id is None
+    # ]
+    prodclass_clear_ids: list[int] = []
     log.info(
         "ib-match: prepared %s goods updates and %s equipment updates for client_id=%s",
         len(goods_updates),
@@ -422,19 +430,6 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             )
             for payload in equipment_updates:
                 await conn.execute(update_equipment_sql, payload)
-        if prodclass_clear_ids:
-            delete_prodclass_sql = text(
-                """
-                DELETE FROM public.ai_site_prodclass
-                WHERE text_pars_id = :text_pars_id
-                """
-            )
-            for pars_id in prodclass_clear_ids:
-                if pars_id not in prodclass_existing_map:
-                    continue
-                await conn.execute(delete_prodclass_sql, {"text_pars_id": pars_id})
-                prodclass_cleared += 1
-                prodclass_existing_map.pop(pars_id, None)
         if prodclass_updates:
             update_prodclass_sql = text(
                 """
@@ -453,17 +448,41 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             )
             for payload in prodclass_updates:
                 pars_id = int(payload["text_pars_id"])
-                row_id = prodclass_existing_map.get(pars_id)
-                if row_id is None:
+                existing_row = prodclass_existing_map.get(pars_id)
+                if existing_row is None:
                     insert_result = await conn.execute(insert_prodclass_sql, payload)
                     new_id = insert_result.scalar_one()
-                    prodclass_existing_map[pars_id] = new_id
+                    prodclass_existing_map[pars_id] = {
+                        "id": new_id,
+                        "prodclass": payload.get("prodclass"),
+                        "prodclass_score": payload.get("score"),
+                    }
                     prodclass_inserted += 1
                     prodclass_updated += 1
                 else:
+                    existing_score = existing_row.get("prodclass_score")
+                    incoming_score = payload.get("score")
+                    if (
+                        existing_score is not None
+                        and incoming_score is not None
+                        and incoming_score > existing_score
+                    ):
+                        log.info(
+                            "ib-match: keeping existing prodclass for pars_site=%s (existing_score=%.3f, incoming_score=%.3f)",
+                            pars_id,
+                            existing_score,
+                            incoming_score,
+                        )
+                        continue
                     update_payload = dict(payload)
-                    update_payload["row_id"] = row_id
+                    update_payload["row_id"] = existing_row["id"]
                     await conn.execute(update_prodclass_sql, update_payload)
+                    prodclass_existing_map[pars_id]["prodclass"] = payload.get(
+                        "prodclass"
+                    )
+                    prodclass_existing_map[pars_id]["prodclass_score"] = (
+                        incoming_score
+                    )
                     prodclass_updated += 1
     log.info(
         "ib-match: database updates applied for client_id=%s (goods_vectors=%s, equipment_vectors=%s, goods_matches=%s, equipment_matches=%s, prodclass_matches=%s, prodclass_cleared=%s)",
