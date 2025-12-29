@@ -17,6 +17,12 @@
   * `text_pars_id` (внешний ключ на `pars_site.id`), опционально `created_at`.
 * При отсутствии `prodclass` в ответе сервис записывает `prodclass_by_okved` и использует `okved_score`/`description_okved_score` как оценку.
 
+### `public.ai_site_openai_responses`
+* Лог ответов внешнего анализа по каждому домену/компании (всегда создаём новую строку — история не затирается).
+* Связки: `text_pars_id` → `pars_site.id`, `company_id` → `clients_requests.id`.
+* Содержит сырой текст описания (`description`), метрики (`description_score`, `okved_score`, `prodclass_by_okved`, `prodclass`, `prodclass_score`), списки (`equipment_site`, `goods`, `goods_type`) и штамп времени (`created_at`).
+* Создаётся автоматически вместе с остальными таблицами `parsing_data`.
+
 ### `public.ai_site_goods_types`
 * Список товаров/услуг: `goods_type` (название), `goods_type_id`/`match_id`, `goods_types_score`, `text_vector`.
 * Каждая строка связана с конкретным парсом через `text_par_id` (`pars_site.id`).
@@ -60,6 +66,15 @@
    ORDER BY id;
    ```
 
+4. Посмотреть историю ответов внешнего анализа (каждый вызов — отдельная строка):
+   ```sql
+   SELECT created_at, domain, url, description, description_score, okved_score, prodclass_by_okved,
+          prodclass, prodclass_score, equipment_site, goods, goods_type
+   FROM public.ai_site_openai_responses
+   WHERE text_pars_id = :pars_id
+   ORDER BY created_at DESC, id DESC;
+   ```
+
 ## Поиск по конкретному домену
 Если нужно уточнить по сайту, используйте тот же порядок, но во втором запросе добавьте фильтр по домену (при наличии колонки `domain_1`/`domain_2`):
 ```sql
@@ -69,6 +84,15 @@ WHERE company_id = :company_id
   AND (domain_1 = :domain OR domain_2 = :domain)
 ORDER BY created_at DESC NULLS LAST, id DESC
 LIMIT 1;
+```
+
+Чтобы просмотреть историю по домену без привязки к конкретной версии парса, можно выбрать все записи сразу:
+```sql
+SELECT created_at, domain, url, description, description_score, okved_score, prodclass_by_okved,
+       prodclass, prodclass_score, equipment_site, goods, goods_type
+FROM public.ai_site_openai_responses
+WHERE domain = :domain
+ORDER BY created_at DESC, id DESC;
 ```
 
 ## Когда срабатывает фолбэк по ОКВЭД
