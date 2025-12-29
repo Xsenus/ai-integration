@@ -1588,6 +1588,47 @@ async def _apply_db_payload(
                         "okved_score": okved_score_param,
                         "prodclass_by_okved": prodclass_by_okved_value,
                     }
+                else:
+                    set_clauses = ["prodclass = :prodclass", "prodclass_score = :score"]
+                    if prodclass_has_okved_score:
+                        set_clauses.append("description_okved_score = :description_okved_score")
+                    if prodclass_has_description_score:
+                        set_clauses.append("description_score = :description_score")
+                    if prodclass_has_okved_score_value:
+                        set_clauses.append("okved_score = :okved_score")
+                    if prodclass_has_okved_fallback:
+                        set_clauses.append("prodclass_by_okved = :prodclass_by_okved")
+                    update_prodclass_sql = (
+                        "UPDATE public.ai_site_prodclass " f"SET {', '.join(set_clauses)}"
+                    )
+                    if prodclass_has_created_at:
+                        update_prodclass_sql += ", created_at = TIMEZONE('UTC', now())"
+                    update_prodclass_sql += " WHERE id = :row_id"
+                    log.info(
+                        "analyze-json: updating prodclass (pars_id=%s, prodclass=%s, score=%s, desc_okved=%s, source=%s) using SQL: %s",
+                        snapshot.pars_id,
+                        candidate_prodclass_id,
+                        score_to_use,
+                        description_okved_score,
+                        prodclass_source,
+                        update_prodclass_sql,
+                    )
+                    await conn.execute(
+                        text(update_prodclass_sql),
+                        {
+                            **params,
+                            "row_id": prodclass_row.get("id"),
+                        },
+                    )
+                    prodclass_row = {
+                        "id": prodclass_row.get("id"),
+                        "prodclass": candidate_prodclass_id,
+                        "prodclass_score": score_to_use,
+                        "description_okved_score": description_okved_score,
+                        "description_score": description_score_to_use,
+                        "okved_score": okved_score_param,
+                        "prodclass_by_okved": prodclass_by_okved_value,
+                    }
 
         elif prodclass_row is not None and prodclass_has_okved_fallback:
             updated_clauses: list[str] = []
@@ -1648,51 +1689,6 @@ async def _apply_db_payload(
                     "description_score": params.get("description_score", prodclass_row.get("description_score")),
                     "okved_score": params.get("okved_score", prodclass_row.get("okved_score")),
                 }
-                else:
-                    set_clauses = ["prodclass = :prodclass", "prodclass_score = :score"]
-                    if prodclass_has_okved_score:
-                        set_clauses.append(
-                            "description_okved_score = :description_okved_score"
-                        )
-                    if prodclass_has_description_score:
-                        set_clauses.append("description_score = :description_score")
-                    if prodclass_has_okved_score_value:
-                        set_clauses.append("okved_score = :okved_score")
-                    if prodclass_has_okved_fallback:
-                        set_clauses.append("prodclass_by_okved = :prodclass_by_okved")
-                    update_prodclass_sql = (
-                        "UPDATE public.ai_site_prodclass "
-                        f"SET {', '.join(set_clauses)}"
-                    )
-                    if prodclass_has_created_at:
-                        update_prodclass_sql += ", created_at = TIMEZONE('UTC', now())"
-                    update_prodclass_sql += " WHERE id = :row_id"
-                    log.info(
-                        "analyze-json: updating prodclass (pars_id=%s, prodclass=%s, score=%s, desc_okved=%s, source=%s) using SQL: %s",
-                        snapshot.pars_id,
-                        candidate_prodclass_id,
-                        score_to_use,
-                        description_okved_score,
-                        prodclass_source,
-                        update_prodclass_sql,
-                    )
-                    await conn.execute(
-                        text(update_prodclass_sql),
-                        {
-                            **params,
-                            "row_id": prodclass_row.get("id"),
-                        },
-                    )
-                    prodclass_row = {
-                        "id": prodclass_row.get("id"),
-                        "prodclass": candidate_prodclass_id,
-                        "prodclass_score": score_to_use,
-                        "description_okved_score": description_okved_score,
-                        "description_score": description_score_to_use,
-                        "okved_score": okved_score_param,
-                        "prodclass_by_okved": prodclass_by_okved_value,
-                    }
-
         if prodclass_row is not None:
             prodclass_id = _safe_int(prodclass_row.get("prodclass"))
             prodclass_score = _normalize_score(prodclass_row.get("prodclass_score"))
