@@ -1225,11 +1225,21 @@ def _sanitize_db_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 value.get("score")
                 or value.get("prodclass_score")
             )
+            description_okved_score = _normalize_score(
+                value.get("description_okved_score")
+            )
+            description_score = _normalize_score(value.get("description_score"))
+            okved_score = _normalize_score(value.get("okved_score"))
+            prodclass_by_okved = _safe_int(value.get("prodclass_by_okved"))
             sanitized[key] = _compact_dict(
                 {
                     "id": candidate_id,
                     "score": candidate_score,
                     "name": (value.get("name") or value.get("prodclass_name") or "").strip() or None,
+                    "description_okved_score": description_okved_score,
+                    "description_score": description_score,
+                    "okved_score": okved_score,
+                    "prodclass_by_okved": prodclass_by_okved,
                 }
             )
             continue
@@ -1340,6 +1350,12 @@ async def _apply_db_payload(
     vector_literal = _vector_to_literal(payload.get("description_vector")) if vector_present else None
 
     payload_lower = {str(k).lower(): v for k, v in payload.items()}
+    prodclass_payload = payload.get("prodclass") if isinstance(payload, Mapping) else None
+    prodclass_lower = (
+        {str(k).lower(): v for k, v in prodclass_payload.items()}
+        if isinstance(prodclass_payload, Mapping)
+        else {}
+    )
 
     async with engine.begin() as conn:
         prodclass_row: Optional[dict[str, Any]] = None
@@ -1408,9 +1424,19 @@ async def _apply_db_payload(
             if okved_data:
                 okved_main = okved_data.get("okved_main")
 
-        okved_score_payload = _normalize_score(payload_lower.get("okved_score"))
-        description_score_payload = _normalize_score(payload_lower.get("description_score"))
-        prodclass_by_okved_value = _safe_int(payload_lower.get("prodclass_by_okved"))
+        okved_score_payload = _normalize_score(
+            payload_lower.get("okved_score")
+            or prodclass_lower.get("okved_score")
+            or prodclass_lower.get("description_okved_score")
+        )
+        description_score_payload = _normalize_score(
+            payload_lower.get("description_score")
+            or prodclass_lower.get("description_score")
+        )
+        prodclass_by_okved_value = _safe_int(
+            payload_lower.get("prodclass_by_okved")
+            or prodclass_lower.get("prodclass_by_okved")
+        )
 
         description_okved_score = okved_score_payload
         if prodclass_has_okved_score and description_okved_score is None:
