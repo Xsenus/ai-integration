@@ -657,6 +657,9 @@ def _select_primary_prodclass(
         label = _format_with_id(name, prodclass_id if prodclass_id is not None else identifier)
         score = _as_float(row.get("prodclass_score"))
         description_okved_score = _as_float(row.get("description_okved_score"))
+        description_score = _as_float(row.get("description_score"))
+        okved_score = _as_float(row.get("okved_score"))
+        prodclass_by_okved = _safe_int(row.get("prodclass_by_okved"))
         result = {
             "id": prodclass_id,
             "name": name,
@@ -665,6 +668,12 @@ def _select_primary_prodclass(
         }
         if description_okved_score is not None:
             result["description_okved_score"] = description_okved_score
+        if description_score is not None:
+            result["description_score"] = description_score
+        if okved_score is not None:
+            result["okved_score"] = okved_score
+        if prodclass_by_okved is not None:
+            result["prodclass_by_okved"] = prodclass_by_okved
         return result
     return None
 
@@ -927,11 +936,26 @@ async def analyze_company_by_inn(inn: str) -> dict:
                 has_okved_score = await _column_exists(
                     conn, "public", "ai_site_prodclass", "description_okved_score"
                 )
+                has_description_score = await _column_exists(
+                    conn, "public", "ai_site_prodclass", "description_score"
+                )
+                has_okved_score_value = await _column_exists(
+                    conn, "public", "ai_site_prodclass", "okved_score"
+                )
+                has_prodclass_by_okved = await _column_exists(
+                    conn, "public", "ai_site_prodclass", "prodclass_by_okved"
+                )
                 prod_columns = (
                     "pc.id, pc.text_pars_id, pc.prodclass, pc.prodclass_score,"
                 )
                 if has_okved_score:
                     prod_columns += " pc.description_okved_score,"
+                if has_description_score:
+                    prod_columns += " pc.description_score,"
+                if has_okved_score_value:
+                    prod_columns += " pc.okved_score,"
+                if has_prodclass_by_okved:
+                    prod_columns += " pc.prodclass_by_okved,"
                 sql_prod = text(
                     f"""
                     SELECT {prod_columns}
@@ -1084,8 +1108,10 @@ async def analyze_company_by_inn(inn: str) -> dict:
         industry = _okved_to_industry(okved_src)
 
     description_okved_score: Optional[float] = None
+    okved_score_value: Optional[float] = None
     if primary_prodclass:
         description_okved_score = primary_prodclass.get("description_okved_score")
+        okved_score_value = primary_prodclass.get("okved_score")
     if description_okved_score is None:
         okved_src_for_score = (cr or {}).get("okved_main") if cr else None
         if not okved_src_for_score:
@@ -1094,9 +1120,15 @@ async def analyze_company_by_inn(inn: str) -> dict:
         description_okved_score = _compute_description_okved_score(
             joined_description, okved_src_for_score
         )
+        if okved_score_value is None:
+            okved_score_value = description_okved_score
         if primary_prodclass and description_okved_score is not None:
             primary_prodclass = dict(primary_prodclass)
             primary_prodclass["description_okved_score"] = description_okved_score
+    if primary_prodclass and okved_score_value is not None:
+        if not isinstance(primary_prodclass, dict):
+            primary_prodclass = dict(primary_prodclass)
+        primary_prodclass.setdefault("okved_score", okved_score_value)
 
     utp = (cr or {}).get("utp") if cr else None
     letter = (cr or {}).get("pismo") if cr else None

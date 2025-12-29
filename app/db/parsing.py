@@ -663,6 +663,9 @@ async def ensure_parsing_schema() -> None:
                 text_pars_id BIGINT NOT NULL REFERENCES public.pars_site(id) ON UPDATE CASCADE ON DELETE CASCADE,
                 prodclass INT NOT NULL,
                 prodclass_score NUMERIC(4,2),
+                description_score NUMERIC(6,4),
+                okved_score NUMERIC(6,4),
+                prodclass_by_okved INT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 CONSTRAINT chk_ai_site_prodclass_score CHECK (
                     prodclass_score IS NULL OR (prodclass_score >= 0.00 AND prodclass_score <= 1.00)

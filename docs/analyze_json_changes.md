@@ -20,3 +20,9 @@
 ## Поведение при пустом `company_id`
 * `company_id` теперь передаётся только если он присутствует в снимке. Это соответствует схеме запроса и избавляет внешний сервис от `null` значений в верхнем уровне.
 
+## Новые поля ответа внешнего сервиса (DESCRIPTION_SCORE/OKVED_SCORE/PRODCLASS_by_OKVED)
+* Таблица `ai_site_prodclass` дополнена колонками `description_score`, `okved_score` и `prodclass_by_okved`. Они создаются автоматически при первом же сохранении `db_payload`, даже если база была развёрнута ранее.
+* В `db_payload` поддерживаются новые ключи `description_score`, `okved_score` и `prodclass_by_okved`. При их наличии значения записываются в `ai_site_prodclass`; при отсутствии сервис сохраняет прошлые значения или рассчитывает `okved_score` на основе `description_okved_score`.
+* Если сайт недоступен и внешний сервис возвращает только `prodclass_by_okved`, класс сохраняется в `ai_site_prodclass`, чтобы последующие вызовы `/v1/lookup/{inn}/ai-analyzer` показывали хотя бы ОКВЭД-базовую классификацию.
+* Ответ `AI-анализатора` дополнен полями `description_score`, `okved_score` и `prodclass_by_okved` в блоке `ai.prodclass`, поэтому фронт может выводить новые метрики без дополнительной обработки.
+
