@@ -2227,12 +2227,14 @@ async def _apply_db_payload(
                     INSERT INTO public.ai_site_openai_responses (
                         text_pars_id, company_id, domain, url,
                         description, description_score, okved_score, prodclass_by_okved,
-                        prodclass, prodclass_score, equipment_site, goods, goods_type
+                        prodclass, prodclass_score, equipment_site, goods, goods_type,
+                        created_at
                     )
                     VALUES (
                         :text_pars_id, :company_id, :domain, :url,
                         :description, :description_score, :okved_score, :prodclass_by_okved,
-                        :prodclass, :prodclass_score, :equipment_site, :goods, :goods_type
+                        :prodclass, :prodclass_score, :equipment_site, :goods, :goods_type,
+                        now()
                     )
                     """
                 ),
