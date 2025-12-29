@@ -1334,6 +1334,68 @@ def _sanitize_external_response(payload: Any) -> Any:
     return payload
 
 
+def _merge_parsed_scores_into_db_payload(
+    db_payload: Mapping[str, Any], parsed_payload: Any
+) -> Mapping[str, Any]:
+    """Добавляет оценки из блока parsed в db_payload, если их там нет."""
+
+    if not isinstance(db_payload, Mapping) or not isinstance(parsed_payload, Mapping):
+        return db_payload
+
+    merged: dict[str, Any] = {**db_payload}
+    parsed_lower = {str(k).lower(): v for k, v in parsed_payload.items()}
+
+    if merged.get("description_score") is None:
+        description_score = _normalize_score(
+            parsed_lower.get("description_score")
+            or parsed_lower.get("description_score_raw")
+        )
+        if description_score is not None:
+            merged["description_score"] = description_score
+
+    if merged.get("okved_score") is None:
+        okved_score = _normalize_score(
+            parsed_lower.get("okved_score") or parsed_lower.get("okved_score_raw")
+        )
+        if okved_score is not None:
+            merged["okved_score"] = okved_score
+
+    if merged.get("prodclass_by_okved") is None:
+        prodclass_by_okved = _safe_int(parsed_lower.get("prodclass_by_okved"))
+        if prodclass_by_okved is not None:
+            merged["prodclass_by_okved"] = prodclass_by_okved
+
+    prodclass_payload = merged.get("prodclass")
+    if isinstance(prodclass_payload, Mapping):
+        updated_prodclass = dict(prodclass_payload)
+
+        if updated_prodclass.get("id") is None:
+            candidate_prodclass_id = _safe_int(parsed_lower.get("prodclass"))
+            if candidate_prodclass_id is not None:
+                updated_prodclass["id"] = candidate_prodclass_id
+
+        if updated_prodclass.get("score") is None:
+            candidate_prodclass_score = _normalize_score(
+                parsed_lower.get("prodclass_score")
+                or parsed_lower.get("prodclass_score_raw")
+            )
+            if candidate_prodclass_score is not None:
+                updated_prodclass["score"] = candidate_prodclass_score
+
+        merged["prodclass"] = updated_prodclass
+
+    elif _safe_int(parsed_lower.get("prodclass")) is not None:
+        merged["prodclass"] = {
+            "id": _safe_int(parsed_lower.get("prodclass")),
+            "score": _normalize_score(
+                parsed_lower.get("prodclass_score")
+                or parsed_lower.get("prodclass_score_raw")
+            ),
+        }
+
+    return merged
+
+
 def _iter_text_fragments(payload: Any) -> Iterable[str]:
     if isinstance(payload, Mapping):
         for value in payload.values():
@@ -2745,6 +2807,10 @@ async def _run_analyze(
                     "response": response_json,
                 },
             )
+
+        db_payload = _merge_parsed_scores_into_db_payload(
+            db_payload, response_json.get("parsed")
+        )
 
         goods_saved, equipment_saved, prodclass_id, prodclass_score = await _apply_db_payload(
             engine,
