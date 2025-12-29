@@ -435,6 +435,17 @@ def _vector_values_to_literal(values: Sequence[float]) -> str:
     return json.dumps(list(values), ensure_ascii=False, separators=(",", ":"))
 
 
+def _json_dump_or_none(value: Any) -> Optional[str]:
+    """Сериализует значение в JSON-строку для хранения в JSONB-колонках."""
+
+    if value in (None, ""):
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _build_catalog_vector_payload(value: Any) -> Optional[dict[str, Any]]:
     """Формирует структуру CatalogVector c literal и values, если возможно."""
 
@@ -2265,6 +2276,10 @@ async def _apply_db_payload(
             if item.get("name")
         ]
 
+        goods_json = _json_dump_or_none(goods_values or None)
+        goods_type_json = _json_dump_or_none(goods_type_values or None)
+        equipment_json = _json_dump_or_none(equipment_values or None)
+
         prodclass_row_prodclass = _safe_int(prodclass_row.get("prodclass")) if prodclass_row else None
         prodclass_row_score = (
             _normalize_score(prodclass_row.get("prodclass_score")) if prodclass_row else None
@@ -2281,9 +2296,9 @@ async def _apply_db_payload(
             "prodclass_by_okved": prodclass_by_okved_value,
             "prodclass": prodclass_row_prodclass,
             "prodclass_score": prodclass_row_score,
-            "equipment_site": equipment_values or None,
-            "goods": goods_values or None,
-            "goods_type": goods_type_values or None,
+            "equipment_site": equipment_json,
+            "goods": goods_json,
+            "goods_type": goods_type_json,
         }
 
         insert_openai_sql = text(
