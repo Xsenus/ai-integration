@@ -1527,74 +1527,84 @@ async def _apply_db_payload(
             prodclass_exists = await _prodclass_exists(conn, candidate_prodclass_id)
             if not prodclass_exists:
                 log.warning(
-                    "analyze-json: ib_prodclass is missing entry id=%s (pars_id=%s) — storing prodclass anyway for visibility",
+                    "analyze-json: ib_prodclass is missing entry id=%s (pars_id=%s) — skipping prodclass write to avoid FK error",
                     candidate_prodclass_id,
                     snapshot.pars_id,
                 )
                 if prodclass_by_okved_value is None:
                     prodclass_by_okved_value = candidate_prodclass_id
-                if candidate_prodclass_score is None:
-                    candidate_prodclass_score = okved_score_to_use or description_okved_score
+                candidate_prodclass_id = None
+                candidate_prodclass_score = None
 
             score_to_use = candidate_prodclass_score
             if prodclass_row is not None and score_to_use is None:
                 score_to_use = _normalize_score(prodclass_row.get("prodclass_score"))
 
+            if candidate_prodclass_id is None:
+                score_to_use = None
+
             params = {
                 "pid": snapshot.pars_id,
-                "prodclass": candidate_prodclass_id,
-                "score": score_to_use,
                 "description_okved_score": description_okved_score,
                 "description_score": description_score_to_use,
                 "okved_score": okved_score_param,
                 "prodclass_by_okved": prodclass_by_okved_value,
             }
+            if candidate_prodclass_id is not None:
+                params["prodclass"] = candidate_prodclass_id
+                params["score"] = score_to_use
 
             if prodclass_row is None:
-                columns = ["text_pars_id", "prodclass", "prodclass_score"]
-                values = [":pid", ":prodclass", ":score"]
-                if prodclass_has_okved_score:
+                columns = ["text_pars_id"]
+                values = [":pid"]
+                if candidate_prodclass_id is not None:
+                    columns.extend(["prodclass", "prodclass_score"])
+                    values.extend([":prodclass", ":score"])
+                if prodclass_has_okved_score and "description_okved_score" in params:
                     columns.append("description_okved_score")
                     values.append(":description_okved_score")
-                if prodclass_has_description_score:
+                if prodclass_has_description_score and "description_score" in params:
                     columns.append("description_score")
                     values.append(":description_score")
-                if prodclass_has_okved_score_value:
+                if prodclass_has_okved_score_value and "okved_score" in params:
                     columns.append("okved_score")
                     values.append(":okved_score")
-                if prodclass_has_okved_fallback:
+                if prodclass_has_okved_fallback and "prodclass_by_okved" in params:
                     columns.append("prodclass_by_okved")
                     values.append(":prodclass_by_okved")
 
-                insert_prodclass_sql = (
-                    "INSERT INTO public.ai_site_prodclass "
-                    f"({', '.join(columns)}) "
-                    f"VALUES ({', '.join(values)}) RETURNING id"
-                )
-                log.info(
-                    "analyze-json: inserting prodclass (pars_id=%s, prodclass=%s, score=%s, desc_okved=%s, source=%s) using SQL: %s",
-                    snapshot.pars_id,
-                    candidate_prodclass_id,
-                    score_to_use,
-                    description_okved_score,
-                    prodclass_source,
-                    insert_prodclass_sql,
-                )
-                insert_result = await conn.execute(
-                    text(insert_prodclass_sql),
-                    params,
-                )
-                prodclass_row = {
-                    "id": insert_result.scalar_one(),
-                    "prodclass": candidate_prodclass_id,
-                    "prodclass_score": score_to_use,
-                    "description_okved_score": description_okved_score,
-                    "description_score": description_score_to_use,
-                    "okved_score": okved_score_param,
-                    "prodclass_by_okved": prodclass_by_okved_value,
-                }
+                if len(columns) > 1:
+                    insert_prodclass_sql = (
+                        "INSERT INTO public.ai_site_prodclass "
+                        f"({', '.join(columns)}) "
+                        f"VALUES ({', '.join(values)}) RETURNING id"
+                    )
+                    log.info(
+                        "analyze-json: inserting prodclass (pars_id=%s, prodclass=%s, score=%s, desc_okved=%s, source=%s) using SQL: %s",
+                        snapshot.pars_id,
+                        candidate_prodclass_id,
+                        score_to_use,
+                        description_okved_score,
+                        prodclass_source,
+                        insert_prodclass_sql,
+                    )
+                    insert_result = await conn.execute(
+                        text(insert_prodclass_sql),
+                        params,
+                    )
+                    prodclass_row = {
+                        "id": insert_result.scalar_one(),
+                        "prodclass": candidate_prodclass_id,
+                        "prodclass_score": score_to_use,
+                        "description_okved_score": description_okved_score,
+                        "description_score": description_score_to_use,
+                        "okved_score": okved_score_param,
+                        "prodclass_by_okved": prodclass_by_okved_value,
+                    }
             else:
-                set_clauses = ["prodclass = :prodclass", "prodclass_score = :score"]
+                set_clauses: list[str] = []
+                if candidate_prodclass_id is not None:
+                    set_clauses.extend(["prodclass = :prodclass", "prodclass_score = :score"])
                 if prodclass_has_okved_score:
                     set_clauses.append("description_okved_score = :description_okved_score")
                 if prodclass_has_description_score:
@@ -1603,37 +1613,39 @@ async def _apply_db_payload(
                     set_clauses.append("okved_score = :okved_score")
                 if prodclass_has_okved_fallback:
                     set_clauses.append("prodclass_by_okved = :prodclass_by_okved")
-                update_prodclass_sql = (
-                    "UPDATE public.ai_site_prodclass " f"SET {', '.join(set_clauses)}"
-                )
-                if prodclass_has_created_at:
-                    update_prodclass_sql += ", created_at = TIMEZONE('UTC', now())"
-                update_prodclass_sql += " WHERE id = :row_id"
-                log.info(
-                    "analyze-json: updating prodclass (pars_id=%s, prodclass=%s, score=%s, desc_okved=%s, source=%s) using SQL: %s",
-                    snapshot.pars_id,
-                    candidate_prodclass_id,
-                    score_to_use,
-                    description_okved_score,
-                    prodclass_source,
-                    update_prodclass_sql,
-                )
-                await conn.execute(
-                    text(update_prodclass_sql),
-                    {
-                        **params,
-                        "row_id": prodclass_row.get("id"),
-                    },
-                )
-                prodclass_row = {
-                    "id": prodclass_row.get("id"),
-                    "prodclass": candidate_prodclass_id,
-                    "prodclass_score": score_to_use,
-                    "description_okved_score": description_okved_score,
-                    "description_score": description_score_to_use,
-                    "okved_score": okved_score_param,
-                    "prodclass_by_okved": prodclass_by_okved_value,
-                }
+
+                if set_clauses:
+                    update_prodclass_sql = (
+                        "UPDATE public.ai_site_prodclass " f"SET {', '.join(set_clauses)}"
+                    )
+                    if prodclass_has_created_at:
+                        update_prodclass_sql += ", created_at = TIMEZONE('UTC', now())"
+                    update_prodclass_sql += " WHERE id = :row_id"
+                    log.info(
+                        "analyze-json: updating prodclass (pars_id=%s, prodclass=%s, score=%s, desc_okved=%s, source=%s) using SQL: %s",
+                        snapshot.pars_id,
+                        candidate_prodclass_id,
+                        score_to_use,
+                        description_okved_score,
+                        prodclass_source,
+                        update_prodclass_sql,
+                    )
+                    await conn.execute(
+                        text(update_prodclass_sql),
+                        {
+                            **params,
+                            "row_id": prodclass_row.get("id"),
+                        },
+                    )
+                    prodclass_row = {
+                        "id": prodclass_row.get("id"),
+                        "prodclass": candidate_prodclass_id,
+                        "prodclass_score": score_to_use,
+                        "description_okved_score": description_okved_score,
+                        "description_score": description_score_to_use,
+                        "okved_score": okved_score_param,
+                        "prodclass_by_okved": prodclass_by_okved_value,
+                    }
 
         elif prodclass_row is not None and prodclass_has_okved_fallback:
             updated_clauses: list[str] = []
