@@ -1486,6 +1486,10 @@ async def _apply_db_payload(
                     prodclass_row.get("prodclass_by_okved")
                 )
 
+        okved_score_param = okved_score_to_use
+        if okved_score_param is None and description_okved_score is not None:
+            okved_score_param = _normalize_score(description_okved_score)
+
         raw_prod = payload.get("prodclass")
         candidate_prodclass_id = None
         candidate_prodclass_score = None
@@ -1510,6 +1514,15 @@ async def _apply_db_payload(
                 snapshot.pars_id,
             )
 
+        if (
+            candidate_prodclass_id is None
+            and prodclass_by_okved_value is not None
+            and prodclass_row is None
+        ):
+            candidate_prodclass_id = prodclass_by_okved_value
+            candidate_prodclass_score = okved_score_to_use or description_okved_score
+            prodclass_source = "prodclass_by_okved"
+
         if candidate_prodclass_id is not None:
             if not await _prodclass_exists(conn, candidate_prodclass_id):
                 log.warning(
@@ -1521,10 +1534,6 @@ async def _apply_db_payload(
                 score_to_use = candidate_prodclass_score
                 if prodclass_row is not None and score_to_use is None:
                     score_to_use = _normalize_score(prodclass_row.get("prodclass_score"))
-
-                okved_score_param = okved_score_to_use
-                if okved_score_param is None and description_okved_score is not None:
-                    okved_score_param = _normalize_score(description_okved_score)
 
                 params = {
                     "pid": snapshot.pars_id,
@@ -1582,9 +1591,7 @@ async def _apply_db_payload(
                 else:
                     set_clauses = ["prodclass = :prodclass", "prodclass_score = :score"]
                     if prodclass_has_okved_score:
-                        set_clauses.append(
-                            "description_okved_score = :description_okved_score"
-                        )
+                        set_clauses.append("description_okved_score = :description_okved_score")
                     if prodclass_has_description_score:
                         set_clauses.append("description_score = :description_score")
                     if prodclass_has_okved_score_value:
@@ -1592,8 +1599,7 @@ async def _apply_db_payload(
                     if prodclass_has_okved_fallback:
                         set_clauses.append("prodclass_by_okved = :prodclass_by_okved")
                     update_prodclass_sql = (
-                        "UPDATE public.ai_site_prodclass "
-                        f"SET {', '.join(set_clauses)}"
+                        "UPDATE public.ai_site_prodclass " f"SET {', '.join(set_clauses)}"
                     )
                     if prodclass_has_created_at:
                         update_prodclass_sql += ", created_at = TIMEZONE('UTC', now())"
@@ -1624,6 +1630,65 @@ async def _apply_db_payload(
                         "prodclass_by_okved": prodclass_by_okved_value,
                     }
 
+        elif prodclass_row is not None and prodclass_has_okved_fallback:
+            updated_clauses: list[str] = []
+            params: dict[str, Any] = {"row_id": prodclass_row.get("id")}
+
+            if (
+                prodclass_has_okved_fallback
+                and prodclass_by_okved_value is not None
+                and _safe_int(prodclass_row.get("prodclass_by_okved"))
+                != prodclass_by_okved_value
+            ):
+                updated_clauses.append("prodclass_by_okved = :prodclass_by_okved")
+                params["prodclass_by_okved"] = prodclass_by_okved_value
+
+            if (
+                prodclass_has_okved_score
+                and description_okved_score is not None
+                and _normalize_score(prodclass_row.get("description_okved_score"))
+                != _normalize_score(description_okved_score)
+            ):
+                updated_clauses.append("description_okved_score = :description_okved_score")
+                params["description_okved_score"] = description_okved_score
+
+            if (
+                prodclass_has_description_score
+                and description_score_to_use is not None
+                and _normalize_score(prodclass_row.get("description_score"))
+                != _normalize_score(description_score_to_use)
+            ):
+                updated_clauses.append("description_score = :description_score")
+                params["description_score"] = description_score_to_use
+
+            if (
+                prodclass_has_okved_score_value
+                and okved_score_param is not None
+                and _normalize_score(prodclass_row.get("okved_score"))
+                != _normalize_score(okved_score_param)
+            ):
+                updated_clauses.append("okved_score = :okved_score")
+                params["okved_score"] = okved_score_param
+
+            if updated_clauses:
+                update_prodclass_sql = (
+                    "UPDATE public.ai_site_prodclass "
+                    f"SET {', '.join(updated_clauses)} WHERE id = :row_id"
+                )
+                log.info(
+                    "analyze-json: updating prodclass metrics (pars_id=%s, prodclass_by_okved=%s) using SQL: %s",
+                    snapshot.pars_id,
+                    prodclass_by_okved_value,
+                    update_prodclass_sql,
+                )
+                await conn.execute(text(update_prodclass_sql), params)
+                prodclass_row = {
+                    **(prodclass_row or {}),
+                    "prodclass_by_okved": params.get("prodclass_by_okved", prodclass_row.get("prodclass_by_okved")),
+                    "description_okved_score": params.get("description_okved_score", prodclass_row.get("description_okved_score")),
+                    "description_score": params.get("description_score", prodclass_row.get("description_score")),
+                    "okved_score": params.get("okved_score", prodclass_row.get("okved_score")),
+                }
         if prodclass_row is not None:
             prodclass_id = _safe_int(prodclass_row.get("prodclass"))
             prodclass_score = _normalize_score(prodclass_row.get("prodclass_score"))
