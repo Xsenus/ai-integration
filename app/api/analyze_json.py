@@ -1334,6 +1334,8 @@ async def _apply_db_payload(
     equipment_saved = 0
     prodclass_id: Optional[int] = None
     prodclass_score: Optional[float] = None
+    normalized_goods_payload: list[dict[str, Any]] = []
+    normalized_equipment_payload: list[dict[str, Any]] = []
 
     log.info(
         "analyze-json: applying db_payload (pars_id=%s, company_id=%s)",
@@ -1750,6 +1752,8 @@ async def _apply_db_payload(
                         }
                     )
 
+            normalized_goods_payload = normalized_goods
+
             if not normalized_goods:
                 log.info(
                     "analyze-json: goods payload empty — existing rows remain untouched (pars_id=%s)",
@@ -1987,6 +1991,8 @@ async def _apply_db_payload(
                         }
                     )
 
+            normalized_equipment_payload = normalized_equipment
+
             if not normalized_equipment:
                 log.info(
                     "analyze-json: equipment payload empty — existing rows remain untouched (pars_id=%s)",
@@ -2194,6 +2200,64 @@ async def _apply_db_payload(
                         text("DELETE FROM public.ai_site_equipment WHERE id = :row_id"),
                         {"row_id": row_id},
                     )
+
+        goods_values = [item.get("name") for item in normalized_goods_payload if item.get("name")]
+        equipment_values = [
+            item.get("name") for item in normalized_equipment_payload if item.get("name")
+        ]
+        goods_type_values = [
+            {
+                "name": item.get("name"),
+                "match_id": item.get("match_id"),
+                "score": item.get("score"),
+            }
+            for item in normalized_goods_payload
+            if item.get("name")
+        ]
+
+        prodclass_row_prodclass = _safe_int(prodclass_row.get("prodclass")) if prodclass_row else None
+        prodclass_row_score = (
+            _normalize_score(prodclass_row.get("prodclass_score")) if prodclass_row else None
+        )
+
+        try:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO public.ai_site_openai_responses (
+                        text_pars_id, company_id, domain, url,
+                        description, description_score, okved_score, prodclass_by_okved,
+                        prodclass, prodclass_score, equipment_site, goods, goods_type
+                    )
+                    VALUES (
+                        :text_pars_id, :company_id, :domain, :url,
+                        :description, :description_score, :okved_score, :prodclass_by_okved,
+                        :prodclass, :prodclass_score, :equipment_site, :goods, :goods_type
+                    )
+                    """
+                ),
+                {
+                    "text_pars_id": snapshot.pars_id,
+                    "company_id": snapshot.company_id,
+                    "domain": snapshot.domain,
+                    "url": snapshot.url,
+                    "description": description_value,
+                    "description_score": description_score_to_use,
+                    "okved_score": okved_score_param,
+                    "prodclass_by_okved": prodclass_by_okved_value,
+                    "prodclass": prodclass_row_prodclass,
+                    "prodclass_score": prodclass_row_score,
+                    "equipment_site": equipment_values or None,
+                    "goods": goods_values or None,
+                    "goods_type": goods_type_values or None,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "analyze-json: failed to store full openai response (pars_id=%s): %s",
+                snapshot.pars_id,
+                exc,
+            )
 
     log.info(
         "analyze-json: db_payload applied (pars_id=%s, goods_saved=%s, equipment_saved=%s, prodclass=%s, prodclass_score=%s)",

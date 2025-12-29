@@ -17,6 +17,12 @@
   * `text_pars_id` (внешний ключ на `pars_site.id`), опционально `created_at`.
 * При отсутствии `prodclass` в ответе сервис записывает `prodclass_by_okved` и использует `okved_score`/`description_okved_score` как оценку.
 
+### `public.ai_site_openai_responses`
+* Лог ответов внешнего анализа по каждому домену/компании.
+* Связки: `text_pars_id` → `pars_site.id`, `company_id` → `clients_requests.id`.
+* Содержит сырой текст описания (`description`), метрики (`description_score`, `okved_score`, `prodclass_by_okved`, `prodclass`, `prodclass_score`) и списки (`equipment_site`, `goods`, `goods_type`).
+* Создаётся автоматически вместе с остальными таблицами `parsing_data`.
+
 ### `public.ai_site_goods_types`
 * Список товаров/услуг: `goods_type` (название), `goods_type_id`/`match_id`, `goods_types_score`, `text_vector`.
 * Каждая строка связана с конкретным парсом через `text_par_id` (`pars_site.id`).
