@@ -146,3 +146,38 @@ def test_apply_prodclass_name_fallback_preserves_custom_label():
 
     assert updated["name"] == "Добыча меди"
     assert updated["label"] == "[17] Кастом"
+
+
+def test_select_primary_prodclass_carries_new_scores_and_fallback():
+    prod_rows = [
+        {
+            "prodclass": 31,
+            "prodclass_score": 0.85,
+            "description_okved_score": 0.9,
+            "description_score": 0.95,
+            "okved_score": 0.9,
+            "prodclass_by_okved": 99,
+        }
+    ]
+
+    lookup = {
+        31: {
+            "text": "Литейные предприятия чёрных металлов",
+        },
+        99: {
+            "text": "Фолбэк по ОКВЭД",
+        },
+    }
+
+    result = _select_primary_prodclass(prod_rows, lookup)
+
+    assert result == {
+        "id": 31,
+        "name": "Литейные предприятия чёрных металлов",
+        "label": "[31] Литейные предприятия чёрных металлов",
+        "score": 0.85,
+        "description_okved_score": 0.9,
+        "description_score": 0.95,
+        "okved_score": 0.9,
+        "prodclass_by_okved": 99,
+    }
