@@ -1225,11 +1225,21 @@ def _sanitize_db_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 value.get("score")
                 or value.get("prodclass_score")
             )
+            description_okved_score = _normalize_score(
+                value.get("description_okved_score")
+            )
+            description_score = _normalize_score(value.get("description_score"))
+            okved_score = _normalize_score(value.get("okved_score"))
+            prodclass_by_okved = _safe_int(value.get("prodclass_by_okved"))
             sanitized[key] = _compact_dict(
                 {
                     "id": candidate_id,
                     "score": candidate_score,
                     "name": (value.get("name") or value.get("prodclass_name") or "").strip() or None,
+                    "description_okved_score": description_okved_score,
+                    "description_score": description_score,
+                    "okved_score": okved_score,
+                    "prodclass_by_okved": prodclass_by_okved,
                 }
             )
             continue
