@@ -592,8 +592,29 @@ async def assign_ib_matches_by_inn(*, inn: str, reembed_if_exists: bool) -> dict
         result = await conn.execute(query, {"inn": normalized_inn})
         candidate_ids = [int(row["id"]) for row in result.mappings()]
 
+        if not candidate_ids:
+            log.info(
+                "ib-match: clients_requests not found in public for INN %s — trying parsing_data",
+                normalized_inn,
+            )
+            fallback_query = text(
+                """
+                SELECT id
+                FROM parsing_data.clients_requests
+                WHERE inn = :inn
+                ORDER BY COALESCE(ended_at, created_at) DESC NULLS LAST, id DESC
+                """
+            )
+            fallback_result = await conn.execute(
+                fallback_query, {"inn": normalized_inn}
+            )
+            candidate_ids = [int(row["id"]) for row in fallback_result.mappings()]
+
     if not candidate_ids:
-        log.info("ib-match: clients_requests not found for INN %s", normalized_inn)
+        log.info(
+            "ib-match: clients_requests not found for INN %s even in parsing_data",
+            normalized_inn,
+        )
         raise IbMatchServiceError("Не найдена запись clients_requests по ИНН", status_code=404)
 
     log.info(
