@@ -249,10 +249,71 @@ async def fetch_embedding(text: str, *, label: str) -> Optional[list[float]]:
     return None
 
 
+async def fetch_prodclass_by_okved(
+    okved: str,
+    *,
+    label: str,
+) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    payload = {"okved": okved}
+
+    base_url = get_analyze_base_url()
+    if not base_url:
+        log.warning("analyze-client: ANALYZE_BASE не настроен (%s)", label)
+        return None, None, None
+
+    await ensure_service_available(base_url, label=f"health:{label}")
+
+    response = await _post_with_retries(
+        base_url,
+        "/v1/prompts/site-unavailable",
+        payload,
+        label=label,
+    )
+    if response is None:
+        return None, None, None
+    if response.status_code >= 400:
+        log.warning(
+            "analyze-client: внешний сервис вернул %s (%s @ %s)",
+            response.status_code,
+            label,
+            base_url,
+        )
+        return None, None, None
+
+    try:
+        data = response.json()
+    except ValueError:  # noqa: BLE001
+        log.warning("analyze-client: не-JSON ответ (%s @ %s)", label, base_url)
+        return None, None, None
+
+    prompt_raw = data.get("prompt") or data.get("request")
+    prompt = prompt_raw.strip() if isinstance(prompt_raw, str) else None
+
+    raw_response_value = data.get("raw_response") or data.get("response")
+    raw_response = str(raw_response_value).strip() if raw_response_value is not None else None
+
+    prodclass_value = data.get("prodclass_by_okved") or data.get("prodclass")
+    try:
+        prodclass_by_okved = int(prodclass_value) if prodclass_value is not None else None
+    except (TypeError, ValueError):
+        prodclass_by_okved = None
+
+    log.info(
+        "analyze-client: prodclass_by_okved=%s получен по ОКВЭД %s (%s, base=%s)",
+        prodclass_by_okved,
+        okved,
+        label,
+        base_url,
+    )
+
+    return prompt, raw_response, prodclass_by_okved
+
+
 __all__ = [
     "AnalyzeServiceUnavailable",
     "ensure_service_available",
     "get_analyze_base_url",
     "fetch_site_description",
     "fetch_embedding",
+    "fetch_prodclass_by_okved",
 ]
