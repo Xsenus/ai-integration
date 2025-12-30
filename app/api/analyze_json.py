@@ -1628,6 +1628,21 @@ async def _apply_db_payload(
             candidate_prodclass_score = _normalize_score(
                 raw_prod.get("score") or raw_prod.get("prodclass_score")
             )
+            okved_based_score = okved_score_to_use or description_okved_score
+
+            # Если сайт не дал уверенный prodclass (скор пустой или ниже), но по
+            # ОКВЭД доступен более сильный вариант, переключаемся на него. Далее
+            # все шаги (сохранение результата, аналитика, выбор оборудования)
+            # будут опираться на prodclass от ОКВЭД, так как он считается
+            # более релевантным источником.
+            if (
+                prodclass_by_okved_value is not None
+                and okved_based_score is not None
+                and (candidate_prodclass_score is None or okved_based_score > candidate_prodclass_score)
+            ):
+                candidate_prodclass_id = prodclass_by_okved_value
+                candidate_prodclass_score = okved_based_score
+                prodclass_source = "prodclass_by_okved"
         elif raw_prod is None and prodclass_by_okved_value is not None:
             candidate_prodclass_id = prodclass_by_okved_value
             candidate_prodclass_score = okved_score_to_use or description_okved_score
