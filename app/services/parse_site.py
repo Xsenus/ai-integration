@@ -771,6 +771,18 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                 site_unavailable_reason = "Не удалось определить домены для парсинга"
                 log.info("parse-site: домены не найдены для ИНН %s, задействуем fallback", inn)
                 domains_to_process = []
+    else:
+        domains_to_process = await _collect_domains_by_inn(inn, session)
+        if domains_to_process:
+            log.info(
+                "parse-site: домены определены только из БД (%s шт.) → %s",
+                len(domains_to_process),
+                domains_to_process,
+            )
+        else:
+            site_unavailable_reason = "Не удалось определить домены для парсинга"
+            log.info("parse-site: домены не найдены для ИНН %s, задействуем fallback", inn)
+            domains_to_process = []
 
     log.info("parse-site: итоговый набор доменов для обработки (до override) → %s", domains_to_process)
 
