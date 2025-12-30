@@ -3000,7 +3000,13 @@ async def _run_analyze(
 async def analyze_from_inn(payload: AnalyzeFromInnRequest) -> AnalyzeFromInnResponse:
     """Полный цикл анализа через POST-запрос."""
 
-    return await _run_analyze(payload, source="POST")
+    try:
+        return await _run_analyze(payload, source="POST")
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("analyze-json: unexpected error during POST analyze-json (inn=%s)", payload.inn)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Внутренняя ошибка AI-анализа")
 
 
 @router.get(
@@ -3058,4 +3064,10 @@ async def analyze_from_inn_get(
             level=logging.WARNING,
         )
 
-    return await _run_analyze(payload, source="GET")
+    try:
+        return await _run_analyze(payload, source="GET")
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("analyze-json: unexpected error during GET analyze-json (inn=%s)", inn)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Внутренняя ошибка AI-анализа")
