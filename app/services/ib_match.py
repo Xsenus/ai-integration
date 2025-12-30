@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import httpx
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.db.postgres import get_postgres_engine
@@ -589,7 +590,17 @@ async def assign_ib_matches_by_inn(*, inn: str, reembed_if_exists: bool) -> dict
             ORDER BY COALESCE(ended_at, created_at) DESC NULLS LAST, id DESC
             """
         )
-        result = await conn.execute(query, {"inn": normalized_inn})
+        try:
+            result = await conn.execute(query, {"inn": normalized_inn})
+        except SQLAlchemyError as exc:  # noqa: PERF203
+            log.warning(
+                "ib-match: failed to query clients_requests in public for INN %s: %s",
+                normalized_inn,
+                exc,
+            )
+            raise IbMatchServiceError(
+                "Не удалось получить clients_requests по ИНН", status_code=503
+            ) from exc
         candidate_ids = [int(row["id"]) for row in result.mappings()]
 
         if not candidate_ids:
@@ -605,10 +616,21 @@ async def assign_ib_matches_by_inn(*, inn: str, reembed_if_exists: bool) -> dict
                 ORDER BY COALESCE(ended_at, created_at) DESC NULLS LAST, id DESC
                 """
             )
-            fallback_result = await conn.execute(
-                fallback_query, {"inn": normalized_inn}
-            )
-            candidate_ids = [int(row["id"]) for row in fallback_result.mappings()]
+            try:
+                fallback_result = await conn.execute(
+                    fallback_query, {"inn": normalized_inn}
+                )
+            except SQLAlchemyError as exc:  # noqa: PERF203
+                log.warning(
+                    "ib-match: fallback query parsing_data.clients_requests failed for INN %s: %s",
+                    normalized_inn,
+                    exc,
+                )
+                candidate_ids = []
+            else:
+                candidate_ids = [
+                    int(row["id"]) for row in fallback_result.mappings()
+                ]
 
     if not candidate_ids:
         log.info(
