@@ -23,7 +23,7 @@ from app.services.analyze_client import (
     AnalyzeServiceUnavailable,
     ensure_service_available,
 )
-from app.services.parse_site import ParseSiteRequest, run_parse_site
+from app.services.parse_site import ParseSiteRequest, ParseSiteResponse, run_parse_site
 from app.config import settings
 from app.db.bitrix import bitrix_session
 from app.db.parsing import _normalize_domain
@@ -378,19 +378,21 @@ async def close_analyze_json_http_client() -> None:
             _http_client = None
 
 
-async def _trigger_parse_site(inn: str) -> None:
+async def _trigger_parse_site(inn: str) -> Optional[ParseSiteResponse]:
     """Запускает /v1/parse-site для указанного ИНН (best effort)."""
 
     payload = ParseSiteRequest(inn=inn, save_client_request=True)
     try:
         log.info("analyze-json: triggering parse-site (inn=%s)", inn)
         async with bitrix_session() as session:
-            await run_parse_site(payload, session)
+            response = await run_parse_site(payload, session)
         log.info("analyze-json: pars_site refreshed for inn=%s", inn)
+        return response
     except HTTPException as exc:
         log.info("analyze-json: parse-site skipped for inn=%s → %s", inn, exc.detail)
     except Exception:  # noqa: BLE001
         log.exception("analyze-json: parse-site failed for inn=%s", inn)
+    return None
 
 
 def _ensure_identifier(name: str) -> str:
@@ -2495,15 +2497,69 @@ async def _run_analyze(
             level=logging.WARNING,
         )
 
+    parse_site_response: Optional[ParseSiteResponse] = None
     if payload.refresh_site:
-        await _trigger_parse_site(inn)
+        parse_site_response = await _trigger_parse_site(inn)
 
     snapshots = await _collect_latest_pars_site(engine, inn)
     if not snapshots and not payload.refresh_site:
-        await _trigger_parse_site(inn)
+        parse_site_response = await _trigger_parse_site(inn)
         snapshots = await _collect_latest_pars_site(engine, inn)
 
     if not snapshots:
+        if parse_site_response and parse_site_response.site_unavailable:
+            fallback = parse_site_response.site_unavailable.model_dump()
+            first_okved = fallback.get("okved")
+            response = AnalyzeFromInnResponse(
+                status="error",
+                inn=inn,
+                pars_id=None,
+                company_id=parse_site_response.company_id,
+                text_length=0,
+                catalog_goods_size=0,
+                catalog_equipment_size=0,
+                saved_goods=0,
+                saved_equipment=0,
+                prodclass_id=fallback.get("prodclass_by_okved"),
+                prodclass_score=None,
+                external_request={"reason": "site-unavailable", "okved": first_okved},
+                external_status=status.HTTP_404_NOT_FOUND,
+                external_response={
+                    "message": parse_site_response.message,
+                    "site_unavailable": fallback,
+                },
+                external_response_raw=fallback,
+                total_text_length=0,
+                total_saved_goods=0,
+                total_saved_equipment=0,
+                domains_processed=[],
+                runs=[
+                    AnalyzeFromInnRun(
+                        domain=None,
+                        domain_source=None,
+                        pars_id=None,
+                        company_id=parse_site_response.company_id,
+                        created_at=parse_site_response.finished_at,
+                        text_length=0,
+                        chunk_count=0,
+                        catalog_goods_size=0,
+                        catalog_equipment_size=0,
+                        saved_goods=0,
+                        saved_equipment=0,
+                        prodclass_id=fallback.get("prodclass_by_okved"),
+                        prodclass_score=None,
+                        external_request={"reason": "site-unavailable", "okved": first_okved},
+                        external_status=status.HTTP_404_NOT_FOUND,
+                        external_response={
+                            "message": parse_site_response.message,
+                            "site_unavailable": fallback,
+                        },
+                        external_response_raw=fallback,
+                    )
+                ],
+            )
+            return response
+
         _log_and_raise(
             status.HTTP_404_NOT_FOUND,
             inn=inn,
