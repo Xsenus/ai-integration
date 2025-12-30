@@ -1032,15 +1032,26 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         fallback_details = SiteUnavailableFallback(okved=main_okved_code)
 
         if main_okved_code:
-            prompt, raw_response, prodclass_by_okved = await fetch_prodclass_by_okved(
-                main_okved_code,
-                label=f"site-unavailable:{inn}",
-            )
-            fallback_details.prompt = prompt
-            fallback_details.raw_response = raw_response
-            fallback_details.prodclass_by_okved = prodclass_by_okved
-            if prodclass_by_okved is None:
-                fallback_details.error = "Не удалось определить PRODCLASS по ОКВЭД"
+            try:
+                prompt, raw_response, prodclass_by_okved = await fetch_prodclass_by_okved(
+                    main_okved_code,
+                    label=f"site-unavailable:{inn}",
+                )
+            except AnalyzeServiceUnavailable as exc:
+                log.warning(
+                    "parse-site: внешнее AI для расчёта по ОКВЭД недоступно (%s)",
+                    exc,
+                )
+                fallback_details.error = "AI-сервис недоступен для расчёта по ОКВЭД"
+                prompt = None
+                raw_response = None
+                prodclass_by_okved = None
+            else:
+                fallback_details.prompt = prompt
+                fallback_details.raw_response = raw_response
+                fallback_details.prodclass_by_okved = prodclass_by_okved
+                if prodclass_by_okved is None:
+                    fallback_details.error = "Не удалось определить PRODCLASS по ОКВЭД"
         else:
             fallback_details.error = "Основной ОКВЭД не определён"
 
