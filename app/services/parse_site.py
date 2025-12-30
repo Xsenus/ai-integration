@@ -41,6 +41,7 @@ from app.services.mapping import map_summary_from_dadata
 from app.services.analyze_client import (
     AnalyzeServiceUnavailable,
     fetch_embedding,
+    fetch_prodclass_by_okved,
     fetch_site_description,
 )
 from app.services.scrape import FetchError, fetch_and_chunk, to_home_url
@@ -152,14 +153,22 @@ class OkvedAlert(BaseModel):
     score: float
 
 
+class SiteUnavailableFallback(BaseModel):
+    okved: str | None = None
+    prompt: str | None = None
+    raw_response: str | None = None
+    prodclass_by_okved: int | None = None
+    error: str | None = None
+
+
 class ParseSiteResponse(BaseModel):
-    status: Literal["success", "partial_success"]
+    status: Literal["success", "partial_success", "fallback"]
     message: str
     started_at: datetime
     finished_at: datetime
     duration_seconds: float
     duration_ms: int
-    company_id: int
+    company_id: int | None
     domain_1: str | None
     domain_2: str | None
     url: str | None
@@ -172,6 +181,7 @@ class ParseSiteResponse(BaseModel):
     results: list[ParsedSiteResult]
     okved_text: str | None = None
     okved_alerts: list[OkvedAlert] = Field(default_factory=list)
+    site_unavailable: SiteUnavailableFallback | None = None
 
 
 @dataclass(slots=True)
@@ -736,6 +746,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
 
     log.info("parse-site: нормализованные ручные домены → %s", normalized_manual)
     domains_to_process: list[str]
+    site_unavailable_reason: str | None = None
     if normalized_manual:
         domains_to_process = list(normalized_manual)
         seen = set(domains_to_process)
@@ -748,17 +759,18 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                 len(domains_to_process),
                 domains_to_process,
             )
-    else:
-        domains_to_process = await _collect_domains_by_inn(inn, session)
-        if domains_to_process:
-            log.info(
-                "parse-site: домены определены только из БД (%s шт.) → %s",
-                len(domains_to_process),
-                domains_to_process,
-            )
         else:
-            log.info("parse-site: домены не найдены для ИНН %s, возвращаем ошибку", inn)
-            raise HTTPException(status_code=404, detail="Не удалось определить домены для парсинга")
+            domains_to_process = await _collect_domains_by_inn(inn, session)
+            if domains_to_process:
+                log.info(
+                    "parse-site: домены определены только из БД (%s шт.) → %s",
+                    len(domains_to_process),
+                    domains_to_process,
+                )
+            else:
+                site_unavailable_reason = "Не удалось определить домены для парсинга"
+                log.info("parse-site: домены не найдены для ИНН %s, задействуем fallback", inn)
+                domains_to_process = []
 
     log.info("parse-site: итоговый набор доменов для обработки (до override) → %s", domains_to_process)
 
@@ -895,6 +907,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         okved_main_code = await get_okved_main_pg(inn)
 
     okved_entries = _collect_okved_entries(okved_main_code, okveds_source)
+    main_okved_code = okved_entries[0][0] if okved_entries else None
     okved_text = okved_entries[0][1] if okved_entries else None
     if okved_text:
         log.info("parse-site: основной ОКВЭД для сравнения → %s", okved_text)
@@ -1002,6 +1015,64 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
     total_inserted = 0
     successful_used_domains: list[str] = []
     okved_alerts: list[OkvedAlert] = []
+
+    async def _build_site_unavailable_response(reason: str) -> ParseSiteResponse:
+        fallback_details = SiteUnavailableFallback(okved=main_okved_code)
+
+        if main_okved_code:
+            prompt, raw_response, prodclass_by_okved = await fetch_prodclass_by_okved(
+                main_okved_code,
+                label=f"site-unavailable:{inn}",
+            )
+            fallback_details.prompt = prompt
+            fallback_details.raw_response = raw_response
+            fallback_details.prodclass_by_okved = prodclass_by_okved
+            if prodclass_by_okved is None:
+                fallback_details.error = "Не удалось определить PRODCLASS по ОКВЭД"
+        else:
+            fallback_details.error = "Основной ОКВЭД не определён"
+
+        finished_at = datetime.now(timezone.utc)
+        total_duration_seconds = time.perf_counter() - started_monotonic
+        duration_seconds = round(total_duration_seconds, 3)
+        duration_ms = max(0, int(total_duration_seconds * 1000))
+        domains_attempted = len(results) or len(domains_to_process)
+        failed_domains = [r.requested_domain for r in results if not r.success]
+
+        message_bits = [reason]
+        if fallback_details.prodclass_by_okved is not None:
+            message_bits.append(
+                f"Получен PRODCLASS по ОКВЭД: {fallback_details.prodclass_by_okved}"
+            )
+        elif fallback_details.error:
+            message_bits.append(fallback_details.error)
+
+        company_id_for_response = company_id_pg
+        if company_id_for_response is None:
+            company_id_for_response = await get_clients_request_id_pg(inn)
+
+        return ParseSiteResponse(
+            status="fallback",
+            message="; ".join(filter(None, message_bits)),
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration_seconds,
+            duration_ms=duration_ms,
+            company_id=company_id_for_response,
+            domain_1=None,
+            domain_2=None,
+            url=None,
+            planned_domains=planned_domains,
+            successful_domains=[],
+            chunks_inserted=total_inserted,
+            domains_attempted=domains_attempted,
+            domains_succeeded=0,
+            failed_domains=failed_domains,
+            results=results,
+            okved_text=okved_text,
+            okved_alerts=okved_alerts,
+            site_unavailable=fallback_details,
+        )
 
     for idx, domain_candidate in enumerate(domains_to_process, start=1):
         domain_results = fetch_results_pool.get(domain_candidate, [])
@@ -1446,8 +1517,13 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
 
     if not successes:
         errors = "; ".join(filter(None, (r.error for r in results))) or "Парсинг не удался"
-        log.warning("parse-site: все домены завершились ошибкой для ИНН %s → %s", inn, errors)
-        raise HTTPException(status_code=502, detail=errors)
+        log.warning(
+            "parse-site: все домены завершились ошибкой для ИНН %s → %s", inn, errors
+        )
+        fallback_response = await _build_site_unavailable_response(
+            site_unavailable_reason or errors
+        )
+        return fallback_response
 
     final_ordered_domains = _sort_domains_by_score(
         client_domain_scores,
@@ -1477,7 +1553,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
     domains_attempted = len(results)
     domains_succeeded = len(successes)
     failed_domains = [r.requested_domain for r in results if not r.success]
-    status: Literal["success", "partial_success"] = (
+    status: Literal["success", "partial_success", "fallback"] = (
         "success" if domains_attempted == domains_succeeded else "partial_success"
     )
     if status == "success":
