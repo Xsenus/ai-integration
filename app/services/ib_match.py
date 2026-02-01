@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import httpx
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.db.postgres import get_postgres_engine
@@ -199,86 +200,105 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
             client_id,
         )
 
-        ib_goods_raw = await conn.execute(
-            text(
-                """
-                SELECT id, goods_type_name, goods_type_vector::text AS vector
-                FROM public.{table}
-                WHERE {vector} IS NOT NULL
-                """.format(
-                    table=settings.IB_GOODS_TYPES_TABLE,
-                    vector=settings.IB_GOODS_TYPES_VECTOR_COLUMN,
+        try:
+            ib_goods_raw = await conn.execute(
+                text(
+                    """
+                    SELECT id,
+                           {name_column} AS name,
+                           {vector_column}::text AS vector
+                    FROM public.{table}
+                    WHERE {vector_column} IS NOT NULL
+                    """.format(
+                        table=settings.IB_GOODS_TYPES_TABLE,
+                        name_column=settings.IB_GOODS_TYPES_NAME_COLUMN,
+                        vector_column=settings.IB_GOODS_TYPES_VECTOR_COLUMN,
+                    )
                 )
             )
-        )
-        ib_goods: List[CatalogEntry] = []
-        for row in ib_goods_raw.mappings():
-            vector = _parse_pgvector(row["vector"])
-            if vector is None:
-                continue
-            entry = CatalogEntry(
-                ib_id=int(row["id"]),
-                name=str(row[settings.IB_GOODS_TYPES_NAME_COLUMN] or ""),
-            )
-            entry.add_vector(vector, source=_VECTOR_SOURCE_CATALOG)
-            ib_goods.append(entry)
+            ib_goods: List[CatalogEntry] = []
+            for row in ib_goods_raw.mappings():
+                vector = _parse_pgvector(row["vector"])
+                if vector is None:
+                    continue
+                entry = CatalogEntry(
+                    ib_id=int(row["id"]),
+                    name=str(row.get("name") or ""),
+                )
+                entry.add_vector(vector, source=_VECTOR_SOURCE_CATALOG)
+                ib_goods.append(entry)
 
-        ib_equipment_raw = await conn.execute(
-            text(
-                """
-                SELECT id, equipment_name, equipment_vector::text AS vector
-                FROM public.{table}
-                WHERE {vector} IS NOT NULL
-                """.format(
-                    table=settings.IB_EQUIPMENT_TABLE,
-                    vector=settings.IB_EQUIPMENT_VECTOR_COLUMN,
+            ib_equipment_raw = await conn.execute(
+                text(
+                    """
+                    SELECT id,
+                           {name_column} AS name,
+                           {vector_column}::text AS vector
+                    FROM public.{table}
+                    WHERE {vector_column} IS NOT NULL
+                    """.format(
+                        table=settings.IB_EQUIPMENT_TABLE,
+                        name_column=settings.IB_EQUIPMENT_NAME_COLUMN,
+                        vector_column=settings.IB_EQUIPMENT_VECTOR_COLUMN,
+                    )
                 )
             )
-        )
-        ib_equipment: List[CatalogEntry] = []
-        for row in ib_equipment_raw.mappings():
-            vector = _parse_pgvector(row["vector"])
-            if vector is None:
-                continue
-            entry = CatalogEntry(
-                ib_id=int(row["id"]),
-                name=str(row[settings.IB_EQUIPMENT_NAME_COLUMN] or ""),
-            )
-            entry.add_vector(vector, source=_VECTOR_SOURCE_CATALOG)
-            ib_equipment.append(entry)
+            ib_equipment: List[CatalogEntry] = []
+            for row in ib_equipment_raw.mappings():
+                vector = _parse_pgvector(row["vector"])
+                if vector is None:
+                    continue
+                entry = CatalogEntry(
+                    ib_id=int(row["id"]),
+                    name=str(row.get("name") or ""),
+                )
+                entry.add_vector(vector, source=_VECTOR_SOURCE_CATALOG)
+                ib_equipment.append(entry)
+        except SQLAlchemyError as exc:
+            log.exception("ib-match: failed to load IB goods/equipment catalogs")
+            raise IbMatchServiceError(
+                "Не удалось загрузить справочники IB товаров/оборудования",
+                status_code=503,
+            ) from exc
         log.info(
             "ib-match: loaded %s ib_goods_types and %s ib_equipment entries",
             len(ib_goods),
             len(ib_equipment),
         )
-
-        ib_prodclass_raw = await conn.execute(
-            text(
-                """
-                SELECT {id_column} AS id,
-                       {name_column} AS name,
-                       {vector_column}::text AS vector
-                FROM public.{table}
-                WHERE {vector_column} IS NOT NULL
-                """.format(
-                    table=settings.IB_PRODCLASS_TABLE,
-                    id_column=settings.IB_PRODCLASS_ID_COLUMN,
-                    name_column=settings.IB_PRODCLASS_NAME_COLUMN,
-                    vector_column=settings.IB_PRODCLASS_VECTOR_COLUMN,
+        try:
+            ib_prodclass_raw = await conn.execute(
+                text(
+                    """
+                    SELECT {id_column} AS id,
+                           {name_column} AS name,
+                           {vector_column}::text AS vector
+                    FROM public.{table}
+                    WHERE {vector_column} IS NOT NULL
+                    """.format(
+                        table=settings.IB_PRODCLASS_TABLE,
+                        id_column=settings.IB_PRODCLASS_ID_COLUMN,
+                        name_column=settings.IB_PRODCLASS_NAME_COLUMN,
+                        vector_column=settings.IB_PRODCLASS_VECTOR_COLUMN,
+                    )
                 )
             )
-        )
-        ib_prodclass: List[CatalogEntry] = []
-        for row in ib_prodclass_raw.mappings():
-            vector = _parse_pgvector(row["vector"])
-            entry = CatalogEntry(
-                ib_id=int(row["id"]),
-                name=str(row.get("name") or ""),
-            )
-            if vector is not None:
-                entry.add_vector(vector, source=_VECTOR_SOURCE_CATALOG)
-            if entry.has_vectors() or entry.name:
-                ib_prodclass.append(entry)
+            ib_prodclass: List[CatalogEntry] = []
+            for row in ib_prodclass_raw.mappings():
+                vector = _parse_pgvector(row["vector"])
+                entry = CatalogEntry(
+                    ib_id=int(row["id"]),
+                    name=str(row.get("name") or ""),
+                )
+                if vector is not None:
+                    entry.add_vector(vector, source=_VECTOR_SOURCE_CATALOG)
+                if entry.has_vectors() or entry.name:
+                    ib_prodclass.append(entry)
+        except SQLAlchemyError as exc:
+            log.exception("ib-match: failed to load IB prodclass catalog")
+            raise IbMatchServiceError(
+                "Не удалось загрузить справочник IB продклассов",
+                status_code=503,
+            ) from exc
         added_name_vectors = await _augment_prodclass_catalog(ib_prodclass)
         vectors_available = sum(1 for entry in ib_prodclass if entry.vectors)
         log.info(
