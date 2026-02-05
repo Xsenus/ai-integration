@@ -829,6 +829,17 @@ def _resolve_equipment_group(
     return None
 
 
+def _select_equipment_rows(
+    selection_rows: list[dict[str, Any]],
+    site_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Предпочитает результаты подбора оборудования из EQUIPMENT_ALL."""
+
+    if selection_rows:
+        return selection_rows
+    return site_rows
+
+
 def _compose_equipment(
     equipment_rows: Iterable[Mapping[str, Any]],
     lookup: Mapping[Any, Mapping[str, Any]] | None,
@@ -881,6 +892,7 @@ async def analyze_company_by_inn(inn: str) -> dict:
     goods_rows: list[dict[str, Any]] = []
     prod_rows: list[dict[str, Any]] = []
     equipment_rows: list[dict[str, Any]] = []
+    equipment_rows_from_selection: list[dict[str, Any]] = []
     goods_lookup: dict[Any, dict[str, Any]] = {}
     prod_lookup: dict[Any, dict[str, Any]] = {}
     equipment_lookup: dict[Any, dict[str, Any]] = {}
@@ -974,6 +986,33 @@ async def analyze_company_by_inn(inn: str) -> dict:
                     )
                     await _enrich_prodclass_lookup_with_industry(conn, prod_lookup)
 
+            if await _table_exists(conn, "public", "EQUIPMENT_ALL"):
+                sql_equipment_all = text(
+                    """
+                    SELECT
+                        ea.id,
+                        ea.id AS equipment_id,
+                        ea.equipment_name AS equipment,
+                        ea.equipment_name,
+                        ea.score AS equipment_score,
+                        ps.domain_1,
+                        ps.url,
+                        ps.id AS pars_site_id
+                    FROM public."EQUIPMENT_ALL" AS ea
+                    LEFT JOIN LATERAL (
+                        SELECT id, domain_1, url
+                        FROM public.pars_site
+                        WHERE company_id = :company_id
+                        ORDER BY created_at DESC NULLS LAST, id DESC
+                        LIMIT 1
+                    ) AS ps ON TRUE
+                    WHERE ea.company_id = :company_id
+                    ORDER BY ea.score DESC NULLS LAST, ea.id DESC
+                    """
+                )
+                res_eq_all = await conn.execute(sql_equipment_all, {"company_id": company_id})
+                equipment_rows_from_selection = [dict(row) for row in res_eq_all.mappings().all()]
+
             if await _table_exists(conn, "public", "ai_site_equipment"):
                 sql_equipment = text(
                     """
@@ -987,10 +1026,22 @@ async def analyze_company_by_inn(inn: str) -> dict:
                 )
                 res_eq = await conn.execute(sql_equipment, {"company_id": company_id})
                 equipment_rows = [dict(row) for row in res_eq.mappings().all()]
+                equipment_rows = _select_equipment_rows(
+                    equipment_rows_from_selection,
+                    equipment_rows,
+                )
                 if equipment_rows:
                     equipment_lookup = await _load_lookup_table(
                         conn, _EQUIPMENT_LOOKUP_TABLES, ("id", "equipment_id")
                     )
+            elif equipment_rows_from_selection:
+                equipment_rows = _select_equipment_rows(
+                    equipment_rows_from_selection,
+                    equipment_rows,
+                )
+                equipment_lookup = await _load_lookup_table(
+                    conn, _EQUIPMENT_LOOKUP_TABLES, ("id", "equipment_id")
+                )
 
     # --- домены из CR + pars_site ---
     urls: list[str] = []
@@ -1142,7 +1193,9 @@ async def analyze_company_by_inn(inn: str) -> dict:
         note_bits.append("ai_site_goods_types(PG)")
     if prod_rows:
         note_bits.append("ai_site_prodclass(PG)")
-    if equipment_rows:
+    if equipment_rows_from_selection:
+        note_bits.append("EQUIPMENT_ALL(PG)")
+    elif equipment_rows:
         note_bits.append("ai_site_equipment(PG)")
     if bx_used:
         note_bits.append("dadata_result(Bitrix)")
