@@ -213,6 +213,100 @@ async def fetch_home_via_scraperapi(
     raise FetchError("Unreachable")
 
 
+async def fetch_home_direct(
+    domain_or_url: str,
+    *,
+    retries: int = 2,
+    max_redirects: int | None = None,
+) -> tuple[str, str]:
+    target_url = to_home_url(domain_or_url)
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/122 Safari/537.36"}
+
+    redirects_followed = 0
+    redirect_limit = settings.PARSE_MAX_REDIRECTS if max_redirects is None else max_redirects
+    if redirect_limit < 0:
+        redirect_limit = 0
+
+    timeout_s = max(1, int(settings.PARSE_HTTP_TIMEOUT))
+    client_kwargs: dict[str, Any] = {
+        "timeout": httpx.Timeout(
+            timeout_s,
+            connect=min(float(timeout_s), 5.0),
+            read=float(timeout_s),
+            write=min(float(timeout_s), 5.0),
+        ),
+        "follow_redirects": False,
+    }
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        while True:
+            backoff = 1.0
+            redirect_followed = False
+
+            for attempt in range(1, retries + 1):
+                try:
+                    requested_url = target_url
+                    log.info("HTTP: direct fetch → %s (try %s/%s)", requested_url, attempt, retries)
+                    r = await client.get(requested_url, headers=headers)
+                    if r.status_code in {301, 302, 303, 307, 308}:
+                        location = r.headers.get("Location")
+                        if not location:
+                            raise FetchError(f"HTTP {r.status_code} без заголовка Location")
+                        redirects_followed += 1
+                        if redirects_followed > redirect_limit:
+                            raise FetchError("Превышено число HTTP-редиректов")
+                        target_url = urljoin(requested_url, location)
+                        log.info(
+                            "HTTP: redirect (%s/%s): %s → %s",
+                            redirects_followed,
+                            redirect_limit,
+                            requested_url,
+                            target_url,
+                        )
+                        redirect_followed = True
+                        break
+
+                    if r.status_code != 200:
+                        body = (r.text or "")[:400]
+                        raise FetchError(f"HTTP {r.status_code}: {body}")
+                    html = r.text or ""
+                    if len(html) < settings.PARSE_MIN_HTML_LEN:
+                        raise FetchError("Ответ слишком короткий")
+
+                    effective_url = str(r.url)
+
+                    redirect_target = _extract_html_redirect_target(html, effective_url)
+                    if redirect_target:
+                        redirects_followed += 1
+                        log.info(
+                            "HTTP: HTML redirect обнаружен (%s/%s): %s → %s",
+                            redirects_followed,
+                            redirect_limit,
+                            effective_url,
+                            redirect_target,
+                        )
+                        if redirects_followed > redirect_limit:
+                            raise FetchError("Превышено число HTML-редиректов")
+                        target_url = redirect_target
+                        redirect_followed = True
+                        break
+
+                    log.info("HTTP: direct OK, %s символов HTML", len(html))
+                    return html, effective_url
+                except Exception as e:  # noqa: BLE001
+                    if attempt >= retries:
+                        raise FetchError(f"Fetch failed after {attempt} tries: {e}") from e
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 10.0)
+
+            if redirect_followed:
+                continue
+
+            raise FetchError("Не удалось получить страницу после повторов")
+
+    raise FetchError("Unreachable")
+
+
 def html_to_full_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
@@ -228,7 +322,17 @@ async def fetch_and_chunk(domain_or_url: str) -> tuple[str, list[str], str]:
     home_url — https://host/
     normalized_domain — host без www
     """
-    html, final_url = await fetch_home_via_scraperapi(domain_or_url)
+    try:
+        html, final_url = await fetch_home_via_scraperapi(domain_or_url)
+        log.info("scrape: ScraperAPI успешно обработал домен %s", domain_or_url)
+    except FetchError as exc:
+        log.warning(
+            "scrape: ScraperAPI не смог обработать домен %s (%s), пробуем прямой парсинг",
+            domain_or_url,
+            exc,
+        )
+        html, final_url = await fetch_home_direct(domain_or_url)
+        log.info("scrape: прямой парсинг успешно обработал домен %s", domain_or_url)
     home_url = to_home_url(final_url)
     normalized_domain = urlparse(home_url).netloc.replace("www.", "")
     text = html_to_full_text(html)
