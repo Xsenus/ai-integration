@@ -10,7 +10,7 @@
   2. `parse_site` — собирает домены, скачивает главные страницы, формирует описание и embedding, обновляет `pars_site`.
   3. `analyze_json` — отправляет свежие снапшоты и каталоги во внешний AI‑сервис, применяет `db_payload` к `ai_site_*`.
   4. `ib_match` — сравнивает embedding сайта с каталогом `ib_prodclass` и сохраняет `prodclass`.
-  5. `equipment_selection` — рассчитывает набор оборудования по последней записи клиента в `clients_requests`.
+  5. `equipment_selection` — рассчитывает набор оборудования по последней записи клиента в `clients_requests` и выбирает стратегию источника (`site` или `okved`) на основе `description_okved_score`/`okved_score` и `prodclass_by_okved` (порог настраивается через `EQUIPMENT_SELECTION_OKVED_THRESHOLD`).
 * **Обработка ошибок:** каждая стадия логируется отдельной записью. Ошибки на фатальных шагах (`lookup`) прекращают пайплайн; остальные фиксируются в массиве `errors`, но ответ всё равно возвращается.
 * **Ответ:** модель `PipelineFullResponse` содержит результаты каждого шага (или `null`, если шаг пропущен), список ошибок с `status_code`/`detail` и `duration_ms` — общее время выполнения.
 

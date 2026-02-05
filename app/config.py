@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     B24_LOG_BODIES: bool = False           # логировать тела запросов/ответов (ОСТОРОЖНО: могут быть ПДн)
     B24_LOG_BODY_CHARS: int = 2000         # если включены тела — обрезать до N символов
 
+    # === Equipment selection ===
+    EQUIPMENT_SELECTION_OKVED_THRESHOLD: float = 0.5
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

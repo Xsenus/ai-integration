@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence, Literal
 
@@ -1027,6 +1028,28 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
     total_inserted = 0
     successful_used_domains: list[str] = []
     okved_alerts: list[OkvedAlert] = []
+    description_status_counts: Counter[str] = Counter()
+    missing_description_counter = [0]
+
+    def _record_description_status(status: Optional[str], has_description: bool) -> None:
+        normalized = status or "unknown"
+        description_status_counts[normalized] += 1
+        if not has_description:
+            missing_description_counter[0] += 1
+
+    def _log_description_metrics(total: int) -> None:
+        missing = missing_description_counter[0]
+        if total <= 0:
+            return
+        parts = [f"{key}={value}" for key, value in description_status_counts.items()]
+        missing_pct = round((missing / total) * 100, 2)
+        log.info(
+            "parse-site: метрики описания (домены=%s, без_описания=%s, доля_%%=%s, статусы=%s)",
+            total,
+            missing,
+            missing_pct,
+            ", ".join(parts) if parts else "нет",
+        )
 
     async def _build_site_unavailable_response(reason: str) -> ParseSiteResponse:
         fallback_details = SiteUnavailableFallback(okved=main_okved_code)
@@ -1132,6 +1155,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                     processing_ms=elapsed_ms,
                 )
             )
+            _record_description_status("Контент не получен", False)
             continue
 
         if fetch_result.error:
@@ -1150,6 +1174,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                     processing_ms=elapsed_ms,
                 )
             )
+            _record_description_status("Контент не получен", False)
             continue
 
         home_url = fetch_result.home_url
@@ -1172,6 +1197,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                     processing_ms=elapsed_ms,
                 )
             )
+            _record_description_status("Главная страница недоступна", False)
             continue
 
         domain_for_pars = (
@@ -1529,6 +1555,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             processing_ms=total_elapsed_ms,
         )
         results.append(result)
+        _record_description_status(description_status, bool(description))
         successes.append(result)
         if domain_for_pars and domain_for_pars not in successful_used_domains:
             successful_used_domains.append(domain_for_pars)
@@ -1543,6 +1570,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         log.warning(
             "parse-site: все домены завершились ошибкой для ИНН %s → %s", inn, errors
         )
+        _log_description_metrics(len(results) or len(domains_to_process))
         fallback_response = await _build_site_unavailable_response(
             site_unavailable_reason or errors
         )
@@ -1568,6 +1596,7 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         len(results),
         total_inserted,
     )
+    _log_description_metrics(len(results))
 
     finished_at = datetime.now(timezone.utc)
     total_duration_seconds = time.perf_counter() - started_monotonic

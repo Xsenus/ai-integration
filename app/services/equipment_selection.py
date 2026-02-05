@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from app.config import settings
 from app.schemas.equipment_selection import (
     ClientRow as ClientRowModel,
     Equipment3WayDetailRow as Equipment3WayDetailModel,
@@ -298,6 +299,8 @@ class TableData:
 @dataclass(slots=True)
 class EquipmentStepReport:
     company_id: Optional[int] = None
+    selection_strategy: str = "unknown"
+    selection_reason: Optional[str] = None
     client_rows: Sequence[Dict[str, Any]] = field(default_factory=list)
     goods_types: Sequence[Dict[str, Any]] = field(default_factory=list)
     site_equipment: Sequence[Dict[str, Any]] = field(default_factory=list)
@@ -496,6 +499,7 @@ def _build_response(report: EquipmentStepReport) -> EquipmentSelectionResponse:
     prodclass_rows = [
         ProdclassSourceRowModel(**_convert_decimals(_row_mapping(row)))
         for row in report.prodclass_rows
+        if _row_mapping(row).get("prodclass_id") is not None
     ]
     prodclass_details = _convert_prodclass_details(report.prodclass_details)
 
@@ -514,6 +518,8 @@ def _build_response(report: EquipmentStepReport) -> EquipmentSelectionResponse:
     sample_tables = [_create_sample_table(table) for table in report.tables]
 
     return EquipmentSelectionResponse(
+        selection_strategy=report.selection_strategy,
+        selection_reason=report.selection_reason,
         client=client_model,
         goods_types=goods_types,
         site_equipment=site_equipment,
@@ -604,6 +610,7 @@ async def build_equipment_tables(
     _append_step_separator(report.log, "Шаг 1 — Данные с сайта")
     goods_types = await _load_goods_types(conn, report.company_id)
     report.goods_types = goods_types
+    goods_types_for_calc = goods_types
     _add_table(
         report,
         step="1.a",
@@ -628,6 +635,7 @@ async def build_equipment_tables(
 
     site_equipment = await _load_site_equipment(conn, report.company_id)
     report.site_equipment = site_equipment
+    site_equipment_for_calc = site_equipment
     _add_table(
         report,
         step="1.b",
@@ -663,6 +671,9 @@ async def build_equipment_tables(
             "prodclass_id",
             "prodclass_name",
             "prodclass_score",
+            "description_okved_score",
+            "okved_score",
+            "prodclass_by_okved",
             "text_pars_id",
             "url",
             "created_at",
@@ -674,7 +685,59 @@ async def build_equipment_tables(
         f"Шаг 2.a: загружено {len(prodclass_rows)} записей ai_site_prodclass.",
     )
 
-    prodclass_agg = _aggregate_prodclass(prodclass_rows)
+    (
+        selection_strategy,
+        selection_score,
+        prodclass_by_okved,
+        selection_reason,
+    ) = _resolve_selection_strategy(prodclass_rows)
+    report.selection_strategy = selection_strategy
+    report.selection_reason = selection_reason
+    _log_event(
+        report.log,
+        (
+            "Выбор стратегии: "
+            f"{selection_strategy} (score={selection_score}, prodclass_by_okved={prodclass_by_okved}). "
+            f"Причина: {selection_reason}"
+        ),
+    )
+
+    if selection_strategy == "okved" and prodclass_by_okved is not None:
+        prodclass_name = await _load_prodclass_name(conn, prodclass_by_okved)
+        if prodclass_name is None:
+            selection_strategy = "site"
+            report.selection_strategy = selection_strategy
+            report.selection_reason = (
+                "prodclass_by_okved не найден в справочнике — fallback на сайт"
+            )
+            _log_event(
+                report.log,
+                (
+                    "prodclass_by_okved="
+                    f"{prodclass_by_okved} отсутствует в справочнике, переключаемся на site."
+                ),
+            )
+            prodclass_agg = _aggregate_prodclass(prodclass_rows)
+        else:
+            prodclass_agg = [
+                {
+                    "prodclass_id": prodclass_by_okved,
+                    "prodclass_name": prodclass_name,
+                    "SCORE_1": _quantize(_to_decimal(selection_score or 0)),
+                    "votes": 1,
+                }
+            ]
+            goods_types_for_calc = []
+            site_equipment_for_calc = []
+            _log_event(
+                report.log,
+                (
+                    "OKVED-стратегия: используем prodclass_by_okved="
+                    f"{prodclass_by_okved}, исключаем goods_types и site_equipment."
+                ),
+            )
+    else:
+        prodclass_agg = _aggregate_prodclass(prodclass_rows)
     report.prodclass_agg = prodclass_agg
     _add_table(
         report,
@@ -752,7 +815,7 @@ async def build_equipment_tables(
         equipment_2way,
         goods_type_scores,
         equipment_2way_details,
-    ) = await _compute_equipment_2way(conn, goods_types, report.log)
+    ) = await _compute_equipment_2way(conn, goods_types_for_calc, report.log)
     equipment_2way = _limit_equipment_rows(equipment_2way)
     report.equipment_2way = equipment_2way
     report.equipment_2way_goods = goods_type_scores
@@ -797,7 +860,7 @@ async def build_equipment_tables(
 
     _append_step_separator(report.log, "Шаг 4 — SCORE_E3 через ai_site_equipment")
     equipment_3way, equipment_3way_details = await _compute_equipment_3way(
-        conn, site_equipment, report.log
+        conn, site_equipment_for_calc, report.log
     )
     equipment_3way = _limit_equipment_rows(equipment_3way)
     report.equipment_3way = equipment_3way
@@ -1092,12 +1155,15 @@ async def _load_prodclass_rows(
             ap.prodclass AS prodclass_id,
             ip.prodclass AS prodclass_name,
             ap.prodclass_score,
+            ap.description_okved_score,
+            ap.okved_score,
+            ap.prodclass_by_okved,
             ap.text_pars_id,
             pst.url,
             ap.created_at
         FROM ai_site_prodclass AS ap
         JOIN pars_site AS pst ON pst.id = ap.text_pars_id
-        JOIN ib_prodclass AS ip ON ip.id = ap.prodclass
+        LEFT JOIN ib_prodclass AS ip ON ip.id = ap.prodclass
         WHERE pst.company_id = :cid
         ORDER BY ap.created_at, ap.id
         """
@@ -1119,7 +1185,10 @@ async def _load_prodclass_rows(
 def _aggregate_prodclass(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     aggregated: Dict[int, Dict[str, Any]] = {}
     for row in rows:
-        prodclass_id = int(row["prodclass_id"])
+        prodclass_id_raw = row.get("prodclass_id")
+        if prodclass_id_raw is None:
+            continue
+        prodclass_id = int(prodclass_id_raw)
         score = row.get("prodclass_score")
         if score is None:
             continue
@@ -1150,6 +1219,59 @@ def _aggregate_prodclass(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
 
     result.sort(key=lambda item: (item["SCORE_1"], item["votes"]), reverse=True)
     return result
+
+
+def _resolve_selection_strategy(
+    prodclass_rows: Sequence[Dict[str, Any]],
+) -> tuple[str, Optional[float], Optional[int], str]:
+    threshold = settings.EQUIPMENT_SELECTION_OKVED_THRESHOLD
+    description_scores: list[float] = []
+    okved_scores: list[float] = []
+    prodclass_by_okved: Optional[int] = None
+
+    for row in prodclass_rows:
+        description_score = _maybe_float(row.get("description_okved_score"))
+        if description_score is not None:
+            description_scores.append(description_score)
+        okved_score = _maybe_float(row.get("okved_score"))
+        if okved_score is not None:
+            okved_scores.append(okved_score)
+        fallback_id = row.get("prodclass_by_okved")
+        if fallback_id is not None:
+            prodclass_by_okved = int(fallback_id)
+
+    best_description = max(description_scores) if description_scores else None
+    best_okved = max(okved_scores) if okved_scores else None
+    effective_score = best_description if best_description is not None else best_okved
+
+    if prodclass_by_okved is not None:
+        if effective_score is None:
+            reason = "score отсутствует — fallback на prodclass_by_okved"
+            return "okved", effective_score, prodclass_by_okved, reason
+        if effective_score < threshold:
+            reason = "score ниже порога — используем prodclass_by_okved"
+            return "okved", effective_score, prodclass_by_okved, reason
+        reason = "score >= порога — используем сайт"
+        return "site", effective_score, prodclass_by_okved, reason
+
+    if prodclass_rows:
+        reason = "нет данных prodclass_by_okved — используем сайт"
+        return "site", effective_score, prodclass_by_okved, reason
+
+    reason = "нет данных для выбора источника"
+    return "unknown", effective_score, prodclass_by_okved, reason
+
+
+async def _load_prodclass_name(
+    conn: AsyncConnection,
+    prodclass_id: int,
+) -> Optional[str]:
+    stmt = text("SELECT prodclass FROM ib_prodclass WHERE id = :pid")
+    result = await conn.execute(stmt, {"pid": prodclass_id})
+    row = result.first()
+    if row is None:
+        return None
+    return row[0]
 
 
 async def _compute_equipment_1way(
@@ -1822,4 +1944,3 @@ __all__ = [
     "compute_equipment_selection",
     "resolve_client_request_id",
 ]
-

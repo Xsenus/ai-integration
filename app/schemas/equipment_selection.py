@@ -43,6 +43,9 @@ class ProdclassSourceRow(BaseModel):
     prodclass_id: int
     prodclass_name: Optional[str] = None
     prodclass_score: Optional[float] = None
+    description_okved_score: Optional[float] = None
+    okved_score: Optional[float] = None
+    prodclass_by_okved: Optional[int] = None
     text_pars_id: Optional[int] = None
     url: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -118,6 +121,8 @@ class SampleTable(BaseModel):
 
 
 class EquipmentSelectionResponse(BaseModel):
+    selection_strategy: str = "unknown"
+    selection_reason: Optional[str] = None
     client: Optional[ClientRow] = None
     goods_types: List[GoodsTypeRow] = Field(default_factory=list)
     site_equipment: List[SiteEquipmentRow] = Field(default_factory=list)
