@@ -1,6 +1,10 @@
 import pytest
 
-from app.services.parse_site import _summarize_okved_scores
+from app.services.parse_site import (
+    _is_disallowed_domain,
+    _normalize_domains,
+    _summarize_okved_scores,
+)
 
 
 def test_summarize_okved_scores_prefers_main_okved():
@@ -37,3 +41,17 @@ def test_summarize_okved_scores_empty():
     assert avg_score is None
     assert details == []
     assert notes == []
+
+
+
+def test_normalize_domains_filters_personal_email_domains():
+    domains = _normalize_domains(["bk.ru", "mail.ru", "td-kama.com", "www.td-kama.com"])
+
+    assert domains == ["td-kama.com"]
+
+
+def test_is_disallowed_domain_filters_subdomains_of_personal_services():
+    assert _is_disallowed_domain("bk.ru") is True
+    assert _is_disallowed_domain("mail.ru") is True
+    assert _is_disallowed_domain("corp.mail.ru") is True
+    assert _is_disallowed_domain("td-kama.com") is False

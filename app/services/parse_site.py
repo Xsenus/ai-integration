@@ -241,11 +241,24 @@ def _normalize_domains(values: Iterable[object]) -> list[str]:
     for value in values:
         for raw in _extract_domains_from_value(value):
             norm = _normalize_domain_candidate(raw)
-            if not norm or norm in seen:
+            if not norm or _is_disallowed_domain(norm) or norm in seen:
                 continue
             seen.add(norm)
             result.append(norm)
     return result
+
+
+def _is_disallowed_domain(domain: str) -> bool:
+    """Исключает личные/почтовые домены из кандидатов на сайт компании."""
+
+    normalized = (domain or "").strip().lower().lstrip(".")
+    if not normalized:
+        return True
+
+    return any(
+        normalized == personal_domain or normalized.endswith(f".{personal_domain}")
+        for personal_domain in _PERSONAL_EMAIL_DOMAINS
+    )
 
 
 def _parse_vector_literal(literal: str) -> Optional[list[float]]:
@@ -541,7 +554,7 @@ def _normalize_email_domains(values: Iterable[object]) -> list[str]:
     for value in values:
         for raw_email in _extract_emails_from_value(value):
             domain_part = raw_email.split("@", 1)[1].lower()
-            if domain_part in _PERSONAL_EMAIL_DOMAINS:
+            if _is_disallowed_domain(domain_part):
                 continue
             norm = _normalize_domain_candidate(domain_part)
             if not norm or norm in seen:
