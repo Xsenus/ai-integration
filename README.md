@@ -52,10 +52,11 @@
 | `POST /v1/ib-match`, `POST/GET /v1/ib-match/by-inn` | Сопоставление `pars_site.text_vector` с каталогами `ib_prodclass`/оборудования. |
 | `GET /v1/equipment-selection`, `GET /v1/equipment-selection/by-inn/{inn}` | Расчёт комплекта оборудования по последней записи клиента в `clients_requests`. |
 | `GET /v1/analyze-service/health` | Проверка доступности внешнего сервиса анализа. |
+| `GET /api/ai-analysis/companies` | Список компаний с агрегированным статусом AI-анализа, длительностью и прогрессом для UI-поллинга. |
 | `POST /v1/pipeline/full` | Последовательный запуск lookup → parse-site → analyze-json → ib-match → equipment-selection для переданного ИНН. |
 | `POST /v1/pipeline/auto` | Автообработка нескольких ИНН без готового результата расчёта оборудования. |
 
-Детализированные сценарии и структуры ответов описаны в документах `docs/analyze_json_flow.md`, `docs/parse_site_pipeline.md`, `docs/analyze_json_changes.md`, `docs/prodclass_matching.md`, `docs/industry_detection.md` и `docs/pipeline_overview.md`.
+Детализированные сценарии и структуры ответов описаны в документах `docs/analyze_json_flow.md`, `docs/parse_site_pipeline.md`, `docs/analyze_json_changes.md`, `docs/prodclass_matching.md`, `docs/industry_detection.md`, `docs/pipeline_overview.md` и `docs/ai_analysis_timer_sync_contract.md`.
 
 ## Полезные заметки
 
