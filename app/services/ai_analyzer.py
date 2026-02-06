@@ -13,6 +13,7 @@ from sqlalchemy.engine import Result
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.db.bitrix import get_bitrix_engine          # ← Bitrix сначала
+from app.config import settings
 from app.db.postgres import get_postgres_engine
 
 # ---------------------- helpers ----------------------
@@ -846,7 +847,16 @@ def _compose_equipment(
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     seen: set[tuple[str, Optional[str]]] = set()
+    min_score = settings.IB_MATCH_EQUIPMENT_MIN_SCORE
     for row in sorted(equipment_rows, key=lambda r: _score_sort_key(r, "equipment_score")):
+        score = row.get("equipment_score")
+        try:
+            score_value = float(score) if score is not None else None
+        except (TypeError, ValueError):
+            score_value = None
+        if score_value is not None and score_value < min_score:
+            continue
+
         name = _resolve_equipment_name(row, lookup)
         if not name:
             continue

@@ -89,3 +89,16 @@ def test_normalize_prodclass_updates_preserves_score_for_sql_payload() -> None:
     assert payload["score"] == payload["prodclass_score"]
     assert payload["prodclass"] == 11
     assert payload["text_pars_id"] == 7
+
+
+def test_match_rows_skips_match_when_below_threshold() -> None:
+    rows = [SourceRow(ai_id=3, text="foo", vector=[1.0, 0.0])]
+    entry = CatalogEntry(ib_id=9, name="low")
+    entry.add_vector([0.5, 0.8660254], source=ib_match_mod._VECTOR_SOURCE_CATALOG)
+
+    matches, updates = _match_rows(rows, [entry], min_score=0.75)
+
+    assert matches[0].match_ib_id is None
+    assert matches[0].score == 0.0
+    assert matches[0].note == "Сходство ниже порога 0.75"
+    assert updates == [{"id": 3, "match_id": None, "score": 0.0}]

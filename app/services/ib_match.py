@@ -362,7 +362,9 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
 
     goods_matches, goods_updates = _match_rows(goods_rows, ib_goods)
     equipment_matches, equipment_updates = _match_rows(
-        equipment_rows, ib_equipment
+        equipment_rows,
+        ib_equipment,
+        min_score=settings.IB_MATCH_EQUIPMENT_MIN_SCORE,
     )
     prodclass_matches, prodclass_updates_raw = _match_rows(
         prodclass_rows, ib_prodclass
@@ -824,7 +826,10 @@ def _normalize_prodclass_updates(
 
 
 def _match_rows(
-    rows: Sequence[SourceRow], catalog: Sequence[CatalogEntry]
+    rows: Sequence[SourceRow],
+    catalog: Sequence[CatalogEntry],
+    *,
+    min_score: Optional[float] = None,
 ) -> tuple[List[MatchResult], List[dict[str, Any]]]:
     matches: List[MatchResult] = []
     updates: List[dict[str, Any]] = []
@@ -910,6 +915,25 @@ def _match_rows(
                     score=None,
                     note="Кандидаты не найдены",
                 )
+            )
+            continue
+        if min_score is not None and best_score < min_score:
+            matches.append(
+                MatchResult(
+                    ai_id=row.ai_id,
+                    text=row.text,
+                    match_ib_id=None,
+                    match_ib_name=None,
+                    score=0.0,
+                    note=f"Сходство ниже порога {min_score:.2f}",
+                )
+            )
+            updates.append(
+                {
+                    "id": row.ai_id,
+                    "match_id": None,
+                    "score": 0.0,
+                }
             )
             continue
         clamped_score = min(max(best_score, 0.0), 1.0)
