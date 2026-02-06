@@ -72,6 +72,10 @@ class AnalyzeFromInnRun(BaseModel):
         None,
         description="Непреобразованный ответ внешнего сервиса (включая исходный текст LLM)",
     )
+    okved_fallback_used: bool = Field(
+        False,
+        description="Признак, что домен обработан через fallback по ОКВЭД при недоступном сайте",
+    )
 
 
 class AnalyzeFromInnResponse(BaseModel):
@@ -137,6 +141,10 @@ class AnalyzeFromInnResponse(BaseModel):
     runs: list[AnalyzeFromInnRun] = Field(
         default_factory=list,
         description="Детальная информация по каждому обработанному домену",
+    )
+    okved_fallback_used: bool = Field(
+        False,
+        description="Использован ли fallback по ОКВЭД из-за недоступного сайта",
     )
 
 

@@ -2511,7 +2511,7 @@ async def _run_analyze(
             fallback = parse_site_response.site_unavailable.model_dump()
             first_okved = fallback.get("okved")
             response = AnalyzeFromInnResponse(
-                status="error",
+                status="ok",
                 inn=inn,
                 pars_id=None,
                 company_id=parse_site_response.company_id,
@@ -2533,6 +2533,7 @@ async def _run_analyze(
                 total_saved_goods=0,
                 total_saved_equipment=0,
                 domains_processed=[],
+                okved_fallback_used=True,
                 runs=[
                     AnalyzeFromInnRun(
                         domain=None,
@@ -2555,6 +2556,7 @@ async def _run_analyze(
                             "site_unavailable": fallback,
                         },
                         external_response_raw=fallback,
+                        okved_fallback_used=True,
                     )
                 ],
             )
@@ -2985,6 +2987,7 @@ async def _run_analyze(
         total_saved_equipment=total_saved_equipment,
         domains_processed=domains_processed,
         runs=runs,
+        okved_fallback_used=False,
     )
 
 
