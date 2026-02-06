@@ -85,6 +85,7 @@ class Settings(BaseSettings):
 
     # === Equipment selection ===
     EQUIPMENT_SELECTION_OKVED_THRESHOLD: float = 0.5
+    IB_MATCH_EQUIPMENT_MIN_SCORE: float = 0.75
 
     model_config = SettingsConfigDict(
         env_file=".env",
