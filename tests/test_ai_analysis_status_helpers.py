@@ -59,3 +59,9 @@ def test_duration_terminal_uses_timeline_fallback() -> None:
     end = start + timedelta(seconds=42)
     row = _base_row(started_at=start, ended_at=end, sec_duration=None)
     assert _resolve_duration_ms(row, "completed", end) == 42_000
+
+
+def test_duration_queued_does_not_grow_before_start() -> None:
+    now = datetime.now(timezone.utc)
+    row = _base_row(created_at=now - timedelta(minutes=3), started_at=None, sec_duration=None)
+    assert _resolve_duration_ms(row, "queued", now) == 0
