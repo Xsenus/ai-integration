@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from app.config import settings
 from app.schemas.equipment_selection import (
     ClientRow as ClientRowModel,
     Equipment3WayDetailRow as Equipment3WayDetailModel,
@@ -1224,7 +1223,6 @@ def _aggregate_prodclass(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
 def _resolve_selection_strategy(
     prodclass_rows: Sequence[Dict[str, Any]],
 ) -> tuple[str, Optional[float], Optional[int], str]:
-    threshold = settings.EQUIPMENT_SELECTION_OKVED_THRESHOLD
     description_scores: list[float] = []
     okved_scores: list[float] = []
     prodclass_by_okved: Optional[int] = None
@@ -1245,14 +1243,8 @@ def _resolve_selection_strategy(
     effective_score = best_description if best_description is not None else best_okved
 
     if prodclass_by_okved is not None:
-        if effective_score is None:
-            reason = "score отсутствует — fallback на prodclass_by_okved"
-            return "okved", effective_score, prodclass_by_okved, reason
-        if effective_score < threshold:
-            reason = "score ниже порога — используем prodclass_by_okved"
-            return "okved", effective_score, prodclass_by_okved, reason
-        reason = "score >= порога — используем сайт"
-        return "site", effective_score, prodclass_by_okved, reason
+        reason = "найден prodclass_by_okved — используем ОКВЭД как приоритетный источник"
+        return "okved", effective_score, prodclass_by_okved, reason
 
     if prodclass_rows:
         reason = "нет данных prodclass_by_okved — используем сайт"
