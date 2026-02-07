@@ -116,7 +116,9 @@ def _resolve_duration_ms(row: dict[str, object], status: AnalysisStatus, now_utc
     elif status == "running":
         timeline_ms = _ms_between(now_utc, started_at) or _ms_between(now_utc, created_at)
     elif status == "queued":
-        timeline_ms = _ms_between(now_utc, created_at)
+        # В очереди задача ещё не исполняется, поэтому не наращиваем
+        # длительность «живым» таймером от времени создания.
+        timeline_ms = 0
 
     return max(sec_duration_ms, timeline_ms)
 
