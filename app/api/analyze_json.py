@@ -540,7 +540,7 @@ def _prepare_catalog_payload(
     for item in catalog:
         if not isinstance(item, Mapping):
             continue
-        name = str(item.get("name") or "").strip()
+        name = _coerce_text(item.get("name"))
         if not name:
             continue
 
@@ -562,6 +562,33 @@ def _prepare_catalog_payload(
         return None
 
     return {"items": items}
+
+
+def _coerce_text(value: Any) -> str:
+    """Нормализует произвольное значение к человекочитаемой строке."""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, Mapping):
+        for key in ("name", "title", "label", "text", "value"):
+            nested = _coerce_text(value.get(key))
+            if nested:
+                return nested
+        try:
+            return json.dumps(value, ensure_ascii=False).strip()
+        except Exception:  # noqa: BLE001
+            return str(value).strip()
+
+    if isinstance(value, (list, tuple, set)):
+        parts = [_coerce_text(item) for item in value]
+        merged = ", ".join(part for part in parts if part)
+        return merged.strip()
+
+    if value is None:
+        return ""
+
+    return str(value).strip()
 
 
 async def _load_catalog(
@@ -1206,14 +1233,14 @@ def _sanitize_catalog_items(
         name_value: Optional[str] = None
         text_value: Optional[str] = None
         for key in text_keys:
-            candidate = raw_item.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                text_value = candidate.strip()
+            candidate = _coerce_text(raw_item.get(key))
+            if candidate:
+                text_value = candidate
                 break
         for key in name_keys:
-            candidate = raw_item.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                name_value = candidate.strip()
+            candidate = _coerce_text(raw_item.get(key))
+            if candidate:
+                name_value = candidate
                 break
         if not name_value:
             name_value = text_value
@@ -1223,10 +1250,10 @@ def _sanitize_catalog_items(
         item_payload: dict[str, Any] = {"name": name_value}
         if text_value:
             item_payload["text"] = text_value
-        elif isinstance(raw_item.get("text"), str):
-            stripped = raw_item["text"].strip()
-            if stripped:
-                item_payload["text"] = stripped
+        else:
+            fallback_text = _coerce_text(raw_item.get("text"))
+            if fallback_text:
+                item_payload["text"] = fallback_text
 
         for key in id_keys:
             candidate_id = raw_item.get(key)
@@ -1870,12 +1897,11 @@ async def _apply_db_payload(
                 for item in goods_items:
                     if not isinstance(item, dict):
                         continue
-                    name = (
+                    name = _coerce_text(
                         item.get("name")
                         or item.get("goods_type")
                         or item.get("text")
-                        or ""
-                    ).strip()
+                    )
                     if not name:
                         continue
                     match_id = _safe_int(
@@ -2109,12 +2135,11 @@ async def _apply_db_payload(
                 for item in equipment_items:
                     if not isinstance(item, dict):
                         continue
-                    name = (
+                    name = _coerce_text(
                         item.get("name")
                         or item.get("equipment")
                         or item.get("text")
-                        or ""
-                    ).strip()
+                    )
                     if not name:
                         continue
                     match_id = _safe_int(
