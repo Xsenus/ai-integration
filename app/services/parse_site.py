@@ -185,6 +185,16 @@ class ParseSiteResponse(BaseModel):
     site_unavailable: SiteUnavailableFallback | None = None
 
 
+def _should_use_okved_fallback(results: list[ParsedSiteResult], total_inserted: int) -> bool:
+    """Возвращает True, когда нужно переходить на fallback по ОКВЭД."""
+
+    if total_inserted > 0:
+        return False
+    if not results:
+        return True
+    return all((item.chunks_inserted or 0) <= 0 for item in results)
+
+
 @dataclass(slots=True)
 class _DomainFetchResult:
     requested_domain: str
@@ -1586,6 +1596,18 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
         _log_description_metrics(len(results) or len(domains_to_process))
         fallback_response = await _build_site_unavailable_response(
             site_unavailable_reason or errors
+        )
+        return fallback_response
+
+    if _should_use_okved_fallback(successes, total_inserted):
+        log.warning(
+            "parse-site: домены обработаны, но данные сайта не сохранены (ИНН=%s, total_inserted=%s) — fallback по ОКВЭД",
+            inn,
+            total_inserted,
+        )
+        _log_description_metrics(len(results) or len(domains_to_process))
+        fallback_response = await _build_site_unavailable_response(
+            "Не удалось получить данные сайта для анализа"
         )
         return fallback_response
 

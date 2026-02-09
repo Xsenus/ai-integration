@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Mapping, Optional
 
 import httpx
@@ -20,6 +21,36 @@ _RETRY_BASE_DELAY = 0.5
 
 _client_pool: dict[str, httpx.AsyncClient] = {}
 _client_lock = asyncio.Lock()
+_FIRST_INT_RE = re.compile(r"\b(\d{1,4})\b")
+
+
+def _extract_first_int(value: object) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        pass
+
+    match = _FIRST_INT_RE.search(text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
 
 def _normalize_base(url: Optional[str]) -> Optional[str]:
     if not url:
@@ -87,6 +118,8 @@ def _coerce_vector(value: Any) -> Optional[list[float]]:
         except (TypeError, ValueError):
             continue
     return result or None
+
+
 async def ensure_service_available(base_url: str, *, label: str) -> None:
     """Проверяет доступность внешнего сервиса анализа."""
 
@@ -292,11 +325,12 @@ async def fetch_prodclass_by_okved(
     raw_response_value = data.get("raw_response") or data.get("response")
     raw_response = str(raw_response_value).strip() if raw_response_value is not None else None
 
-    prodclass_value = data.get("prodclass_by_okved") or data.get("prodclass")
-    try:
-        prodclass_by_okved = int(prodclass_value) if prodclass_value is not None else None
-    except (TypeError, ValueError):
-        prodclass_by_okved = None
+    prodclass_value = data.get("prodclass_by_okved")
+    if prodclass_value is None:
+        prodclass_value = data.get("prodclass")
+    if prodclass_value is None:
+        prodclass_value = raw_response_value
+    prodclass_by_okved = _extract_first_int(prodclass_value)
 
     log.info(
         "analyze-client: prodclass_by_okved=%s получен по ОКВЭД %s (%s, base=%s)",
