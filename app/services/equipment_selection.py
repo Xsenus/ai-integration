@@ -321,13 +321,22 @@ class EquipmentStepReport:
 
 
 async def compute_equipment_selection(
-    conn: AsyncConnection, client_request_id: int
+    conn: AsyncConnection,
+    client_request_id: int,
+    *,
+    allow_virtual_client: bool = False,
+    fallback_inn: str | None = None,
 ) -> EquipmentSelectionResponse:
     log.info(
         "equipment-selection: запуск расчёта для clients_requests.id=%s",
         client_request_id,
     )
-    report = await build_equipment_tables(conn, client_request_id)
+    report = await build_equipment_tables(
+        conn,
+        client_request_id,
+        allow_virtual_client=allow_virtual_client,
+        fallback_inn=fallback_inn,
+    )
     response = _build_response(report)
     return response
 
@@ -565,7 +574,11 @@ async def resolve_client_request_id(conn: AsyncConnection, inn: str) -> Optional
 
 
 async def build_equipment_tables(
-    conn: AsyncConnection, client_request_id: int
+    conn: AsyncConnection,
+    client_request_id: int,
+    *,
+    allow_virtual_client: bool = False,
+    fallback_inn: str | None = None,
 ) -> EquipmentStepReport:
     report = EquipmentStepReport()
     _log_event(
@@ -579,7 +592,12 @@ async def build_equipment_tables(
     )
 
     _append_step_separator(report.log, "Шаг 0 — Клиент")
-    client_rows = await _load_client(conn, client_request_id)
+    client_rows = await _load_client(
+        conn,
+        client_request_id,
+        allow_virtual_client=allow_virtual_client,
+        fallback_inn=fallback_inn,
+    )
     report.client_rows = client_rows
     report.company_id = await _resolve_company_id(
         conn, client_request_id, client_rows, report.log
@@ -917,34 +935,44 @@ async def build_equipment_tables(
         columns=["id", "equipment_name", "score", "source"],
     )
 
-    await _sync_equipment_table(
-        conn,
-        "EQUIPMENT_1way",
-        equipment_1way,
-        client_request_id,
-        report.log,
-    )
-    await _sync_equipment_table(
-        conn,
-        "EQUIPMENT_2way",
-        equipment_2way,
-        client_request_id,
-        report.log,
-    )
-    await _sync_equipment_table(
-        conn,
-        "EQUIPMENT_3way",
-        equipment_3way,
-        client_request_id,
-        report.log,
-    )
-    await _sync_equipment_table(
-        conn,
-        "EQUIPMENT_ALL",
-        equipment_all,
-        client_request_id,
-        report.log,
-    )
+    if allow_virtual_client:
+        _log_event(
+            report.log,
+            (
+                "Пропускаем синхронизацию EQUIPMENT_*: используется virtual client "
+                f"для ИНН {fallback_inn or 'unknown'}."
+            ),
+            level=logging.WARNING,
+        )
+    else:
+        await _sync_equipment_table(
+            conn,
+            "EQUIPMENT_1way",
+            equipment_1way,
+            client_request_id,
+            report.log,
+        )
+        await _sync_equipment_table(
+            conn,
+            "EQUIPMENT_2way",
+            equipment_2way,
+            client_request_id,
+            report.log,
+        )
+        await _sync_equipment_table(
+            conn,
+            "EQUIPMENT_3way",
+            equipment_3way,
+            client_request_id,
+            report.log,
+        )
+        await _sync_equipment_table(
+            conn,
+            "EQUIPMENT_ALL",
+            equipment_all,
+            client_request_id,
+            report.log,
+        )
 
     _append_step_separator(report.log, "Итоговый отчёт")
     _log_event(
@@ -959,7 +987,11 @@ async def build_equipment_tables(
 
 
 async def _load_client(
-    conn: AsyncConnection, client_request_id: int
+    conn: AsyncConnection,
+    client_request_id: int,
+    *,
+    allow_virtual_client: bool = False,
+    fallback_inn: str | None = None,
 ) -> List[Dict[str, Any]]:
     log.debug(
         "equipment-selection: загружаем клиента из public.clients_requests (id=%s)",
@@ -988,6 +1020,22 @@ async def _load_client(
     result = await conn.execute(stmt, {"cid": client_request_id})
     mappings = list(result.mappings())
     if not mappings:
+        if allow_virtual_client and fallback_inn:
+            log.warning(
+                "equipment-selection: clients_requests.id=%s не найден, используем synthetic client по ИНН %s",
+                client_request_id,
+                fallback_inn,
+            )
+            return [
+                {
+                    "id": client_request_id,
+                    "company_name": None,
+                    "inn": fallback_inn,
+                    "domain_1": None,
+                    "started_at": None,
+                    "ended_at": None,
+                }
+            ]
         raise EquipmentSelectionNotFound(
             f"clients_requests.id={client_request_id} не найден"
         )

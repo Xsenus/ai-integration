@@ -301,14 +301,20 @@ async def get_equipment_selection_by_inn(
         raise HTTPException(status_code=503, detail="Postgres engine is not configured")
     async with engine.begin() as conn:
         client_request_id = await resolve_client_request_id(conn, inn)
-        if client_request_id is None:
+        allow_virtual_client = client_request_id is None
+        if allow_virtual_client:
             log.warning(
-                "equipment-selection GET/by-inn: clients_requests not found for INN %s",
+                "equipment-selection GET/by-inn: clients_requests not found for INN %s, using virtual fallback id=0",
                 inn,
             )
-            raise HTTPException(status_code=404, detail=f"clients_requests for INN {inn} not found")
+            client_request_id = 0
         try:
-            result = await compute_equipment_selection(conn, client_request_id)
+            result = await compute_equipment_selection(
+                conn,
+                client_request_id,
+                allow_virtual_client=allow_virtual_client,
+                fallback_inn=inn,
+            )
         except EquipmentSelectionNotFound as exc:  # pragma: no cover - network/db required
             log.warning(
                 "equipment-selection GET/by-inn: selection not found for INN %s (id=%s)",
