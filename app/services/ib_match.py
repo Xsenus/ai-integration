@@ -342,19 +342,32 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
 
     goods_embeddings_generated = 0
     equipment_embeddings_generated = 0
+    embedding_warnings: list[str] = []
 
     if goods_embed_targets:
         log.info("ib-match: generating %s goods embeddings", len(goods_embed_targets))
-        goods_vectors = await _embed_and_update_rows(goods_embed_targets)
-        goods_embeddings_generated = len(goods_embed_targets)
+        goods_vectors, goods_warning = await _embed_rows_with_fallback(
+            goods_embed_targets,
+            entity_label="goods_types",
+        )
+        if goods_warning:
+            embedding_warnings.append(goods_warning)
+        else:
+            goods_embeddings_generated = len(goods_vectors)
         for row, vector in zip(goods_embed_targets, goods_vectors):
             row.vector = vector
     else:
         log.info("ib-match: goods embeddings already exist — skipping regeneration")
     if equipment_embed_targets:
         log.info("ib-match: generating %s equipment embeddings", len(equipment_embed_targets))
-        equipment_vectors = await _embed_and_update_rows(equipment_embed_targets)
-        equipment_embeddings_generated = len(equipment_embed_targets)
+        equipment_vectors, equipment_warning = await _embed_rows_with_fallback(
+            equipment_embed_targets,
+            entity_label="equipment",
+        )
+        if equipment_warning:
+            embedding_warnings.append(equipment_warning)
+        else:
+            equipment_embeddings_generated = len(equipment_vectors)
         for row, vector in zip(equipment_embed_targets, equipment_vectors):
             row.vector = vector
     else:
@@ -542,6 +555,7 @@ async def assign_ib_matches(*, client_id: int, reembed_if_exists: bool) -> dict[
         equipment_updated=equipment_updated,
         prodclass_updated=prodclass_updated,
         prodclass_cleared=prodclass_cleared,
+        embedding_warnings=embedding_warnings,
     )
 
     log.info(
@@ -679,6 +693,27 @@ async def _embed_and_update_rows(rows: Sequence[SourceRow]) -> List[List[float]]
     for batch in _batched(texts, _MAX_BATCH_SIZE):
         vectors.extend(await _embed_texts(batch))
     return vectors
+
+
+async def _embed_rows_with_fallback(
+    rows: Sequence[SourceRow],
+    *,
+    entity_label: str,
+) -> tuple[List[List[float]], Optional[str]]:
+    """Генерирует эмбеддинги, но не прерывает пайплайн при недоступности сервиса."""
+
+    if not rows:
+        return [], None
+
+    try:
+        return await _embed_and_update_rows(rows), None
+    except IbMatchServiceError as exc:
+        warning = (
+            f"Не удалось получить эмбеддинги для {entity_label}: {exc}. "
+            "Продолжаем сопоставление по уже сохранённым векторам."
+        )
+        log.warning("ib-match: %s", warning)
+        return [], warning
 
 
 async def _embed_texts(texts: Sequence[str]) -> List[List[float]]:
@@ -1049,6 +1084,7 @@ def _build_report(
     equipment_updated: int,
     prodclass_updated: int,
     prodclass_cleared: int,
+    embedding_warnings: Sequence[str],
 ) -> str:
     lines: List[str] = []
     lines.append(
@@ -1090,6 +1126,8 @@ def _build_report(
             "equipment", equipment_embeddings_generated, len(equipment_rows)
         )
     )
+    for warning in embedding_warnings:
+        lines.append(f"[WARN] {warning}")
 
     lines.append("")
     lines.append("=" * _BORDER_WIDTH)

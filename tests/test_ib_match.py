@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 
 import app.services.ib_match as ib_match_mod
@@ -102,3 +103,36 @@ def test_match_rows_skips_match_when_below_threshold() -> None:
     assert matches[0].score == 0.0
     assert matches[0].note == "Сходство ниже порога 0.75"
     assert updates == [{"id": 3, "match_id": None, "score": 0.0}]
+
+
+def test_embed_rows_with_fallback_returns_warning_on_service_error(monkeypatch) -> None:
+    row = SourceRow(ai_id=1, text="Тест", vector=None)
+
+    async def _raise(_rows):
+        raise ib_match_mod.IbMatchServiceError("service unavailable", status_code=503)
+
+    monkeypatch.setattr(ib_match_mod, "_embed_and_update_rows", _raise)
+
+    vectors, warning = asyncio.run(
+        ib_match_mod._embed_rows_with_fallback([row], entity_label="goods_types")
+    )
+
+    assert vectors == []
+    assert warning is not None
+    assert "goods_types" in warning
+
+
+def test_embed_rows_with_fallback_returns_vectors_on_success(monkeypatch) -> None:
+    row = SourceRow(ai_id=1, text="Тест", vector=None)
+
+    async def _ok(_rows):
+        return [[0.1, 0.2]]
+
+    monkeypatch.setattr(ib_match_mod, "_embed_and_update_rows", _ok)
+
+    vectors, warning = asyncio.run(
+        ib_match_mod._embed_rows_with_fallback([row], entity_label="equipment")
+    )
+
+    assert vectors == [[0.1, 0.2]]
+    assert warning is None
