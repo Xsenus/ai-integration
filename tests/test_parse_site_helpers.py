@@ -1,6 +1,7 @@
 import pytest
 
 from app.services.parse_site import (
+    _merge_domains_prefer_explicit,
     _is_disallowed_domain,
     _normalize_domains,
     _summarize_okved_scores,
@@ -55,3 +56,21 @@ def test_is_disallowed_domain_filters_subdomains_of_personal_services():
     assert _is_disallowed_domain("mail.ru") is True
     assert _is_disallowed_domain("corp.mail.ru") is True
     assert _is_disallowed_domain("td-kama.com") is False
+
+
+def test_merge_domains_prefer_explicit_ignores_email_domains_when_explicit_present():
+    explicit = ["dvec.ru"]
+    email = ["rospatriotcentr.ru"]
+
+    merged = _merge_domains_prefer_explicit(explicit, email)
+
+    assert merged == ["dvec.ru"]
+
+
+def test_merge_domains_prefer_explicit_uses_email_domains_as_fallback():
+    explicit: list[str] = []
+    email = ["dvec.ru", "dvec.ru", "post.eao.ru"]
+
+    merged = _merge_domains_prefer_explicit(explicit, email)
+
+    assert merged == ["dvec.ru", "post.eao.ru"]

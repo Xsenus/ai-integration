@@ -49,11 +49,18 @@ def test_run_analyze_marks_okved_fallback_as_success(monkeypatch) -> None:
             ),
         )
 
+    async def _persist_okved_fallback_snapshot(_engine, *, inn: str, company_id: int | None, prodclass_by_okved: int | None):
+        assert inn == "7701234567"
+        assert company_id == 321
+        assert prodclass_by_okved == 17
+        return company_id, 999
+
     monkeypatch.setattr(analyze_json_mod, "get_postgres_engine", lambda: object())
     monkeypatch.setattr(analyze_json_mod.settings, "AI_ANALYZE_BASE", "http://analyze.local")
     monkeypatch.setattr(analyze_json_mod, "ensure_service_available", _ensure_service_available)
     monkeypatch.setattr(analyze_json_mod, "_collect_latest_pars_site", _collect_latest_pars_site)
     monkeypatch.setattr(analyze_json_mod, "_trigger_parse_site", _trigger_parse_site)
+    monkeypatch.setattr(analyze_json_mod, "_persist_okved_fallback_snapshot", _persist_okved_fallback_snapshot)
 
     result = asyncio.run(
         analyze_json_mod._run_analyze(
@@ -65,5 +72,7 @@ def test_run_analyze_marks_okved_fallback_as_success(monkeypatch) -> None:
     assert result.status == "ok"
     assert result.okved_fallback_used is True
     assert result.prodclass_id == 17
+    assert result.pars_id == 999
     assert result.runs
+    assert result.runs[0].pars_id == 999
     assert result.runs[0].okved_fallback_used is True

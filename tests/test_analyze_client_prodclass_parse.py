@@ -61,3 +61,30 @@ def test_fetch_prodclass_by_okved_extracts_digit_from_verbose_raw_response(monke
 
     assert raw_response == "IB_PRODCLASS = 101"
     assert prodclass_by_okved == 101
+
+
+def test_fetch_prodclass_by_okved_supports_answer_and_parsed_prodclass(monkeypatch) -> None:
+    async def _ensure_service_available(_base_url: str, *, label: str) -> None:
+        assert label.startswith("health:")
+
+    async def _post_with_retries(_base_url: str, _path: str, _payload: dict[str, object], *, label: str):
+        assert label == "site-unavailable:test"
+        return _FakeResponse(
+            {
+                "prompt": "pick class",
+                "answer": "107",
+                "parsed": {"PRODCLASS": 107},
+            }
+        )
+
+    monkeypatch.setattr(analyze_client, "get_analyze_base_url", lambda: "http://analyze.local")
+    monkeypatch.setattr(analyze_client, "ensure_service_available", _ensure_service_available)
+    monkeypatch.setattr(analyze_client, "_post_with_retries", _post_with_retries)
+
+    prompt, raw_response, prodclass_by_okved = asyncio.run(
+        analyze_client.fetch_prodclass_by_okved("35.11.2", label="site-unavailable:test")
+    )
+
+    assert prompt == "pick class"
+    assert raw_response == "107"
+    assert prodclass_by_okved == 107

@@ -1090,7 +1090,7 @@ def _normalize_score(value: Any) -> Optional[float]:
     if num > 1.0 and num <= 100.0:
         num = num / 100.0
     num = max(0.0, min(1.0, num))
-    return float(f"{num:.2f}")
+    return float(f"{num:.4f}")
 
 
 def _okved_to_industry_label(okved: Optional[str]) -> Optional[str]:
@@ -1196,6 +1196,120 @@ def _safe_int(value: Any) -> Optional[int]:
         return int(value)
     except Exception:  # noqa: BLE001
         return None
+
+
+async def _persist_okved_fallback_snapshot(
+    engine: AsyncEngine,
+    *,
+    inn: str,
+    company_id: Optional[int],
+    prodclass_by_okved: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """Сохраняет fallback по ОКВЭД в БД, чтобы UI и equipment-selection видели класс."""
+
+    prodclass_id = _safe_int(prodclass_by_okved)
+    if prodclass_id is None:
+        return company_id, None
+
+    async with engine.begin() as conn:
+        resolved_company_id = company_id
+        if resolved_company_id is None:
+            company_row = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT id
+                        FROM public.clients_requests
+                        WHERE inn = :inn
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"inn": inn},
+                )
+            ).mappings().first()
+            resolved_company_id = _safe_int(company_row.get("id") if company_row else None)
+
+        if resolved_company_id is None:
+            log.warning(
+                "analyze-json: failed to persist OKVED fallback, company_id not found (inn=%s)",
+                inn,
+            )
+            return None, None
+
+        pars_row = (
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO public.pars_site (company_id, domain_1, url, start, "end", text, text_par)
+                    VALUES (:company_id, :domain, :url, :start, :end, :text, :text_par)
+                    RETURNING id
+                    """
+                ),
+                {
+                    "company_id": resolved_company_id,
+                    "domain": "okved-fallback.local",
+                    "url": "okved://fallback",
+                    "start": None,
+                    "end": None,
+                    "text": None,
+                    "text_par": None,
+                },
+            )
+        ).mappings().first()
+        pars_id = _safe_int(pars_row.get("id") if pars_row else None)
+        if pars_id is None:
+            log.warning(
+                "analyze-json: failed to persist OKVED fallback, pars_id is empty (inn=%s, company_id=%s)",
+                inn,
+                resolved_company_id,
+            )
+            return resolved_company_id, None
+
+        prodclass_columns = await _get_table_columns(conn, "ai_site_prodclass")
+        for column_name, ddl in (("okved_score", "NUMERIC(6,4)"), ("prodclass_by_okved", "INT")):
+            if column_name not in prodclass_columns:
+                prodclass_columns = await _ensure_column_exists(
+                    conn,
+                    "ai_site_prodclass",
+                    column_name,
+                    ddl,
+                )
+
+        insert_columns = ["text_pars_id", "prodclass", "prodclass_score"]
+        insert_values = [":text_pars_id", ":prodclass", ":prodclass_score"]
+        params: dict[str, Any] = {
+            "text_pars_id": pars_id,
+            "prodclass": prodclass_id,
+            "prodclass_score": 1.0,
+        }
+
+        if "okved_score" in prodclass_columns:
+            insert_columns.append("okved_score")
+            insert_values.append(":okved_score")
+            params["okved_score"] = 1.0
+        if "prodclass_by_okved" in prodclass_columns:
+            insert_columns.append("prodclass_by_okved")
+            insert_values.append(":prodclass_by_okved")
+            params["prodclass_by_okved"] = prodclass_id
+
+        await conn.execute(
+            text(
+                "INSERT INTO public.ai_site_prodclass "
+                f"({', '.join(insert_columns)}) "
+                f"VALUES ({', '.join(insert_values)})"
+            ),
+            params,
+        )
+
+    log.info(
+        "analyze-json: OKVED fallback persisted (inn=%s, company_id=%s, pars_id=%s, prodclass=%s)",
+        inn,
+        resolved_company_id,
+        pars_id,
+        prodclass_id,
+    )
+    return resolved_company_id, pars_id
 
 
 def _compact_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -2535,17 +2649,28 @@ async def _run_analyze(
         if parse_site_response and parse_site_response.site_unavailable:
             fallback = parse_site_response.site_unavailable.model_dump()
             first_okved = fallback.get("okved")
+            fallback_prodclass_id = _safe_int(fallback.get("prodclass_by_okved"))
+            persisted_company_id = parse_site_response.company_id
+            persisted_pars_id: Optional[int] = None
+            if fallback_prodclass_id is not None:
+                persisted_company_id, persisted_pars_id = await _persist_okved_fallback_snapshot(
+                    engine,
+                    inn=inn,
+                    company_id=parse_site_response.company_id,
+                    prodclass_by_okved=fallback_prodclass_id,
+                )
+
             response = AnalyzeFromInnResponse(
                 status="ok",
                 inn=inn,
-                pars_id=None,
-                company_id=parse_site_response.company_id,
+                pars_id=persisted_pars_id,
+                company_id=persisted_company_id,
                 text_length=0,
                 catalog_goods_size=0,
                 catalog_equipment_size=0,
                 saved_goods=0,
                 saved_equipment=0,
-                prodclass_id=fallback.get("prodclass_by_okved"),
+                prodclass_id=fallback_prodclass_id,
                 prodclass_score=None,
                 external_request={"reason": "site-unavailable", "okved": first_okved},
                 external_status=status.HTTP_404_NOT_FOUND,
@@ -2563,8 +2688,8 @@ async def _run_analyze(
                     AnalyzeFromInnRun(
                         domain=None,
                         domain_source=None,
-                        pars_id=None,
-                        company_id=parse_site_response.company_id,
+                        pars_id=persisted_pars_id,
+                        company_id=persisted_company_id,
                         created_at=parse_site_response.finished_at,
                         text_length=0,
                         chunk_count=0,
@@ -2572,7 +2697,7 @@ async def _run_analyze(
                         catalog_equipment_size=0,
                         saved_goods=0,
                         saved_equipment=0,
-                        prodclass_id=fallback.get("prodclass_by_okved"),
+                        prodclass_id=fallback_prodclass_id,
                         prodclass_score=None,
                         external_request={"reason": "site-unavailable", "okved": first_okved},
                         external_status=status.HTTP_404_NOT_FOUND,
