@@ -548,25 +548,42 @@ def _build_response(report: EquipmentStepReport) -> EquipmentSelectionResponse:
 
 
 async def resolve_client_request_id(conn: AsyncConnection, inn: str) -> Optional[int]:
-    stmt = text(
-        """
+    normalized_inn = inn.strip()
+    query_template = """
         SELECT id
-        FROM public.clients_requests
+        FROM {schema}.clients_requests
         WHERE inn = :inn
-        ORDER BY id DESC
+        ORDER BY COALESCE(ended_at, created_at) DESC NULLS LAST, id DESC
         LIMIT 1
-        """
-    )
-    row = (await conn.execute(stmt, {"inn": inn.strip()})).first()
-    if row is None:
+    """
+
+    public_stmt = text(query_template.format(schema="public"))
+    public_row = (await conn.execute(public_stmt, {"inn": normalized_inn})).first()
+    if public_row is not None:
+        resolved = int(public_row[0])
         log.info(
-            "equipment-selection: для ИНН %s не найдены записи clients_requests",
+            "equipment-selection: ИНН %s сопоставлен с public.clients_requests.id=%s",
+            inn,
+            resolved,
+        )
+        return resolved
+
+    log.info(
+        "equipment-selection: для ИНН %s не найдены записи в public.clients_requests — пробуем parsing_data",
+        inn,
+    )
+    fallback_stmt = text(query_template.format(schema="parsing_data"))
+    fallback_row = (await conn.execute(fallback_stmt, {"inn": normalized_inn})).first()
+    if fallback_row is None:
+        log.info(
+            "equipment-selection: для ИНН %s не найдены записи clients_requests ни в public, ни в parsing_data",
             inn,
         )
         return None
-    resolved = int(row[0])
+
+    resolved = int(fallback_row[0])
     log.info(
-        "equipment-selection: ИНН %s сопоставлен с clients_requests.id=%s",
+        "equipment-selection: ИНН %s сопоставлен с parsing_data.clients_requests.id=%s",
         inn,
         resolved,
     )
