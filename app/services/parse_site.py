@@ -574,6 +574,28 @@ def _normalize_email_domains(values: Iterable[object]) -> list[str]:
     return result
 
 
+def _merge_domains_prefer_explicit(
+    explicit_domains: Sequence[str],
+    email_domains: Sequence[str],
+) -> list[str]:
+    """Объединяет домены, используя email-домены только как fallback.
+
+    Email-домены часто относятся к внешним/партнёрским сервисам и могут
+    искажать контекст анализируемой компании. Поэтому берём их только если
+    явные домены (сайты/домены из БД) отсутствуют.
+    """
+
+    primary = list(explicit_domains) if explicit_domains else list(email_domains)
+    combined: list[str] = []
+    seen: set[str] = set()
+    for dom in primary:
+        if dom in seen:
+            continue
+        seen.add(dom)
+        combined.append(dom)
+    return combined
+
+
 async def _collect_domains_by_inn(inn: str, session: AsyncSession) -> list[str]:
     """Возвращает уникальный список доменов для ИНН из разных источников."""
 
@@ -681,13 +703,12 @@ async def _collect_domains_by_inn(inn: str, session: AsyncSession) -> list[str]:
             email_domains,
         )
 
-    combined: list[str] = []
-    seen: set[str] = set()
-    for dom in itertools.chain(normalized_domains, email_domains):
-        if dom in seen:
-            continue
-        seen.add(dom)
-        combined.append(dom)
+    combined = _merge_domains_prefer_explicit(normalized_domains, email_domains)
+
+    if normalized_domains and email_domains:
+        log.info(
+            "parse-site: email-домены не добавлены, так как уже есть явные домены из БД",
+        )
 
     log.info(
         "parse-site: итоговый список доменов по ИНН %s (%s шт.) → %s",
@@ -760,13 +781,15 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
             manual_email_domains,
         )
 
-    normalized_manual: list[str] = []
-    normalized_manual_seen: set[str] = set()
-    for dom in itertools.chain(normalized_manual_domains, manual_email_domains):
-        if dom in normalized_manual_seen:
-            continue
-        normalized_manual_seen.add(dom)
-        normalized_manual.append(dom)
+    normalized_manual = _merge_domains_prefer_explicit(
+        normalized_manual_domains,
+        manual_email_domains,
+    )
+
+    if normalized_manual_domains and manual_email_domains:
+        log.info(
+            "parse-site: домены из ручных email не добавлены, так как заданы явные ручные домены",
+        )
 
     log.info("parse-site: нормализованные ручные домены → %s", normalized_manual)
     domains_to_process: list[str]

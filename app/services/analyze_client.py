@@ -322,12 +322,23 @@ async def fetch_prodclass_by_okved(
     prompt_raw = data.get("prompt") or data.get("request")
     prompt = prompt_raw.strip() if isinstance(prompt_raw, str) else None
 
-    raw_response_value = data.get("raw_response") or data.get("response")
+    raw_response_value = (
+        data.get("raw_response")
+        or data.get("response")
+        or data.get("answer")
+    )
     raw_response = str(raw_response_value).strip() if raw_response_value is not None else None
 
     prodclass_value = data.get("prodclass_by_okved")
     if prodclass_value is None:
         prodclass_value = data.get("prodclass")
+    if prodclass_value is None:
+        parsed_payload = data.get("parsed")
+        if isinstance(parsed_payload, Mapping):
+            prodclass_value = (
+                parsed_payload.get("PRODCLASS")
+                or parsed_payload.get("prodclass")
+            )
     if prodclass_value is None:
         prodclass_value = raw_response_value
     prodclass_by_okved = _extract_first_int(prodclass_value)

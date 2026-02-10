@@ -38,3 +38,8 @@ def test_sanitize_db_payload_goods_uses_human_readable_name() -> None:
     assert sanitized["goods"][0]["name"] == "Криооборудование"
     assert sanitized["goods"][0]["id"] == 17
     assert sanitized["goods"][0]["score"] == 0.88
+
+
+def test_normalize_score_keeps_four_decimals() -> None:
+    assert analyze_json_mod._normalize_score(0.81549) == 0.8155
+    assert analyze_json_mod._normalize_score(81.549) == 0.8155
