@@ -32,6 +32,7 @@ from app.db.postgres import get_postgres_engine, ping_postgres
 # Bitrix24 raw companies (модель таблицы) + sync job
 from app.models.bitrix_company import BaseBitrix
 from app.jobs.b24_sync_job import run_b24_sync_loop
+from app.services.analyze_client import close_analyze_clients
 
 # --- Logging ---
 LOG_LEVEL = (settings.LOG_LEVEL or "INFO").upper()
@@ -63,6 +64,40 @@ app.include_router(ai_analysis_router)
 
 # Хэндлы фоновых задач (для корректной остановки)
 _bg_tasks: List[asyncio.Task] = []
+
+
+def _dsn_configured(value: str | None) -> bool:
+    return bool(value and value.strip())
+
+
+async def _probe_connection(
+    *,
+    dsn_configured: bool,
+    ping_fn=None,
+    engine_getter=None,
+    logger_name: str,
+) -> str:
+    if not dsn_configured:
+        return "disabled"
+
+    try:
+        if ping_fn is not None:
+            return "ok" if await ping_fn() else "down"
+
+        eng = engine_getter() if engine_getter is not None else None
+        if eng is None:
+            return "down"
+        async with eng.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return "ok"
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(logger_name).info("healthcheck ping failed: %s", exc)
+        return "down"
+
+
+def _health_ok(connections: dict[str, str]) -> bool:
+    enabled = [status for status in connections.values() if status != "disabled"]
+    return all(status == "ok" for status in enabled)
 
 
 @app.on_event("startup")
@@ -136,6 +171,10 @@ async def on_shutdown() -> None:
         await close_analyze_json_http_client()
     except Exception:
         log.exception("Failed to close analyze-json HTTP client")
+    try:
+        await close_analyze_clients()
+    except Exception:
+        log.exception("Failed to close analyze HTTP clients")
 
     # Закрываем коннекты к БД
     engines: list[AsyncEngine | None] = [
@@ -156,32 +195,27 @@ async def health():
     Healthcheck пингует все четыре базы.
     ok=true только если доступны все, для которых заданы DSN.
     """
-    results = {
-        "bitrix_data": await ping_bitrix(),
-        "parsing_data": False,
-        "pp719": False,
-        "postgres": await ping_postgres(),
+    connections = {
+        "bitrix_data": await _probe_connection(
+            dsn_configured=_dsn_configured(settings.bitrix_url),
+            ping_fn=ping_bitrix,
+            logger_name="db.bitrix",
+        ),
+        "parsing_data": await _probe_connection(
+            dsn_configured=_dsn_configured(settings.parsing_url),
+            engine_getter=get_parsing_engine,
+            logger_name="db.parsing",
+        ),
+        "pp719": await _probe_connection(
+            dsn_configured=_dsn_configured(settings.pp719_url),
+            engine_getter=get_pp719_engine,
+            logger_name="db.pp719",
+        ),
+        "postgres": await _probe_connection(
+            dsn_configured=_dsn_configured(settings.postgres_url),
+            ping_fn=ping_postgres,
+            logger_name="db.postgres",
+        ),
     }
 
-    # parsing_data ping
-    try:
-        eng = get_parsing_engine()
-        if eng is not None:
-            async with eng.connect() as conn:
-                await conn.execute(text("SELECT 1"))
-            results["parsing_data"] = True
-    except Exception as e:
-        logging.getLogger("db.parsing").warning("parsing ping failed: %s", e)
-
-    # pp719 ping
-    try:
-        eng = get_pp719_engine()
-        if eng is not None:
-            async with eng.connect() as conn:
-                await conn.execute(text("SELECT 1"))
-            results["pp719"] = True
-    except Exception as e:
-        logging.getLogger("db.pp719").warning("pp719 ping failed: %s", e)
-
-    ok = all(results.values()) if results else False
-    return {"ok": ok, "connections": results}
+    return {"ok": _health_ok(connections), "connections": connections}

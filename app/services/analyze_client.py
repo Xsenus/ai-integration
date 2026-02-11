@@ -97,6 +97,20 @@ async def _get_client(base_url: str) -> httpx.AsyncClient:
         return client
 
 
+async def close_analyze_clients() -> None:
+    """Закрывает все кэшированные HTTP-клиенты analyze-сервиса."""
+
+    async with _client_lock:
+        clients = list(_client_pool.values())
+        _client_pool.clear()
+
+    for client in clients:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            log.exception("analyze-client: failed to close HTTP client")
+
+
 def _coerce_vector(value: Any) -> Optional[list[float]]:
     if value is None:
         return None
@@ -357,6 +371,7 @@ async def fetch_prodclass_by_okved(
 __all__ = [
     "AnalyzeServiceUnavailable",
     "ensure_service_available",
+    "close_analyze_clients",
     "get_analyze_base_url",
     "fetch_site_description",
     "fetch_embedding",
