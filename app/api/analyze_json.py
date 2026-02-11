@@ -1237,24 +1237,37 @@ async def _persist_okved_fallback_snapshot(
             )
             return None, None
 
+        pars_columns = await _get_table_columns(conn, "pars_site")
+
+        insert_columns: list[str] = ["company_id"]
+        insert_values: list[str] = [":company_id"]
+        insert_params: dict[str, Any] = {"company_id": resolved_company_id}
+
+        optional_pars_columns: tuple[tuple[str, str, Any], ...] = (
+            ("domain_1", "domain", "okved-fallback.local"),
+            ("url", "url", "okved://fallback"),
+            ("start", "start", None),
+            ("end", "end", None),
+            ("text", "text", None),
+            ("text_par", "text_par", None),
+        )
+        for column_name, param_name, param_value in optional_pars_columns:
+            if column_name in pars_columns:
+                insert_columns.append(f'"{column_name}"' if column_name == "end" else column_name)
+                insert_values.append(f":{param_name}")
+                insert_params[param_name] = param_value
+
+        pars_insert_sql = (
+            "INSERT INTO public.pars_site "
+            f"({', '.join(insert_columns)}) "
+            f"VALUES ({', '.join(insert_values)}) "
+            "RETURNING id"
+        )
+
         pars_row = (
             await conn.execute(
-                text(
-                    """
-                    INSERT INTO public.pars_site (company_id, domain_1, url, start, "end", text, text_par)
-                    VALUES (:company_id, :domain, :url, :start, :end, :text, :text_par)
-                    RETURNING id
-                    """
-                ),
-                {
-                    "company_id": resolved_company_id,
-                    "domain": "okved-fallback.local",
-                    "url": "okved://fallback",
-                    "start": None,
-                    "end": None,
-                    "text": None,
-                    "text_par": None,
-                },
+                text(pars_insert_sql),
+                insert_params,
             )
         ).mappings().first()
         pars_id = _safe_int(pars_row.get("id") if pars_row else None)
