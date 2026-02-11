@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -46,6 +47,8 @@ class B24CompanyRaw(BaseBitrix):
 
     @staticmethod
     def compute_sha256(obj: Dict[str, Any]) -> str:
-        # deterministic hash (repr устраивает для технической дедупликации)
-        raw = repr(obj).encode("utf-8", errors="ignore")
+        raw = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8",
+            errors="ignore",
+        )
         return hashlib.sha256(raw).hexdigest()
