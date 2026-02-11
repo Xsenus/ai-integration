@@ -344,27 +344,31 @@ async def _lookup_card_internal(
     except Exception as exc:
         log.warning("pp719 check failed for %s: %s", normalized_inn, exc)
 
-    if refreshed:
-        try:
-            ok_pg = await push_clients_request_pg(summary_dict, domain=domain)
-            if ok_pg:
-                log.info("PG clients_requests: запись добавлена (LOOKUP CARD), ИНН %s", normalized_inn)
-        except Exception as exc:
-            log.warning("PG clients_requests: ошибка записи (LOOKUP CARD), ИНН %s: %s", normalized_inn, exc)
-
-        try:
-            ok_pd = await push_clients_request_pd(summary_dict, domain=domain)
-            if ok_pd:
-                log.info(
-                    "parsing_data.clients_requests: запись добавлена (LOOKUP CARD), ИНН %s",
-                    normalized_inn,
-                )
-        except Exception as exc:
-            log.warning(
-                "parsing_data.clients_requests: ошибка записи (LOOKUP CARD), ИНН %s: %s",
+    try:
+        ok_pg = await push_clients_request_pg(summary_dict, domain=domain)
+        if ok_pg:
+            log.info(
+                "PG clients_requests: запись синхронизирована (LOOKUP CARD, refreshed=%s), ИНН %s",
+                refreshed,
                 normalized_inn,
-                exc,
             )
+    except Exception as exc:
+        log.warning("PG clients_requests: ошибка записи (LOOKUP CARD), ИНН %s: %s", normalized_inn, exc)
+
+    try:
+        ok_pd = await push_clients_request_pd(summary_dict, domain=domain)
+        if ok_pd:
+            log.info(
+                "parsing_data.clients_requests: запись синхронизирована (LOOKUP CARD, refreshed=%s), ИНН %s",
+                refreshed,
+                normalized_inn,
+            )
+    except Exception as exc:
+        log.warning(
+            "parsing_data.clients_requests: ошибка записи (LOOKUP CARD), ИНН %s: %s",
+            normalized_inn,
+            exc,
+        )
 
     if schedule_parse:
         schedule_parse_site_background(

@@ -757,7 +757,7 @@ async def build_equipment_tables(
                 {
                     "prodclass_id": prodclass_by_okved,
                     "prodclass_name": prodclass_name,
-                    "SCORE_1": _quantize(_to_decimal(selection_score or 0)),
+                    "SCORE_1": _quantize(_to_decimal(selection_score if selection_score is not None else 1.0)),
                     "votes": 1,
                 }
             ]
@@ -1824,12 +1824,13 @@ async def _sync_equipment_table(
         text(
             f"""
             CREATE TABLE IF NOT EXISTS "{table_name}"(
-                id BIGINT PRIMARY KEY,
+                id BIGINT,
                 company_id BIGINT,
                 equipment_name TEXT,
                 score NUMERIC(8,4),
                 created_at TIMESTAMPTZ,
-                updated_at TIMESTAMPTZ
+                updated_at TIMESTAMPTZ,
+                PRIMARY KEY (company_id, id)
             )
             """
         )
@@ -1841,36 +1842,63 @@ async def _sync_equipment_table(
     await _ensure_table_column(conn, table_name, "created_at", "TIMESTAMPTZ")
     await _ensure_table_column(conn, table_name, "updated_at", "TIMESTAMPTZ")
 
+    existing_pk_row = (
+        await conn.execute(
+            text(
+                """
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(:table_regclass)
+                  AND contype = 'p'
+                LIMIT 1
+                """
+            ),
+            {"table_regclass": f'public."{table_name}"'},
+        )
+    ).mappings().first()
+    existing_pk = existing_pk_row.get("conname") if existing_pk_row else None
+    expected_pk = f"{table_name.lower()}_company_id_id_pk"
+    if existing_pk and existing_pk != expected_pk:
+        cleanup_result = await conn.execute(
+            text(
+                f"""
+                DELETE FROM "{table_name}"
+                WHERE company_id IS NULL
+                   OR id IS NULL
+                """
+            )
+        )
+        cleaned = int(getattr(cleanup_result, "rowcount", 0) or 0)
+        if cleaned:
+            log.warning(
+                "equipment-selection: удалены строки с NULL-ключом перед миграцией PK (%s: %s)",
+                table_name,
+                cleaned,
+            )
+        await conn.execute(text(f'ALTER TABLE "{table_name}" DROP CONSTRAINT "{existing_pk}"'))
+        await conn.execute(
+            text(
+                f'ALTER TABLE "{table_name}" ADD CONSTRAINT "{expected_pk}" PRIMARY KEY (company_id, id)'
+            )
+        )
+
+    delete_result = await conn.execute(
+        text(
+            f"""
+            DELETE FROM "{table_name}"
+            WHERE company_id = :company_id
+            """
+        ),
+        {"company_id": owner_id},
+    )
+    deleted_count = int(getattr(delete_result, "rowcount", 0) or 0)
+
     if not rows:
         _log_event(
             log_messages,
-            f"{table_name}: данных нет — существующие записи оставлены без изменений.",
+            f"{table_name}: данных нет — удалено старых записей {deleted_count}.",
         )
         return
-
-    result = await conn.execute(
-        text(
-            f"""
-            SELECT id, company_id, equipment_name, score, created_at, updated_at
-            FROM "{table_name}"
-            """
-        )
-    )
-    existing_map: Dict[int, Dict[str, Any]] = {}
-    for record in result.mappings():
-        existing_map[int(record["id"])] = {
-            "company_id": record.get("company_id"),
-            "equipment_name": record.get("equipment_name"),
-            "score": _quantize(_to_decimal(record.get("score"))),
-            "created_at": record.get("created_at"),
-            "updated_at": record.get("updated_at"),
-        }
-
-    log.debug(
-        "equipment-selection: в таблице %s уже %s записей",
-        table_name,
-        len(existing_map),
-    )
 
     unique_rows: Dict[int, EquipmentScore] = {}
     for item in rows:
@@ -1879,34 +1907,20 @@ async def _sync_equipment_table(
     deduped_rows = list(unique_rows.values())
 
     now = datetime.now(timezone.utc)
-    updates: List[Dict[str, Any]] = []
     inserts: List[Dict[str, Any]] = []
 
     for row in deduped_rows:
         new_score = _quantize(_to_decimal(row.score))
-        payload = {
-            "id": row.id,
-            "company_id": owner_id,
-            "equipment_name": row.name,
-            "score": new_score,
-            "created_at": now,
-            "updated_at": now,
-        }
-        current = existing_map.get(row.id)
-        if current is None:
-            inserts.append(payload)
-            continue
-
-        needs_update = (
-            current.get("equipment_name") != row.name
-            or current.get("score") != new_score
-            or current.get("company_id") != owner_id
-            or current.get("created_at") is None
+        inserts.append(
+            {
+                "id": row.id,
+                "company_id": owner_id,
+                "equipment_name": row.name,
+                "score": new_score,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-
-        if needs_update or current.get("updated_at") is None:
-            payload["created_at"] = current.get("created_at") or now
-            updates.append(payload)
 
     if inserts:
         await conn.execute(
@@ -1924,33 +1938,11 @@ async def _sync_equipment_table(
             len(inserts),
         )
 
-    if updates:
-        await conn.execute(
-            text(
-                f"""
-                UPDATE "{table_name}"
-                SET company_id = :company_id,
-                    equipment_name = :equipment_name,
-                    score = :score,
-                    created_at = COALESCE(created_at, :created_at),
-                    updated_at = :updated_at
-                WHERE id = :id
-                """
-            ),
-            updates,
-        )
-        log.info(
-            "equipment-selection: в таблице %s обновлено %s строк",
-            table_name,
-            len(updates),
-        )
-
     _log_event(
         log_messages,
         (
             f"{table_name}: обработано {len(deduped_rows)} записей ("
-            f"добавлено {len(inserts)}, обновлено {len(updates)}). "
-            "Удаление существующих записей не выполнялось."
+            f"добавлено {len(inserts)}, удалено старых {deleted_count})."
         ),
     )
 
