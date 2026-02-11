@@ -633,18 +633,26 @@ async def assign_ib_matches_by_inn(*, inn: str, reembed_if_exists: bool) -> dict
                 "ib-match: clients_requests not found in public for INN %s — trying parsing_data",
                 normalized_inn,
             )
-            fallback_query = text(
-                """
-                SELECT id
-                FROM parsing_data.clients_requests
-                WHERE inn = :inn
-                ORDER BY COALESCE(ended_at, created_at) DESC NULLS LAST, id DESC
-                """
-            )
-            fallback_result = await conn.execute(
-                fallback_query, {"inn": normalized_inn}
-            )
-            candidate_ids = [int(row["id"]) for row in fallback_result.mappings()]
+            try:
+                fallback_query = text(
+                    """
+                    SELECT id
+                    FROM parsing_data.clients_requests
+                    WHERE inn = :inn
+                    ORDER BY COALESCE(ended_at, created_at) DESC NULLS LAST, id DESC
+                    """
+                )
+                fallback_result = await conn.execute(
+                    fallback_query, {"inn": normalized_inn}
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "ib-match: parsing_data fallback query failed for INN %s: %s",
+                    normalized_inn,
+                    exc,
+                )
+            else:
+                candidate_ids = [int(row["id"]) for row in fallback_result.mappings()]
 
     if not candidate_ids:
         log.info(

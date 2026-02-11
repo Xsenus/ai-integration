@@ -1006,6 +1006,69 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
 
     total_domains_to_fetch = len(domains_to_process)
 
+
+    async def _ensure_clients_requests_synced(
+        *,
+        domain_1: Optional[str],
+        domain_2: Optional[str],
+    ) -> None:
+        nonlocal clients_request_synced
+        nonlocal synced_client_domain_1
+        nonlocal synced_client_domain_2
+        nonlocal client_domain_lookup
+        nonlocal company_id_pg
+        nonlocal company_id_pd
+        nonlocal mirror_failed_logged
+
+        summary_for_client = dict(summary_for_client_base)
+        try:
+            await push_clients_request_pg(
+                summary_for_client,
+                domain=domain_1,
+                domain_secondary=domain_2,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(
+                status_code=500,
+                detail=f"PG upsert clients_requests failed: {e}",
+            ) from e
+
+        synced_client_domain_1 = domain_1
+        synced_client_domain_2 = domain_2
+        client_domain_lookup = f"www.{synced_client_domain_1}" if synced_client_domain_1 else None
+        company_id_pg = await get_clients_request_id_pg(inn, client_domain_lookup)
+        if company_id_pg is None:
+            company_id_pg = await get_clients_request_id_pg(inn)
+
+        try:
+            await push_clients_request_pd(
+                summary_for_client,
+                domain=domain_1,
+                domain_secondary=domain_2,
+            )
+        except Exception as e:  # noqa: BLE001
+            if not mirror_failed_logged:
+                log.warning("mirror parsing_data failed for INN=%s: %s", inn, e)
+                mirror_failed_logged = True
+            company_id_pd = await get_clients_request_id_pd(inn, client_domain_lookup)
+        else:
+            company_id_pd = await get_clients_request_id_pd(inn, client_domain_lookup)
+            if company_id_pd is None:
+                company_id_pd = await get_clients_request_id_pd(inn)
+
+        clients_request_synced = True
+
+    if payload.save_client_request and not clients_request_synced:
+        primary_domain = domains_to_process[0] if domains_to_process else None
+        secondary_domain = domains_to_process[1] if len(domains_to_process) > 1 else None
+        log.info(
+            "parse-site: предварительная синхронизация clients_requests (ИНН=%s, domain_1=%s, domain_2=%s)",
+            inn,
+            primary_domain,
+            secondary_domain,
+        )
+        await _ensure_clients_requests_synced(domain_1=primary_domain, domain_2=secondary_domain)
+
     async def _fetch_domain_parallel(
         domain_candidate: str,
         position: int,
@@ -1382,57 +1445,16 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
 
         written_chunks = len(chunks_payload)
 
-        summary_for_client: Optional[dict[str, Any]] = None
         if payload.save_client_request:
-            summary_for_client = dict(summary_for_client_base)
-
-            if not clients_request_synced and chunks_payload:
+            if not clients_request_synced:
                 log.info(
                     "parse-site: выполняем upsert clients_requests (POSTGRES/parsing_data) для ИНН %s",
                     inn,
                 )
-                try:
-                    await push_clients_request_pg(
-                        summary_for_client,
-                        domain=current_client_domain_1,
-                        domain_secondary=current_client_domain_2,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"PG upsert clients_requests failed: {e}",
-                    ) from e
-
-                synced_client_domain_1 = current_client_domain_1
-                synced_client_domain_2 = current_client_domain_2
-                client_domain_lookup = (
-                    f"www.{synced_client_domain_1}" if synced_client_domain_1 else None
+                await _ensure_clients_requests_synced(
+                    domain_1=current_client_domain_1,
+                    domain_2=current_client_domain_2,
                 )
-                company_id_pg = await get_clients_request_id_pg(inn, client_domain_lookup)
-                if company_id_pg is None:
-                    company_id_pg = await get_clients_request_id_pg(inn)
-
-                try:
-                    await push_clients_request_pd(
-                        summary_for_client,
-                        domain=current_client_domain_1,
-                        domain_secondary=current_client_domain_2,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    if not mirror_failed_logged:
-                        log.warning("mirror parsing_data failed for INN=%s: %s", inn, e)
-                        mirror_failed_logged = True
-                    company_id_pd = await get_clients_request_id_pd(inn, client_domain_lookup)
-                else:
-                    company_id_pd = await get_clients_request_id_pd(inn, client_domain_lookup)
-                    if company_id_pd is None:
-                        company_id_pd = await get_clients_request_id_pd(inn)
-                    log.info(
-                        "parse-site: upsert clients_requests в parsing_data завершен, company_id=%s",
-                        company_id_pd,
-                    )
-
-                clients_request_synced = True
                 log.info(
                     "parse-site: синхронизация clients_requests выполнена (domain_1=%s, domain_2=%s)",
                     f"www.{synced_client_domain_1}" if synced_client_domain_1 else None,
@@ -1455,66 +1477,23 @@ async def run_parse_site(payload: ParseSiteRequest, session: AsyncSession) -> Pa
                         new_domain_2_for_log,
                     )
 
-                    pg_domain = current_client_domain_1 if domain_1_changed else None
-                    pg_domain_secondary = (
-                        current_client_domain_2 if domain_2_changed else synced_client_domain_2
-                    )
-
                     try:
-                        await push_clients_request_pg(
-                            summary_for_client,
-                            domain=pg_domain,
-                            domain_secondary=pg_domain_secondary,
+                        await _ensure_clients_requests_synced(
+                            domain_1=current_client_domain_1 if domain_1_changed else synced_client_domain_1,
+                            domain_2=current_client_domain_2 if domain_2_changed else synced_client_domain_2,
                         )
-                    except Exception as e:  # noqa: BLE001
+                    except HTTPException as e:
                         log.warning(
-                            "parse-site: обновление POSTGRES.clients_requests доменов не удалось для ИНН %s: %s",
+                            "parse-site: обновление clients_requests доменов не удалось для ИНН %s: %s",
                             inn,
-                            e,
+                            e.detail,
                         )
                     else:
-                        if domain_1_changed:
-                            synced_client_domain_1 = current_client_domain_1
-                            client_domain_lookup = (
-                                f"www.{synced_client_domain_1}"
-                                if synced_client_domain_1
-                                else None
-                            )
-                        if domain_2_changed:
-                            synced_client_domain_2 = current_client_domain_2
                         log.info(
-                            "parse-site: clients_requests обновлены в POSTGRES → domain_1=%s, domain_2=%s",
+                            "parse-site: clients_requests домены обновлены (domain_1=%s, domain_2=%s)",
                             f"www.{synced_client_domain_1}" if synced_client_domain_1 else None,
                             f"www.{synced_client_domain_2}" if synced_client_domain_2 else None,
                         )
-
-                    if company_id_pd:
-                        pd_domain = current_client_domain_1 if domain_1_changed else None
-                        pd_domain_secondary = (
-                            current_client_domain_2
-                            if domain_2_changed
-                            else synced_client_domain_2
-                        )
-                        try:
-                            await push_clients_request_pd(
-                                summary_for_client,
-                                domain=pd_domain,
-                                domain_secondary=pd_domain_secondary,
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            if not mirror_failed_logged:
-                                log.warning(
-                                    "mirror parsing_data failed для обновления доменов (ИНН %s): %s",
-                                    inn,
-                                    e,
-                                )
-                                mirror_failed_logged = True
-                        else:
-                            log.info(
-                                "parse-site: clients_requests обновлены в parsing_data → domain_1=%s, domain_2=%s",
-                                f"www.{synced_client_domain_1}" if synced_client_domain_1 else None,
-                                f"www.{synced_client_domain_2}" if synced_client_domain_2 else None,
-                            )
 
         if chunks_payload:
             if company_id_pg is None:
