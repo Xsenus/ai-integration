@@ -285,9 +285,12 @@ async def run_full_pipeline(
         log.info("pipeline: lookup_card failed — skipping remaining steps for inn=%s", inn)
 
     if can_continue:
+        analyze_refresh_site = bool(
+            parse_result is not None and getattr(parse_result, "status", None) == "fallback"
+        )
         analyze_result, _ = await _run_step(
             "analyze_json",
-            lambda: analyze_from_inn_get(inn=inn),
+            lambda: analyze_from_inn_get(inn=inn, refresh_site=analyze_refresh_site),
             errors=errors,
         )
 

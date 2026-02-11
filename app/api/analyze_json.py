@@ -2636,9 +2636,85 @@ async def _run_analyze(
             level=logging.WARNING,
         )
 
+    async def _build_okved_fallback_response(
+        parse_response: ParseSiteResponse,
+    ) -> AnalyzeFromInnResponse:
+        fallback = parse_response.site_unavailable.model_dump() if parse_response.site_unavailable else {}
+        first_okved = fallback.get("okved")
+        fallback_prodclass_id = _safe_int(fallback.get("prodclass_by_okved"))
+        persisted_company_id = parse_response.company_id
+        persisted_pars_id: Optional[int] = None
+        if fallback_prodclass_id is not None:
+            persisted_company_id, persisted_pars_id = await _persist_okved_fallback_snapshot(
+                engine,
+                inn=inn,
+                company_id=parse_response.company_id,
+                prodclass_by_okved=fallback_prodclass_id,
+            )
+
+        return AnalyzeFromInnResponse(
+            status="ok",
+            inn=inn,
+            pars_id=persisted_pars_id,
+            company_id=persisted_company_id,
+            text_length=0,
+            catalog_goods_size=0,
+            catalog_equipment_size=0,
+            saved_goods=0,
+            saved_equipment=0,
+            prodclass_id=fallback_prodclass_id,
+            prodclass_score=None,
+            external_request={"reason": "site-unavailable", "okved": first_okved},
+            external_status=status.HTTP_404_NOT_FOUND,
+            external_response={
+                "message": parse_response.message,
+                "site_unavailable": fallback,
+            },
+            external_response_raw=fallback,
+            total_text_length=0,
+            total_saved_goods=0,
+            total_saved_equipment=0,
+            domains_processed=[],
+            okved_fallback_used=True,
+            runs=[
+                AnalyzeFromInnRun(
+                    domain=None,
+                    domain_source=None,
+                    pars_id=persisted_pars_id,
+                    company_id=persisted_company_id,
+                    created_at=parse_response.finished_at,
+                    text_length=0,
+                    chunk_count=0,
+                    catalog_goods_size=0,
+                    catalog_equipment_size=0,
+                    saved_goods=0,
+                    saved_equipment=0,
+                    prodclass_id=fallback_prodclass_id,
+                    prodclass_score=None,
+                    external_request={"reason": "site-unavailable", "okved": first_okved},
+                    external_status=status.HTTP_404_NOT_FOUND,
+                    external_response={
+                        "message": parse_response.message,
+                        "site_unavailable": fallback,
+                    },
+                    external_response_raw=fallback,
+                    okved_fallback_used=True,
+                )
+            ],
+        )
+
     parse_site_response: Optional[ParseSiteResponse] = None
     if payload.refresh_site:
         parse_site_response = await _trigger_parse_site(inn)
+        if (
+            parse_site_response.site_unavailable
+            and (parse_site_response.chunks_inserted or 0) <= 0
+        ):
+            log.info(
+                "analyze-json: parse-site returned fallback; using OKVED fallback without external analyze (inn=%s)",
+                inn,
+            )
+            return await _build_okved_fallback_response(parse_site_response)
 
     snapshots = await _collect_latest_pars_site(engine, inn)
     if not snapshots and not payload.refresh_site:
@@ -2647,70 +2723,7 @@ async def _run_analyze(
 
     if not snapshots:
         if parse_site_response and parse_site_response.site_unavailable:
-            fallback = parse_site_response.site_unavailable.model_dump()
-            first_okved = fallback.get("okved")
-            fallback_prodclass_id = _safe_int(fallback.get("prodclass_by_okved"))
-            persisted_company_id = parse_site_response.company_id
-            persisted_pars_id: Optional[int] = None
-            if fallback_prodclass_id is not None:
-                persisted_company_id, persisted_pars_id = await _persist_okved_fallback_snapshot(
-                    engine,
-                    inn=inn,
-                    company_id=parse_site_response.company_id,
-                    prodclass_by_okved=fallback_prodclass_id,
-                )
-
-            response = AnalyzeFromInnResponse(
-                status="ok",
-                inn=inn,
-                pars_id=persisted_pars_id,
-                company_id=persisted_company_id,
-                text_length=0,
-                catalog_goods_size=0,
-                catalog_equipment_size=0,
-                saved_goods=0,
-                saved_equipment=0,
-                prodclass_id=fallback_prodclass_id,
-                prodclass_score=None,
-                external_request={"reason": "site-unavailable", "okved": first_okved},
-                external_status=status.HTTP_404_NOT_FOUND,
-                external_response={
-                    "message": parse_site_response.message,
-                    "site_unavailable": fallback,
-                },
-                external_response_raw=fallback,
-                total_text_length=0,
-                total_saved_goods=0,
-                total_saved_equipment=0,
-                domains_processed=[],
-                okved_fallback_used=True,
-                runs=[
-                    AnalyzeFromInnRun(
-                        domain=None,
-                        domain_source=None,
-                        pars_id=persisted_pars_id,
-                        company_id=persisted_company_id,
-                        created_at=parse_site_response.finished_at,
-                        text_length=0,
-                        chunk_count=0,
-                        catalog_goods_size=0,
-                        catalog_equipment_size=0,
-                        saved_goods=0,
-                        saved_equipment=0,
-                        prodclass_id=fallback_prodclass_id,
-                        prodclass_score=None,
-                        external_request={"reason": "site-unavailable", "okved": first_okved},
-                        external_status=status.HTTP_404_NOT_FOUND,
-                        external_response={
-                            "message": parse_site_response.message,
-                            "site_unavailable": fallback,
-                        },
-                        external_response_raw=fallback,
-                        okved_fallback_used=True,
-                    )
-                ],
-            )
-            return response
+            return await _build_okved_fallback_response(parse_site_response)
 
         _log_and_raise(
             status.HTTP_404_NOT_FOUND,
