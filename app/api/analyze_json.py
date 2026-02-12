@@ -256,11 +256,19 @@ async def _ensure_ai_site_openai_responses(conn: AsyncConnection) -> None:
     )
 
     for column_name, ddl in (
+        ("chat_model", "TEXT"),
+        ("prompt_tokens", "INT"),
+        ("completion_tokens", "INT"),
+        ("cached_prompt_tokens", "INT"),
+        ("total_tokens", "INT"),
+        ("cost_usd", "NUMERIC(12,6)"),
+        ("request_cost", "JSONB"),
+        ("billing_summary", "JSONB"),
+        # legacy columns for backward compatibility with existing reads
         ("model", "TEXT"),
         ("input_tokens", "INT"),
         ("cached_input_tokens", "INT"),
         ("output_tokens", "INT"),
-        ("cost_usd", "NUMERIC(12,6)"),
     ):
         await _ensure_column_exists(conn, "ai_site_openai_responses", column_name, ddl)
 
@@ -335,16 +343,35 @@ def _extract_request_cost(payload: Any) -> dict[str, Any]:
             return None
         return parsed if parsed >= 0 else None
 
+    usage = request_cost.get("usage") if isinstance(request_cost.get("usage"), Mapping) else {}
+
     model = request_cost.get("model")
     model_value = str(model).strip() if model is not None else None
 
+    input_tokens = _to_int(request_cost.get("input_tokens"))
+    cached_input_tokens = _to_int(request_cost.get("cached_input_tokens"))
+    output_tokens = _to_int(request_cost.get("output_tokens"))
+    tokens_total = _to_int(request_cost.get("tokens_total"))
+
+    if input_tokens is None:
+        input_tokens = _to_int(usage.get("prompt_tokens"))
+    if cached_input_tokens is None:
+        cached_input_tokens = _to_int(usage.get("cached_prompt_tokens"))
+    if output_tokens is None:
+        output_tokens = _to_int(usage.get("completion_tokens"))
+    if tokens_total is None:
+        tokens_total = _to_int(usage.get("total_tokens"))
+    if tokens_total is None and any(v is not None for v in (input_tokens, cached_input_tokens, output_tokens)):
+        tokens_total = int(input_tokens or 0) + int(cached_input_tokens or 0) + int(output_tokens or 0)
+
     return {
         "model": model_value or None,
-        "input_tokens": _to_int(request_cost.get("input_tokens")),
-        "cached_input_tokens": _to_int(request_cost.get("cached_input_tokens")),
-        "output_tokens": _to_int(request_cost.get("output_tokens")),
-        "tokens_total": _to_int(request_cost.get("tokens_total")),
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "tokens_total": tokens_total,
         "cost_usd": _to_float(request_cost.get("cost_usd")),
+        "raw": dict(request_cost),
     }
 
 
@@ -365,13 +392,15 @@ def _extract_billing_summary(payload: Any) -> dict[str, Any]:
             return None
         return parsed
 
-    return {
+    normalized = {
         "remaining_usd": _to_float(billing_summary.get("remaining_usd")),
         "spend_month_to_date_usd": _to_float(
             billing_summary.get("spend_month_to_date_usd")
         ),
         "limit_usd": _to_float(billing_summary.get("limit_usd")),
     }
+    normalized["raw"] = dict(billing_summary)
+    return normalized
 
 
 def _log_and_raise(
@@ -2693,6 +2722,11 @@ async def _apply_db_payload(
             _normalize_score(prodclass_row.get("prodclass_score")) if prodclass_row else None
         )
 
+        request_cost_json = _json_dump_or_none(request_cost.get("raw") if request_cost else None)
+        billing_summary_json = _json_dump_or_none(
+            billing_summary.get("raw") if billing_summary else None
+        )
+
         openai_payload = {
             "text_pars_id": snapshot.pars_id,
             "company_id": snapshot.company_id,
@@ -2707,11 +2741,18 @@ async def _apply_db_payload(
             "equipment_site": equipment_json,
             "goods": goods_json,
             "goods_type": goods_type_json,
+            "chat_model": request_cost.get("model") if request_cost else None,
+            "prompt_tokens": request_cost.get("input_tokens") if request_cost else None,
+            "completion_tokens": request_cost.get("output_tokens") if request_cost else None,
+            "cached_prompt_tokens": request_cost.get("cached_input_tokens") if request_cost else None,
+            "total_tokens": request_cost.get("tokens_total") if request_cost else None,
+            "cost_usd": request_cost.get("cost_usd") if request_cost else None,
+            "request_cost": request_cost_json,
+            "billing_summary": billing_summary_json,
             "model": request_cost.get("model") if request_cost else None,
             "input_tokens": request_cost.get("input_tokens") if request_cost else None,
             "cached_input_tokens": request_cost.get("cached_input_tokens") if request_cost else None,
             "output_tokens": request_cost.get("output_tokens") if request_cost else None,
-            "cost_usd": request_cost.get("cost_usd") if request_cost else None,
         }
 
         request_cost_payload = {
@@ -2736,14 +2777,18 @@ async def _apply_db_payload(
                 text_pars_id, company_id, domain, url,
                 description, description_score, okved_score, prodclass_by_okved,
                 prodclass, prodclass_score, equipment_site, goods, goods_type,
-                model, input_tokens, cached_input_tokens, output_tokens, cost_usd,
+                chat_model, prompt_tokens, completion_tokens, cached_prompt_tokens, total_tokens,
+                cost_usd, request_cost, billing_summary,
+                model, input_tokens, cached_input_tokens, output_tokens,
                 created_at
             )
             VALUES (
                 :text_pars_id, :company_id, :domain, :url,
                 :description, :description_score, :okved_score, :prodclass_by_okved,
                 :prodclass, :prodclass_score, :equipment_site, :goods, :goods_type,
-                :model, :input_tokens, :cached_input_tokens, :output_tokens, :cost_usd,
+                :chat_model, :prompt_tokens, :completion_tokens, :cached_prompt_tokens, :total_tokens,
+                :cost_usd, :request_cost, :billing_summary,
+                :model, :input_tokens, :cached_input_tokens, :output_tokens,
                 now()
             )
             """
