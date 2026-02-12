@@ -1280,7 +1280,13 @@ async def _persist_okved_fallback_snapshot(
             return resolved_company_id, None
 
         prodclass_columns = await _get_table_columns(conn, "ai_site_prodclass")
-        for column_name, ddl in (("okved_score", "NUMERIC(6,4)"), ("prodclass_by_okved", "INT")):
+        for column_name, ddl in (
+            ("description_okved_score", "NUMERIC(6,4)"),
+            ("description_score", "NUMERIC(6,4)"),
+            ("okved_score", "NUMERIC(6,4)"),
+            ("prodclass_by_okved", "INT"),
+            ("score_source", "TEXT"),
+        ):
             if column_name not in prodclass_columns:
                 prodclass_columns = await _ensure_column_exists(
                     conn,
@@ -1294,17 +1300,30 @@ async def _persist_okved_fallback_snapshot(
         params: dict[str, Any] = {
             "text_pars_id": pars_id,
             "prodclass": prodclass_id,
-            "prodclass_score": 1.0,
+            "prodclass_score": None,
         }
+
+        if "description_score" in prodclass_columns:
+            insert_columns.append("description_score")
+            insert_values.append(":description_score")
+            params["description_score"] = None
+        if "description_okved_score" in prodclass_columns:
+            insert_columns.append("description_okved_score")
+            insert_values.append(":description_okved_score")
+            params["description_okved_score"] = None
 
         if "okved_score" in prodclass_columns:
             insert_columns.append("okved_score")
             insert_values.append(":okved_score")
-            params["okved_score"] = 1.0
+            params["okved_score"] = None
         if "prodclass_by_okved" in prodclass_columns:
             insert_columns.append("prodclass_by_okved")
             insert_values.append(":prodclass_by_okved")
             params["prodclass_by_okved"] = prodclass_id
+        if "score_source" in prodclass_columns:
+            insert_columns.append("score_source")
+            insert_values.append(":score_source")
+            params["score_source"] = "okved_fallback"
 
         await conn.execute(
             text(
@@ -1647,6 +1666,7 @@ async def _apply_db_payload(
             ("description_score", "NUMERIC(6,4)"),
             ("okved_score", "NUMERIC(6,4)"),
             ("prodclass_by_okved", "INT"),
+            ("score_source", "TEXT"),
         ):
             if column_name not in prodclass_columns:
                 prodclass_columns = await _ensure_column_exists(
@@ -1661,6 +1681,7 @@ async def _apply_db_payload(
         prodclass_has_description_score = "description_score" in prodclass_columns
         prodclass_has_okved_score_value = "okved_score" in prodclass_columns
         prodclass_has_okved_fallback = "prodclass_by_okved" in prodclass_columns
+        prodclass_has_score_source = "score_source" in prodclass_columns
 
         select_cols = "id, prodclass, prodclass_score"
         if prodclass_has_okved_score:
@@ -1671,6 +1692,8 @@ async def _apply_db_payload(
             select_cols += ", okved_score"
         if prodclass_has_okved_fallback:
             select_cols += ", prodclass_by_okved"
+        if prodclass_has_score_source:
+            select_cols += ", score_source"
 
         result = await conn.execute(
             text(
@@ -1845,6 +1868,7 @@ async def _apply_db_payload(
                 "description_score": description_score_to_use,
                 "okved_score": okved_score_param,
                 "prodclass_by_okved": prodclass_by_okved_value,
+                "score_source": "site",
             }
             if candidate_prodclass_id is not None:
                 params["prodclass"] = candidate_prodclass_id
@@ -1868,6 +1892,9 @@ async def _apply_db_payload(
                 if prodclass_has_okved_fallback and "prodclass_by_okved" in params:
                     columns.append("prodclass_by_okved")
                     values.append(":prodclass_by_okved")
+                if prodclass_has_score_source and "score_source" in params:
+                    columns.append("score_source")
+                    values.append(":score_source")
 
                 if len(columns) > 1:
                     insert_prodclass_sql = (
@@ -1896,6 +1923,7 @@ async def _apply_db_payload(
                         "description_score": description_score_to_use,
                         "okved_score": okved_score_param,
                         "prodclass_by_okved": prodclass_by_okved_value,
+                        "score_source": "site",
                     }
             else:
                 set_clauses: list[str] = []
@@ -1909,6 +1937,8 @@ async def _apply_db_payload(
                     set_clauses.append("okved_score = :okved_score")
                 if prodclass_has_okved_fallback:
                     set_clauses.append("prodclass_by_okved = :prodclass_by_okved")
+                if prodclass_has_score_source:
+                    set_clauses.append("score_source = :score_source")
 
                 if set_clauses:
                     update_prodclass_sql = (
@@ -1941,6 +1971,7 @@ async def _apply_db_payload(
                         "description_score": description_score_to_use,
                         "okved_score": okved_score_param,
                         "prodclass_by_okved": prodclass_by_okved_value,
+                        "score_source": "site",
                     }
 
         elif prodclass_row is not None and prodclass_has_okved_fallback:
