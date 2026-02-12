@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     ANALYZE_TIMEOUT: Optional[int] = None     # альтернативное имя переменной окружения
     AI_ANALYZE_ADMIN_KEY: Optional[str] = None
     ANALYZE_ADMIN_KEY: Optional[str] = None
+    AI_SITE_ANALYZER_URL: Optional[str] = None
 
     AI_ANALYSIS_COSTS_LOOKBACK_HOURS: int = 24
 
@@ -118,6 +119,11 @@ class Settings(BaseSettings):
     def analyze_base(self) -> Optional[str]:
         """Базовый URL внешнего сервиса анализа (берёт AI_ANALYZE_BASE или ANALYZE_BASE)."""
         return self.AI_ANALYZE_BASE or self.ANALYZE_BASE
+
+    @property
+    def ai_site_analyzer_url(self) -> Optional[str]:
+        """Базовый URL ai-site-analyzer; если не задан, используется analyze_base."""
+        return self.AI_SITE_ANALYZER_URL or self.analyze_base
 
     @property
     def analyze_timeout(self) -> int:

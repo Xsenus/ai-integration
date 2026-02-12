@@ -690,6 +690,18 @@ async def ensure_parsing_schema() -> None:
                 equipment_site JSONB,
                 goods JSONB,
                 goods_type JSONB,
+                chat_model TEXT,
+                prompt_tokens INT,
+                completion_tokens INT,
+                cached_prompt_tokens INT,
+                total_tokens INT,
+                cost_usd NUMERIC(12,6),
+                request_cost JSONB,
+                billing_summary JSONB,
+                model TEXT,
+                input_tokens INT,
+                cached_input_tokens INT,
+                output_tokens INT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
             """))
@@ -705,6 +717,21 @@ async def ensure_parsing_schema() -> None:
                     "ON public.ai_site_openai_responses(company_id)"
                 )
             )
+            for ddl in (
+                "ADD COLUMN IF NOT EXISTS chat_model TEXT",
+                "ADD COLUMN IF NOT EXISTS prompt_tokens INT",
+                "ADD COLUMN IF NOT EXISTS completion_tokens INT",
+                "ADD COLUMN IF NOT EXISTS cached_prompt_tokens INT",
+                "ADD COLUMN IF NOT EXISTS total_tokens INT",
+                "ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(12,6)",
+                "ADD COLUMN IF NOT EXISTS request_cost JSONB",
+                "ADD COLUMN IF NOT EXISTS billing_summary JSONB",
+                "ADD COLUMN IF NOT EXISTS model TEXT",
+                "ADD COLUMN IF NOT EXISTS input_tokens INT",
+                "ADD COLUMN IF NOT EXISTS cached_input_tokens INT",
+                "ADD COLUMN IF NOT EXISTS output_tokens INT",
+            ):
+                await conn.execute(text(f"ALTER TABLE public.ai_site_openai_responses {ddl}"))
 
             # 6) ai_site_goods_types
             await conn.execute(text(f"""

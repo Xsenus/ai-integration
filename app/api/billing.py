@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -12,15 +13,24 @@ from app.config import settings
 log = logging.getLogger("api.billing")
 router = APIRouter(prefix="/v1/billing", tags=["billing"])
 
+_CACHE_TTL_SECONDS = 60
+_billing_remaining_cache: dict[str, Any] = {"timestamp": 0.0, "payload": None}
+
 
 @router.get("/remaining")
 async def billing_remaining() -> Any:
-    base_url = (settings.analyze_base or "").strip()
+    base_url = (settings.ai_site_analyzer_url or "").strip()
     if not base_url:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="ANALYZE_BASE is not configured",
         )
+
+    now_ts = time.time()
+    cached_at = float(_billing_remaining_cache.get("timestamp") or 0.0)
+    cached_payload = _billing_remaining_cache.get("payload")
+    if cached_payload is not None and (now_ts - cached_at) < _CACHE_TTL_SECONDS:
+        return cached_payload
 
     target = f"{base_url.rstrip('/')}/v1/billing/remaining"
     client = await _get_http_client()
@@ -51,5 +61,8 @@ async def billing_remaining() -> Any:
                 "upstream_payload": payload,
             },
         )
+
+    _billing_remaining_cache["timestamp"] = now_ts
+    _billing_remaining_cache["payload"] = payload
 
     return payload
