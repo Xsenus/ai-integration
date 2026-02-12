@@ -254,7 +254,52 @@ async def _ensure_ai_site_openai_responses(conn: AsyncConnection) -> None:
         )
     )
 
+    for column_name, ddl in (
+        ("model", "TEXT"),
+        ("input_tokens", "INT"),
+        ("cached_input_tokens", "INT"),
+        ("output_tokens", "INT"),
+        ("cost_usd", "NUMERIC(12,6)"),
+    ):
+        await _ensure_column_exists(conn, "ai_site_openai_responses", column_name, ddl)
+
     _AI_OPENAI_TABLE_ENSURED = True
+
+
+def _extract_request_cost(payload: Any) -> dict[str, Any]:
+    """Извлекает структуру request_cost из ответа внешнего сервиса."""
+
+    if not isinstance(payload, Mapping):
+        return {}
+
+    request_cost = payload.get("request_cost")
+    if not isinstance(request_cost, Mapping):
+        return {}
+
+    def _to_int(value: Any) -> Optional[int]:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+
+    model = request_cost.get("model")
+    model_value = str(model).strip() if model is not None else None
+
+    return {
+        "model": model_value or None,
+        "input_tokens": _to_int(request_cost.get("input_tokens")),
+        "cached_input_tokens": _to_int(request_cost.get("cached_input_tokens")),
+        "output_tokens": _to_int(request_cost.get("output_tokens")),
+        "cost_usd": _to_float(request_cost.get("cost_usd")),
+    }
 
 
 def _log_and_raise(
@@ -1623,6 +1668,7 @@ async def _apply_db_payload(
     engine: AsyncEngine,
     snapshot: ParsSiteSnapshot,
     payload: dict[str, Any],
+    request_cost: Optional[Mapping[str, Any]] = None,
 ) -> tuple[int, int, Optional[int], Optional[float]]:
     """Сохраняет db_payload из ответа внешнего сервиса."""
 
@@ -2561,6 +2607,11 @@ async def _apply_db_payload(
             "equipment_site": equipment_json,
             "goods": goods_json,
             "goods_type": goods_type_json,
+            "model": request_cost.get("model") if request_cost else None,
+            "input_tokens": request_cost.get("input_tokens") if request_cost else None,
+            "cached_input_tokens": request_cost.get("cached_input_tokens") if request_cost else None,
+            "output_tokens": request_cost.get("output_tokens") if request_cost else None,
+            "cost_usd": request_cost.get("cost_usd") if request_cost else None,
         }
 
         insert_openai_sql = text(
@@ -2569,12 +2620,14 @@ async def _apply_db_payload(
                 text_pars_id, company_id, domain, url,
                 description, description_score, okved_score, prodclass_by_okved,
                 prodclass, prodclass_score, equipment_site, goods, goods_type,
+                model, input_tokens, cached_input_tokens, output_tokens, cost_usd,
                 created_at
             )
             VALUES (
                 :text_pars_id, :company_id, :domain, :url,
                 :description, :description_score, :okved_score, :prodclass_by_okved,
                 :prodclass, :prodclass_score, :equipment_site, :goods, :goods_type,
+                :model, :input_tokens, :cached_input_tokens, :output_tokens, :cost_usd,
                 now()
             )
             """
@@ -3091,11 +3144,13 @@ async def _run_analyze(
         db_payload = _merge_parsed_scores_into_db_payload(
             db_payload, response_json.get("parsed")
         )
+        request_cost = _extract_request_cost(response_json)
 
         goods_saved, equipment_saved, prodclass_id, prodclass_score = await _apply_db_payload(
             engine,
             snapshot,
             db_payload,
+            request_cost=request_cost,
         )
 
         log.info(
