@@ -233,12 +233,21 @@ async def _ensure_ai_site_openai_responses(conn: AsyncConnection) -> None:
                 okved_score NUMERIC(6,4),
                 prodclass_by_okved INT,
                 prodclass INT,
-                prodclass_score NUMERIC(4,2),
+                prodclass_score NUMERIC(6,4),
                 equipment_site JSONB,
                 goods JSONB,
                 goods_type JSONB,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
+            """
+        )
+    )
+
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE public.ai_site_openai_responses
+            ALTER COLUMN prodclass_score TYPE NUMERIC(6,4)
             """
         )
     )
