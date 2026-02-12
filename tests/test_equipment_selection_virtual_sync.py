@@ -54,7 +54,11 @@ def test_build_equipment_tables_skips_sync_for_virtual_client(monkeypatch) -> No
         sync_calls.append(table_name)
 
     monkeypatch.setattr(mod, "_load_client", _load_client)
+    async def _resolve_run_scope(*_args, **_kwargs):
+        return mod.RunScope(started_at=None, latest_pars_id=None)
+
     monkeypatch.setattr(mod, "_resolve_company_id", _resolve_company_id)
+    monkeypatch.setattr(mod, "_resolve_run_scope", _resolve_run_scope)
     monkeypatch.setattr(mod, "_load_goods_types", _empty)
     monkeypatch.setattr(mod, "_load_site_equipment", _empty)
     monkeypatch.setattr(mod, "_load_prodclass_rows", _empty)

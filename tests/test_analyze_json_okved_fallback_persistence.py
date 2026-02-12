@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import pathlib
+import sys
+
+ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from dataclasses import dataclass
 
 from app.api import analyze_json as analyze_json_mod
@@ -23,9 +30,11 @@ class _FakeConnection:
     def __init__(self) -> None:
         self.last_sql: str | None = None
         self.last_prodclass_params: dict[str, object] | None = None
+        self.executed_sql: list[str] = []
 
     async def execute(self, stmt, params=None):
         sql_text = str(getattr(stmt, "text", stmt))
+        self.executed_sql.append(sql_text)
         if "INSERT INTO public.pars_site" in sql_text:
             self.last_sql = sql_text
             return _FakeResult({"id": 77})
@@ -129,3 +138,6 @@ def test_persist_okved_fallback_persists_null_scores(monkeypatch) -> None:
     assert fake_conn.last_prodclass_params["description_okved_score"] is None
     assert fake_conn.last_prodclass_params["okved_score"] is None
     assert fake_conn.last_prodclass_params["score_source"] == "okved_fallback"
+    assert any(
+        "UPDATE public.ai_site_prodclass AS ap" in sql for sql in fake_conn.executed_sql
+    )
