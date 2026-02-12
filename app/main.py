@@ -18,6 +18,7 @@ from app.api.analyze_json import (
 )
 from app.api.pipeline import router as pipeline_router
 from app.api.ai_analysis import router as ai_analysis_router
+from app.api.ai_analysis import public_router as ai_analysis_public_router
 
 # DB helpers
 from app.db.bitrix import (
@@ -61,6 +62,7 @@ app.include_router(lookup_router)
 app.include_router(analyze_json_router)
 app.include_router(pipeline_router)
 app.include_router(ai_analysis_router)
+app.include_router(ai_analysis_public_router)
 
 # Хэндлы фоновых задач (для корректной остановки)
 _bg_tasks: List[asyncio.Task] = []

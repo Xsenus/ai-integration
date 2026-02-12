@@ -23,6 +23,15 @@ class AiAnalysisCompanyStatus(BaseModel):
         description="Прогресс анализа в диапазоне [0..1]",
     )
     run_id: Optional[int] = Field(None, description="Идентификатор запуска (clients_requests.id)")
+    tokens_total: int = Field(0, ge=0, description="Сумма input+cached_input+output токенов")
+    cost_total_usd: float = Field(0.0, ge=0.0, description="Суммарная стоимость запросов в USD")
+    tokens_input: int = Field(0, ge=0, description="Сумма input_tokens")
+    tokens_cached_input: int = Field(0, ge=0, description="Сумма cached_input_tokens")
+    tokens_output: int = Field(0, ge=0, description="Сумма output_tokens")
+    breakdown: Optional[dict[str, float]] = Field(
+        None,
+        description="Разбивка по моделям: model -> cost_usd",
+    )
 
 
 class AiAnalysisCompaniesResponse(BaseModel):

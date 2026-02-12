@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     ANALYZE_BASE: Optional[str] = None        # альтернативное имя переменной окружения
     AI_ANALYZE_TIMEOUT: int = 15              # таймаут по умолчанию, сек
     ANALYZE_TIMEOUT: Optional[int] = None     # альтернативное имя переменной окружения
+    AI_ANALYZE_ADMIN_KEY: Optional[str] = None
+    ANALYZE_ADMIN_KEY: Optional[str] = None
+
+    AI_ANALYSIS_COSTS_LOOKBACK_HOURS: int = 24
 
     # === Scrape params (используются в services/scrape.py) ===
     PARSE_HTTP_TIMEOUT: int = 15
@@ -119,6 +123,12 @@ class Settings(BaseSettings):
     def analyze_timeout(self) -> int:
         """Таймаут ожидания ответа внешнего сервиса, сек."""
         return int(self.AI_ANALYZE_TIMEOUT or self.ANALYZE_TIMEOUT or 15)
+
+    @property
+    def analyze_admin_key(self) -> Optional[str]:
+        """Admin key для защищённых эндпоинтов analyze-сервиса."""
+
+        return self.AI_ANALYZE_ADMIN_KEY or self.ANALYZE_ADMIN_KEY
 
     @property
     def embed_model(self) -> str:
