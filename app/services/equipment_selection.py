@@ -296,6 +296,12 @@ class TableData:
 
 
 @dataclass(slots=True)
+class RunScope:
+    started_at: Optional[datetime]
+    latest_pars_id: Optional[int]
+
+
+@dataclass(slots=True)
 class EquipmentStepReport:
     company_id: Optional[int] = None
     selection_strategy: str = "unknown"
@@ -641,8 +647,20 @@ async def build_equipment_tables(
         f"Шаг 0: загружена карточка клиента (строк: {len(client_rows)}).",
     )
 
+    run_scope = await _resolve_run_scope(conn, report.company_id, client_rows)
+    if run_scope.started_at is not None:
+        _log_event(
+            report.log,
+            f"Run-scope: фильтруем данные по created_at >= {run_scope.started_at.isoformat()}.",
+        )
+    elif run_scope.latest_pars_id is not None:
+        _log_event(
+            report.log,
+            f"Run-scope: started_at пустой, используем только самый свежий pars_site.id={run_scope.latest_pars_id}.",
+        )
+
     _append_step_separator(report.log, "Шаг 1 — Данные с сайта")
-    goods_types = await _load_goods_types(conn, report.company_id)
+    goods_types = await _load_goods_types(conn, report.company_id, run_scope)
     report.goods_types = goods_types
     goods_types_for_calc = goods_types
     _add_table(
@@ -667,7 +685,7 @@ async def build_equipment_tables(
         f"Шаг 1.a: найдено {len(goods_types)} записей ai_site_goods_types.",
     )
 
-    site_equipment = await _load_site_equipment(conn, report.company_id)
+    site_equipment = await _load_site_equipment(conn, report.company_id, run_scope)
     report.site_equipment = site_equipment
     site_equipment_for_calc = site_equipment
     _add_table(
@@ -692,7 +710,7 @@ async def build_equipment_tables(
     )
 
     _append_step_separator(report.log, "Шаг 2 — SCORE_E1 через prodclass")
-    prodclass_rows = await _load_prodclass_rows(conn, report.company_id)
+    prodclass_rows = await _load_prodclass_rows(conn, report.company_id, run_scope)
     report.prodclass_rows = prodclass_rows
     _add_table(
         report,
@@ -1143,7 +1161,13 @@ async def _resolve_company_id(
 async def _load_goods_types(
     conn: AsyncConnection,
     company_id: int,
+    run_scope: RunScope,
 ) -> List[Dict[str, Any]]:
+    scope_sql, scope_params = _build_run_scope_sql(
+        run_scope,
+        created_at_column="gst.created_at",
+        pars_id_column="pst.id",
+    )
     stmt = text(
         """
         SELECT
@@ -1157,14 +1181,16 @@ async def _load_goods_types(
         FROM ai_site_goods_types AS gst
         JOIN pars_site AS pst ON pst.id = gst.text_par_id
         WHERE pst.company_id = :cid
+        {scope_sql}
         ORDER BY gst.created_at, gst.id
         """
+        .format(scope_sql=scope_sql)
     )
     log.debug(
         "equipment-selection: загружаем goods_types → %s",
         stmt.text,
     )
-    result = await conn.execute(stmt, {"cid": company_id})
+    result = await conn.execute(stmt, {"cid": company_id, **scope_params})
     rows = list(result.mappings())
     log.info(
         "equipment-selection: получено %s строк goods_types для company_id=%s",
@@ -1177,7 +1203,13 @@ async def _load_goods_types(
 async def _load_site_equipment(
     conn: AsyncConnection,
     company_id: int,
+    run_scope: RunScope,
 ) -> List[Dict[str, Any]]:
+    scope_sql, scope_params = _build_run_scope_sql(
+        run_scope,
+        created_at_column="eq.created_at",
+        pars_id_column="pst.id",
+    )
     stmt = text(
         """
         SELECT
@@ -1191,14 +1223,16 @@ async def _load_site_equipment(
         FROM ai_site_equipment AS eq
         JOIN pars_site AS pst ON pst.id = eq.text_pars_id
         WHERE pst.company_id = :cid
+        {scope_sql}
         ORDER BY eq.created_at, eq.id
         """
+        .format(scope_sql=scope_sql)
     )
     log.debug(
         "equipment-selection: загружаем site_equipment → %s",
         stmt.text,
     )
-    result = await conn.execute(stmt, {"cid": company_id})
+    result = await conn.execute(stmt, {"cid": company_id, **scope_params})
     rows = list(result.mappings())
     log.info(
         "equipment-selection: получено %s строк site_equipment для company_id=%s",
@@ -1211,7 +1245,13 @@ async def _load_site_equipment(
 async def _load_prodclass_rows(
     conn: AsyncConnection,
     company_id: int,
+    run_scope: RunScope,
 ) -> List[Dict[str, Any]]:
+    scope_sql, scope_params = _build_run_scope_sql(
+        run_scope,
+        created_at_column="ap.created_at",
+        pars_id_column="pst.id",
+    )
     stmt = text(
         """
         SELECT
@@ -1229,14 +1269,16 @@ async def _load_prodclass_rows(
         JOIN pars_site AS pst ON pst.id = ap.text_pars_id
         LEFT JOIN ib_prodclass AS ip ON ip.id = ap.prodclass
         WHERE pst.company_id = :cid
+        {scope_sql}
         ORDER BY ap.created_at, ap.id
         """
+        .format(scope_sql=scope_sql)
     )
     log.debug(
         "equipment-selection: загружаем prodclass_rows → %s",
         stmt.text,
     )
-    result = await conn.execute(stmt, {"cid": company_id})
+    result = await conn.execute(stmt, {"cid": company_id, **scope_params})
     rows = list(result.mappings())
     log.info(
         "equipment-selection: получено %s строк prodclass для company_id=%s",
@@ -1244,6 +1286,49 @@ async def _load_prodclass_rows(
         company_id,
     )
     return rows
+
+
+async def _resolve_run_scope(
+    conn: AsyncConnection,
+    company_id: int,
+    client_rows: Sequence[Dict[str, Any]],
+) -> RunScope:
+    started_at = client_rows[0].get("started_at") if client_rows else None
+    if isinstance(started_at, datetime):
+        return RunScope(started_at=started_at, latest_pars_id=None)
+
+    result = await conn.execute(
+        text(
+            """
+            SELECT id
+            FROM public.pars_site
+            WHERE company_id = :cid
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ),
+        {"cid": company_id},
+    )
+    row = result.mappings().first()
+    latest_pars_id = int(row["id"]) if row and row.get("id") is not None else None
+    return RunScope(started_at=None, latest_pars_id=latest_pars_id)
+
+
+def _build_run_scope_sql(
+    run_scope: RunScope,
+    *,
+    created_at_column: str,
+    pars_id_column: str,
+) -> tuple[str, Dict[str, Any]]:
+    if run_scope.started_at is not None:
+        return f"\n          AND {created_at_column} >= :run_started_at", {
+            "run_started_at": run_scope.started_at
+        }
+    if run_scope.latest_pars_id is not None:
+        return f"\n          AND {pars_id_column} = :latest_pars_id", {
+            "latest_pars_id": run_scope.latest_pars_id
+        }
+    return "", {}
 
 
 def _aggregate_prodclass(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
